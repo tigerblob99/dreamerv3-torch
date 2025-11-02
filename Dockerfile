@@ -17,12 +17,13 @@
 # 4. To set up Atari or Minecraft environments, please check the scripts located in "env/setup_scripts".
 
 # System
-FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime
+# FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime
+FROM pytorch/pytorch:2.9.0-cuda13.0-cudnn9-runtime
 ARG DEBIAN_FRONTEND=noninteractive
-ENV TZ=America/San_Francisco
-ENV PYTHONUNBUFFERED 1
-ENV PIP_DISABLE_PIP_VERSION_CHECK 1
-ENV PIP_NO_CACHE_DIR 1
+ENV TZ=Europe/London
+ENV PYTHONUNBUFFERED=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PIP_NO_CACHE_DIR=1
 RUN apt-get update && apt-get install -y \
     vim libgl1-mesa-glx libosmesa6 \
     wget unrar cmake g++ libgl1-mesa-dev \

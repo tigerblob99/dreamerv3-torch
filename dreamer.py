@@ -21,6 +21,7 @@ import torch
 from torch import nn
 from torch import distributions as torchd
 
+import wandb
 
 to_np = lambda x: x.detach().cpu().numpy()
 
@@ -223,6 +224,19 @@ def main(config):
     # step in logger is environmental step
     logger = tools.Logger(logdir, config.action_repeat * step)
 
+    # --- Weights & Biases init; sync existing TensorBoard logs automatically ---
+    run = wandb.init(
+        project=os.getenv("WANDB_PROJECT", "dreamerv3"),
+        entity=os.getenv("WANDB_ENTITY"),                 # optional
+        name=os.getenv("WANDB_NAME"),                     # optional
+        config=vars(config),                              # capture all flags
+        dir=str(logdir),                                  # keep run files in logdir
+        sync_tensorboard=True,                            # mirror TB scalars/images/videos to W&B
+        mode=os.getenv("WANDB_MODE", "online"),           # set WANDB_MODE=offline if needed
+    )
+
+
+
     print("Create envs.")
     if config.offline_traindir:
         directory = config.offline_traindir.format(**vars(config))
@@ -292,6 +306,12 @@ def main(config):
         train_dataset,
     ).to(config.device)
     agent.requires_grad_(requires_grad=False)
+
+    try:
+        wandb.watch(agent, log="all", log_freq=1000)
+    except Exception:
+        pass
+
     if (logdir / "latest.pt").exists():
         checkpoint = torch.load(logdir / "latest.pt")
         agent.load_state_dict(checkpoint["agent_state_dict"])
@@ -337,6 +357,11 @@ def main(config):
             env.close()
         except Exception:
             pass
+    try:
+        wandb.finish()
+    except Exception:
+        pass
+
 
 
 if __name__ == "__main__":
