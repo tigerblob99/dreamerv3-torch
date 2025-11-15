@@ -58,7 +58,7 @@ class Dreamer(nn.Module):
 
     def __call__(self, obs, reset, state=None, training=True):
         step = self._step
-        if training:
+        if training and self._dataset is not None:
             steps = (
                 self._config.pretrain
                 if self._should_pretrain()
@@ -74,7 +74,10 @@ class Dreamer(nn.Module):
                     self._metrics[name] = []
                 if self._config.video_pred_log:
                     openl = self._wm.video_pred(next(self._dataset))
-                    self._logger.video("train_openl", to_np(openl))
+                    video_pred = to_np(openl)
+                    if video_pred.ndim == 4:
+                        video_pred = video_pred[None]
+                    self._logger.video("train_openl", video_pred)
                 self._logger.write(fps=True)
 
         policy_output, state = self._policy(obs, state, training)
@@ -189,6 +192,11 @@ def make_env(config, mode, id):
 
         env = crafter.Crafter(task, config.size, seed=config.seed + id)
         env = wrappers.OneHotAction(env)
+    elif suite == "robosuite":
+        from envs.robosuite_env import make_lift_env
+
+        env = make_lift_env(config, seed=config.seed + id)
+        env = wrappers.NormalizeActions(env)
     elif suite == "minecraft":
         import envs.minecraft as minecraft
 
@@ -215,16 +223,17 @@ def main(config):
     config.eval_every //= config.action_repeat
     config.log_every //= config.action_repeat
     config.time_limit //= config.action_repeat
+    if config.eval_only:
+        config.eval_episode_num = 1
 
     print("Logdir", logdir)
     logdir.mkdir(parents=True, exist_ok=True)
     config.traindir.mkdir(parents=True, exist_ok=True)
     config.evaldir.mkdir(parents=True, exist_ok=True)
     step = count_steps(config.traindir)
-    # step in logger is environmental step
-    logger = tools.Logger(logdir, config.action_repeat * step)
 
     # --- Weights & Biases init; sync existing TensorBoard logs automatically ---
+    os.environ.setdefault("WANDB_LOGDIR", str(logdir))
     run = wandb.init(
         project=os.getenv("WANDB_PROJECT", "dreamerv3"),
         entity=os.getenv("WANDB_ENTITY"),                 # optional
@@ -234,6 +243,9 @@ def main(config):
         sync_tensorboard=True,                            # mirror TB scalars/images/videos to W&B
         mode=os.getenv("WANDB_MODE", "online"),           # set WANDB_MODE=offline if needed
     )
+
+    # step in logger is environmental step
+    logger = tools.Logger(logdir, config.action_repeat * step)
 
 
 
@@ -262,7 +274,7 @@ def main(config):
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
 
     state = None
-    if not config.offline_traindir:
+    if not config.offline_traindir and not config.eval_only:
         prefill = max(0, config.prefill - count_steps(config.traindir))
         print(f"Prefill dataset ({prefill} steps).")
         if hasattr(acts, "discrete"):
@@ -296,7 +308,7 @@ def main(config):
         print(f"Logger: ({logger.step} steps).")
 
     print("Simulate agent.")
-    train_dataset = make_dataset(train_eps, config)
+    train_dataset = None if config.eval_only else make_dataset(train_eps, config)
     eval_dataset = make_dataset(eval_eps, config)
     agent = Dreamer(
         train_envs[0].observation_space,
@@ -318,6 +330,46 @@ def main(config):
         tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
         agent._should_pretrain._once = False
 
+    if config.eval_only:
+        print("Running single evaluation rollout.")
+        eval_policy = functools.partial(agent, training=False)
+        tools.simulate(
+            eval_policy,
+            eval_envs,
+            eval_eps,
+            config.evaldir,
+            logger,
+            is_eval=True,
+            episodes=1,
+        )
+        latest_eval = tools.load_episodes(config.evaldir, limit=1)
+        if latest_eval:
+            _, episode = next(iter(latest_eval.items()))
+            env_video = np.array(episode["image"])
+            if env_video.ndim == 4:
+                env_video = env_video[None]
+            logger.video("eval_env", env_video)
+        if config.video_pred_log:
+            try:
+                video_pred = agent._wm.video_pred(next(eval_dataset))
+                video_pred = to_np(video_pred)
+                if video_pred.ndim == 4:
+                    video_pred = video_pred[None]
+                logger.video("eval_openl", video_pred)
+            except StopIteration:
+                pass
+        logger.write(fps=True)
+        for env in train_envs + eval_envs:
+            try:
+                env.close()
+            except Exception:
+                pass
+        try:
+            wandb.finish()
+        except Exception:
+            pass
+        return
+
     # make sure eval will be executed once after config.steps
     while agent._step < config.steps + config.eval_every:
         logger.write()
@@ -335,7 +387,10 @@ def main(config):
             )
             if config.video_pred_log:
                 video_pred = agent._wm.video_pred(next(eval_dataset))
-                logger.video("eval_openl", to_np(video_pred))
+                video_pred = to_np(video_pred)
+                if video_pred.ndim == 4:
+                    video_pred = video_pred[None]
+                logger.video("eval_openl", video_pred)
         print("Start training.")
         state = tools.simulate(
             agent,
@@ -383,6 +438,7 @@ if __name__ == "__main__":
     defaults = {}
     for name in name_list:
         recursive_update(defaults, configs[name])
+    defaults.setdefault("eval_only", False)
     parser = argparse.ArgumentParser()
     for key, value in sorted(defaults.items(), key=lambda x: x[0]):
         arg_type = tools.args_type(value)

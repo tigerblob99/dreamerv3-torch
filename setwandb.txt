@@ -1,0 +1,5 @@
+export WANDB_API_KEY=apikey      # or run: wandb login
+export WANDB_PROJECT=dreamer_robomimic
+export WANDB_ENTITY=zhuoxuan-li-university-of-oxford
+export WANDB_NAME=robomimic_run_1        # optional custom run name
+export WANDB_MODE=online                  # or offline / disabled

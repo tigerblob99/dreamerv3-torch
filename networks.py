@@ -462,7 +462,7 @@ class ConvEncoder(nn.Module):
         in_dim = input_ch
         out_dim = depth
         layers = []
-        for i in range(stages):
+        for _ in range(stages):
             layers.append(
                 Conv2dSamePad(
                     in_channels=in_dim,
@@ -477,11 +477,14 @@ class ConvEncoder(nn.Module):
             layers.append(act())
             in_dim = out_dim
             out_dim *= 2
-            h, w = h // 2, w // 2
 
-        self.outdim = out_dim // 2 * h * w
         self.layers = nn.Sequential(*layers)
         self.layers.apply(tools.weight_init)
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, input_ch, input_shape[0], input_shape[1])
+            dummy_out = self.layers(dummy)
+            self.outdim = int(np.prod(dummy_out.shape[1:]))
 
     def forward(self, obs):
         obs -= 0.5
@@ -574,6 +577,10 @@ class ConvDecoder(nn.Module):
         # (batch, time, -1) -> (batch * time, ch, h, w)
         x = x.permute(0, 3, 1, 2)
         x = self.layers(x)
+        target_hw = self._shape[1:]
+        if tuple(x.shape[-2:]) != target_hw:
+            # resize spatial dims when dataset resolution does not align with decoder strides
+            x = F.interpolate(x, size=target_hw, mode="bilinear", align_corners=False)
         # (batch, time, -1) -> (batch, time, ch, h, w)
         mean = x.reshape(features.shape[:-1] + self._shape)
         # (batch, time, ch, h, w) -> (batch, time, h, w, ch)

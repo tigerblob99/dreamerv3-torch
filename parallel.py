@@ -1,3 +1,12 @@
+"""Lightweight helpers to run environments in separate processes.
+
+`Parallel(ctor, "process")` creates an env in a child process and forwards
+attribute access and method calls over a pipe, so the training loop can call
+`env.step(...)` / `env.reset()` as usual while the heavy simulator runs
+elsewhere. `Damy` is a no-op wrapper used when `parallel=False` so the rest of
+the code can use the same interface without actually spawning processes.
+"""
+
 import atexit
 import os
 import sys

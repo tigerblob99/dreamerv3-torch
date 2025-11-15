@@ -64,6 +64,14 @@ class Logger:
         self._images = {}
         self._videos = {}
         self.step = step
+        self._wandb_module = None
+        self._wandb_run = None
+
+    def attach_wandb(self, wandb_module, wandb_run):
+        if wandb_module is None or wandb_run is None:
+            return
+        self._wandb_module = wandb_module
+        self._wandb_run = wandb_run
 
     def scalar(self, name, value):
         self._scalars[name] = float(value)
@@ -72,7 +80,7 @@ class Logger:
         self._images[name] = np.array(value)
 
     def video(self, name, value):
-        self._videos[name] = np.array(value)
+        self._videos[name] = self._prepare_video_array(value)
 
     def write(self, fps=False, step=False):
         if not step:
@@ -83,22 +91,30 @@ class Logger:
         print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in scalars))
         with (self._logdir / "metrics.jsonl").open("a") as f:
             f.write(json.dumps({"step": step, **dict(scalars)}) + "\n")
+        wandb_payload = {} if self._wandb_ready() else None
         for name, value in scalars:
             if "/" not in name:
                 self._writer.add_scalar("scalars/" + name, value, step)
             else:
                 self._writer.add_scalar(name, value, step)
+            if wandb_payload is not None:
+                wandb_payload[name] = value
         for name, value in self._images.items():
             self._writer.add_image(name, value, step)
+            if wandb_payload is not None:
+                wandb_payload[name] = self._wandb_module.Image(value)
         for name, value in self._videos.items():
             name = name if isinstance(name, str) else name.decode("utf-8")
-            if np.issubdtype(value.dtype, np.floating):
-                value = np.clip(255 * value, 0, 255).astype(np.uint8)
-            B, T, H, W, C = value.shape
-            value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
-            self._writer.add_video(name, value, step, 16)
+            writer_video, wandb_video = self._format_video_for_logging(value)
+            self._writer.add_video(name, writer_video, step, 16)
+            if wandb_payload is not None:
+                wandb_payload[name] = self._wandb_module.Video(
+                    wandb_video, fps=16, format="mp4"
+                )
 
         self._writer.flush()
+        if wandb_payload:
+            self._wandb_run.log(wandb_payload, step=step)
         self._scalars = {}
         self._images = {}
         self._videos = {}
@@ -116,13 +132,48 @@ class Logger:
 
     def offline_scalar(self, name, value, step):
         self._writer.add_scalar("scalars/" + name, value, step)
+        if self._wandb_ready():
+            self._wandb_run.log({name: float(value)}, step=step)
 
     def offline_video(self, name, value, step):
+        value = self._prepare_video_array(value)
+        writer_video, wandb_video = self._format_video_for_logging(value)
+        self._writer.add_video(name, writer_video, step, 16)
+        if self._wandb_ready():
+            self._wandb_run.log(
+                {name: self._wandb_module.Video(wandb_video, fps=16, format="mp4")},
+                step=step,
+            )
+
+    def _prepare_video_array(self, value):
+        value = np.array(value)
+        if value.ndim == 4:
+            value = value[None]
+        if value.ndim != 5:
+            raise ValueError(
+                f"Video tensors must have shape [B, T, H, W, C]; got {value.shape}"
+            )
+        *_, C = value.shape
+        if C > 3 and C % 3 == 0:
+            cams = C // 3
+            parts = np.split(value, cams, axis=-1)
+            value = np.concatenate(parts, axis=3)
+        return value
+
+    def _format_video_for_logging(self, value):
         if np.issubdtype(value.dtype, np.floating):
-            value = np.clip(255 * value, 0, 255).astype(np.uint8)
-        B, T, H, W, C = value.shape
-        value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
-        self._writer.add_video(name, value, step, 16)
+            video_uint8 = np.clip(255 * value, 0, 255).astype(np.uint8)
+        else:
+            video_uint8 = value.astype(np.uint8)
+        B, T, H, W, C = video_uint8.shape
+        writer_video = (
+            video_uint8.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
+        )
+        wandb_video = writer_video[0]
+        return writer_video, wandb_video
+
+    def _wandb_ready(self):
+        return self._wandb_module is not None and self._wandb_run is not None
 
 
 def simulate(
@@ -322,6 +373,42 @@ def from_generator(generator, batch_size):
 
 def sample_episodes(episodes, length, seed=0):
     np_random = np.random.RandomState(seed)
+
+    if not episodes:
+        raise ValueError("No episodes available for sampling.")
+
+    def _signature(episode):
+        keys = []
+        for key, value in episode.items():
+            if key.startswith("log_"):
+                continue
+            arr = np.asarray(value)
+            keys.append((key, arr.shape[1:], arr.dtype))
+        return tuple(sorted(keys))
+
+    episodes = collections.OrderedDict(episodes)
+    ref_key, ref_episode = next(iter(episodes.items()))
+    ref_sig = _signature(ref_episode)
+    compatible = collections.OrderedDict()
+    incompatible = []
+    for key, episode in episodes.items():
+        sig = _signature(episode)
+        if sig == ref_sig:
+            compatible[key] = episode
+        else:
+            incompatible.append(key)
+
+    if not compatible:
+        raise ValueError("All episodes have incompatible observation structures and were dropped.")
+
+    if incompatible:
+        print(
+            f"[tools.sample_episodes] Dropped {len(incompatible)} episode(s) with incompatible shapes: "
+            + ", ".join(incompatible[:3])
+            + ("..." if len(incompatible) > 3 else "")
+        )
+
+    episodes = compatible
     while True:
         size = 0
         ret = None
@@ -337,24 +424,25 @@ def sample_episodes(episodes, length, seed=0):
                 continue
             if not ret:
                 index = int(np_random.randint(0, total - 1))
-                ret = {
-                    k: v[index : min(index + length, total)].copy()
-                    for k, v in episode.items()
-                    if "log_" not in k
-                }
+                start, stop = index, min(index + length, total)
+                ret = {}
+                for k, v in episode.items():
+                    if k.startswith("log_"):
+                        continue
+                    segment = np.asarray(v[start:stop]).copy()
+                    ret[k] = segment
                 if "is_first" in ret:
                     ret["is_first"][0] = True
             else:
                 # 'is_first' comes after 'is_last'
                 index = 0
                 possible = length - size
-                ret = {
-                    k: np.append(
-                        ret[k], v[index : min(index + possible, total)].copy(), axis=0
-                    )
-                    for k, v in episode.items()
-                    if "log_" not in k
-                }
+                start, stop = index, min(index + possible, total)
+                for k, v in episode.items():
+                    if k.startswith("log_"):
+                        continue
+                    segment = np.asarray(v[start:stop]).copy()
+                    ret[k] = np.concatenate([ret[k], segment], axis=0)
                 if "is_first" in ret:
                     ret["is_first"][size] = True
             size = len(next(iter(ret.values())))
@@ -982,7 +1070,7 @@ def recursively_collect_optim_state_dict(
         new_path = path + "." + name if path else name
         if isinstance(attr, torch.optim.Optimizer):
             optimizers_state_dicts[new_path] = attr.state_dict()
-        elif hasattr(attr, "__dict__"):
+        elif _supports_object_dict(attr):
             optimizers_state_dicts.update(
                 recursively_collect_optim_state_dict(
                     attr, new_path, optimizers_state_dicts, visited
@@ -998,3 +1086,13 @@ def recursively_load_optim_state_dict(obj, optimizers_state_dicts):
         for key in keys:
             obj_now = getattr(obj_now, key)
         obj_now.load_state_dict(state_dict)
+
+
+def _supports_object_dict(value):
+    try:
+        getattr(value, "__dict__")
+    except AttributeError:
+        return False
+    except Exception:
+        return False
+    return True

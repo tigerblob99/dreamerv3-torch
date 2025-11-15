@@ -176,9 +176,39 @@ memorymaze:
   imag_gradient: 'reinforce'
   task: 'memorymaze_9x9'
 
+robosuite_lift:
+  task: 'robosuite_Lift'
+  size: [84, 84]
+  envs: 1
+  action_repeat: 1
+  parallel: False
+  steps: 5e4
+  prefill: 0
+  train_ratio: 512
+  video_pred_log: true
+  offline_eval_batches: 5
+  offline_eval_video_batches: 2
+  robosuite_task_name: 'Lift'
+  robosuite_robots: 'Panda'
+  robosuite_controller: 'OSC_POSE'
+  robosuite_camera: 'agentview'
+  robosuite_reward_shaping: true
+  robosuite_control_freq: 20
+  robosuite_render_device: -1
+  robosuite_add_joint_trig: true
+  robosuite_lowdim_keys: ['robot0_joint_pos', 'robot0_joint_vel', 'robot0_gripper_qpos', 'robot0_gripper_qvel']
+
 debug:
   debug: True
   pretrain: 1
   prefill: 1
   batch_size: 10
   batch_length: 20
+
+robomimic:
+  # Robomimic offline setting: single agent camera and physical proprio targets.
+  # aux_ sin/cos provided as inputs only (no explicit next-state vector supervision stored).
+  encoder:
+    {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel|aux_.*)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
+  decoder:
+    {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
