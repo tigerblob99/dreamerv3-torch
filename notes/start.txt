@@ -1,0 +1,10 @@
+robosuite lift eval
+python dreamer.py   --configs defaults robomimic robosuite_lift   --logdir ./logdir/robomimic_offline   --eval_only True   --envs 1   --robosuite_render_device -1
+
+offline eval
+python offline_train.py   --configs robomimic   --offline_traindir ./logdir/robomimic_data_aux   --offline_evaldir ./logdir/robomimic_data_aux   --logdir ./logdir/robomimic_offline   --eval_only True   --offline_eval_batches 5   --offline_eval_video_batches 2   --video_pred_log True   --device cuda:0   --precision 32
+
+new offline eval
+python offline_train.py   --configs robomimic   --offline_traindir ./datasets/robomimic_data_MV/lift_MH_train   --offline_evaldir ./logdir/robomimic_data_MV/robomimic_data_MV_eval   --logdir ./logdir/robomimic_offline_MV_PH   --eval_only True   --offline_eval_batches 10   --offline_eval_video_batches 10   --video_pred_log True   --device cuda:0   --precision 32 --resume_checkpoint /workspace/dreamerv3-torch/dreamerv3-torch/logdir/robomimic_data_MV/robomimic_data_MV_train_offline_log/latest.pt --offline_eval_preserve_length True
+
+python -m evals.joint_eval   --logdir /workspace/dreamerv3-torch/dreamerv3-torch/logdir/joint_angle   --checkpoint /workspace/dreamerv3-torch/dreamerv3-torch/logdir/robomimic_data_MV/robomimic_data_MV_train_offline_log/latest.pt   --episode-path /workspace/dreamerv3-torch/dreamerv3-torch/logdir/robomimic_data_MV/robomimic_data_MV_eval/demo_107-63.npz   --joint-keys robot0_joint_pos robot0_joint_vel   --plot-dir /workspace/dreamerv3-torch/dreamerv3-torch/logdir/joint_angle/joint_eval_plots   --output-json /workspace/dreamerv3-torch/dreamerv3-torch/logdir/joint_angle/joint_eval_summary.json   --save-npz /workspace/dreamerv3-torch/dreamerv3-torch/logdir/joint_angle/joint_eval_arrays.npz --configs defaults robomimic --fan-horizon 10 

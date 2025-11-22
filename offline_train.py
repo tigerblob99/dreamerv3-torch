@@ -1,3 +1,26 @@
+"""Offline Dreamer training and evaluation entry point.
+
+Usage highlights:
+
+- Provide one or more config names via ``--configs`` (they are merged on top of
+    ``defaults`` from ``configs.yaml``) and always point ``--offline_traindir`` to a
+    directory of offline rollouts. The script auto-derives ``logdir`` next to that
+    dataset unless you override it.
+- Resume from any checkpoint by passing ``--resume_checkpoint path/to/model.pt``;
+    if omitted the script falls back to ``<logdir>/latest.pt`` as before.
+- Control evaluation style with ``--offline_eval_batches`` (batched/padded) or
+    enable length-preserving, per-episode evaluation with
+    ``--offline_eval_preserve_length True``. When that flag is on, episodes are run
+    sequentially without truncation or padding. Both modes respect
+    ``--offline_eval_every`` for periodic evals and run automatically after
+    training when enabled.
+
+Run ``python offline_train.py --configs <name> --offline_traindir <dataset>`` to
+start training, or add ``--eval_only True`` (with optional
+``--resume_checkpoint``/``--offline_eval_preserve_length``) for evaluation-only
+jobs.
+"""
+
 import argparse
 import os
 import pathlib
@@ -86,6 +109,35 @@ def _prepare_padded_episode(episode: Dict[str, np.ndarray], batch_length: int) -
     return {key: value[None, ...] for key, value in clean.items()}
 
 
+def _prepare_full_episode(episode: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    clean = {}
+    for key, value in episode.items():
+        if key.startswith("log_"):
+            continue
+        arr = np.asarray(value)
+        if arr.ndim == 0:
+            arr = arr[None]
+        if arr.shape[0] == 0:
+            raise ValueError("Encountered empty episode when preparing sequential evaluation batch.")
+        clean[key] = arr.copy()
+    if not clean:
+        raise ValueError("Episode does not contain any usable keys for evaluation.")
+    steps = next(iter(clean.values())).shape[0]
+    if "is_first" not in clean:
+        flags = np.zeros(steps, dtype=bool)
+        flags[0] = True
+        clean["is_first"] = flags
+    else:
+        flags = clean["is_first"][:steps].copy()
+        flags[0] = True
+        if flags.shape[0] < steps:
+            pad = np.zeros(steps - flags.shape[0], dtype=flags.dtype)
+            flags = np.concatenate([flags, pad], axis=0)
+        flags[1:] = False
+        clean["is_first"] = flags
+    return {key: value[None, ...] for key, value in clean.items()}
+
+
 def _make_eval_dataset(eval_eps, config):
     episodes = [ep for ep in eval_eps.values() if isinstance(ep, dict)]
     if not episodes:
@@ -93,6 +145,48 @@ def _make_eval_dataset(eval_eps, config):
     batch_length = int(getattr(config, "batch_length", 1))
     prepared = [_prepare_padded_episode(ep, batch_length) for ep in episodes]
     return _EvalDataset(prepared)
+
+
+def _make_eval_sequences(eval_eps):
+    episodes = [ep for ep in eval_eps.values() if isinstance(ep, dict)]
+    if not episodes:
+        raise ValueError("No evaluation episodes available for sequential evaluation.")
+    return [_prepare_full_episode(ep) for ep in episodes]
+
+
+def _compute_eval_metrics(agent, batch):
+    with torch.no_grad():
+        data = agent._wm.preprocess(batch)
+        embed = agent._wm.encoder(data)
+        post, _ = agent._wm.dynamics.observe(
+            embed, data["action"], data["is_first"]
+        )
+        feat = agent._wm.dynamics.get_feat(post)
+
+        batch_metrics = {}
+        decoded = agent._wm.heads["decoder"](feat)
+        for key, dist in decoded.items():
+            if key not in data:
+                continue
+            recon = dist.mode()
+            truth = data[key]
+            batch_metrics[f"eval/{key}_mse"] = torch.mean((recon - truth) ** 2).item()
+
+        reward_pred = agent._wm.heads["reward"](feat).mode()
+        reward_truth = data["reward"].unsqueeze(-1)
+        batch_metrics["eval/reward_mse"] = (
+            torch.mean((reward_pred - reward_truth) ** 2).item()
+        )
+
+        if "cont" in agent._wm.heads and "cont" in data:
+            cont_dist = agent._wm.heads["cont"](feat)
+            cont_pred = cont_dist.mean if hasattr(cont_dist, "mean") else cont_dist.mode()
+            cont_truth = data["cont"].unsqueeze(-1) if data["cont"].ndim == 2 else data["cont"]
+            batch_metrics["eval/cont_l1"] = (
+                torch.mean(torch.abs(cont_pred - cont_truth)).item()
+            )
+
+    return batch_metrics
 
 
 def _infer_spaces(episode: Dict[str, np.ndarray]) -> Tuple[gym.spaces.Dict, gym.spaces.Box]:
@@ -146,12 +240,22 @@ def _setup_config(config):
     config.evaldir = config.evaldir or dataset_dir
     config.log_every = config.offline_log_every
     config.eval_every = config.offline_eval_every
-    if getattr(config, "eval_only", False) and config.offline_eval_batches <= 0:
+    preserve_lengths = bool(getattr(config, "offline_eval_preserve_length", False))
+    config.offline_eval_preserve_length = preserve_lengths
+    if getattr(config, "eval_only", False) and config.offline_eval_batches <= 0 and not preserve_lengths:
         config.offline_eval_batches = 1
     return config
 
 
-def _offline_eval(agent, eval_dataset, config, logger):
+def _offline_eval(agent, eval_dataset, config, logger, eval_sequences=None):
+    preserve_lengths = getattr(config, "offline_eval_preserve_length", False)
+    if preserve_lengths:
+        if not eval_sequences:
+            print("No evaluation episodes available; skipping eval.")
+            return
+        _offline_eval_sequential(agent, eval_sequences, config, logger)
+        return
+
     if eval_dataset is None or len(eval_dataset) == 0:
         print("No evaluation episodes available; skipping eval.")
         return
@@ -167,42 +271,54 @@ def _offline_eval(agent, eval_dataset, config, logger):
     processed_batches = 0
     for batch_idx in range(config.offline_eval_batches):
         batch = next(dataset)
-        with torch.no_grad():
-            data = agent._wm.preprocess(batch)
-            embed = agent._wm.encoder(data)
-            post, _ = agent._wm.dynamics.observe(
-                embed, data["action"], data["is_first"]
-            )
-            feat = agent._wm.dynamics.get_feat(post)
+        batch_metrics = _compute_eval_metrics(agent, batch)
+        for name, value in batch_metrics.items():
+            metrics[name].append(value)
 
-            decoded = agent._wm.heads["decoder"](feat)
-            for key, dist in decoded.items():
-                if key not in data:
-                    continue
-                recon = dist.mode()
-                truth = data[key]
-                mse = torch.mean((recon - truth) ** 2).item()
-                metrics[f"eval/{key}_mse"].append(mse)
-
-            reward_pred = agent._wm.heads["reward"](feat).mode()
-            reward_truth = data["reward"].unsqueeze(-1)
-            metrics["eval/reward_mse"].append(
-                torch.mean((reward_pred - reward_truth) ** 2).item()
-            )
-
-            if "cont" in agent._wm.heads and "cont" in data:
-                cont_dist = agent._wm.heads["cont"](feat)
-                cont_pred = cont_dist.mean if hasattr(cont_dist, "mean") else cont_dist.mode()
-                cont_truth = data["cont"].unsqueeze(-1) if data["cont"].ndim == 2 else data["cont"]
-                cont_l1 = torch.mean(torch.abs(cont_pred - cont_truth)).item()
-                metrics["eval/cont_l1"].append(cont_l1)
-
-            if config.video_pred_log and batch_idx < video_budget:
+        if config.video_pred_log and batch_idx < video_budget:
+            with torch.no_grad():
                 video_pred = agent._wm.video_pred(batch)
-                video_pred = to_np(video_pred)
-                if video_pred.ndim == 4:
-                    video_pred = video_pred[None]
-                logger.video(f"eval_openl/batch_{batch_idx}", video_pred)
+            video_pred = to_np(video_pred)
+            if video_pred.ndim == 4:
+                video_pred = video_pred[None]
+            logger.video(f"eval_openl/batch_{batch_idx}", video_pred)
+        processed_batches += 1
+
+    for name, values in metrics.items():
+        logger.scalar(name, float(np.mean(values)))
+    logger.scalar("eval/batches", float(processed_batches))
+    logger.write(fps=False)
+
+
+def _offline_eval_sequential(agent, eval_sequences, config, logger):
+    total_available = len(eval_sequences)
+    target_batches = config.offline_eval_batches or total_available
+    if target_batches <= 0:
+        print("offline_eval_batches <= 0; skipping eval.")
+        return
+    target_batches = min(target_batches, total_available)
+    if target_batches == 0:
+        print("No evaluation episodes available; skipping eval.")
+        return
+
+    metrics = defaultdict(list)
+    video_budget = min(config.offline_eval_video_batches, target_batches)
+    agent.eval()
+
+    processed_batches = 0
+    for batch_idx in range(target_batches):
+        batch = eval_sequences[batch_idx]
+        batch_metrics = _compute_eval_metrics(agent, batch)
+        for name, value in batch_metrics.items():
+            metrics[name].append(value)
+
+        if config.video_pred_log and batch_idx < video_budget:
+            with torch.no_grad():
+                video_pred = agent._wm.video_pred(batch)
+            video_pred = to_np(video_pred)
+            if video_pred.ndim == 4:
+                video_pred = video_pred[None]
+            logger.video(f"eval_openl/batch_{batch_idx}", video_pred)
         processed_batches += 1
 
     for name, values in metrics.items():
@@ -225,10 +341,7 @@ def offline_train(config):
     if not train_eps:
         raise RuntimeError(f"No episodes found in {config.offline_traindir}.")
     if config.offline_evaldir:
-        eval_dir = pathlib.Path(config.offline_evaldir)
-        npz_count = len(list(eval_dir.glob('*.npz')))
-        eval_limit = npz_count or None
-        eval_eps = tools.load_episodes(config.offline_evaldir, limit=eval_limit)
+        eval_eps = tools.load_episodes(config.offline_evaldir)
     else:
         eval_eps = train_eps
     first_episode = next(iter(train_eps.values()))
@@ -237,6 +350,7 @@ def offline_train(config):
 
     train_dataset = None if config.eval_only else make_dataset(train_eps, config)
     eval_dataset = _make_eval_dataset(eval_eps, config)
+    eval_sequences = _make_eval_sequences(eval_eps)
 
     agent = Dreamer(obs_space, act_space, config, logger, train_dataset).to(config.device)
     agent.requires_grad_(requires_grad=False)
@@ -261,18 +375,26 @@ def offline_train(config):
     if wandb_run is not None:
         logger.attach_wandb(wandb, wandb_run)
 
-    checkpoint_path = logdir / "latest.pt"
-    if checkpoint_path.exists():
-        print(f"Resuming from {checkpoint_path}.")
-        checkpoint = torch.load(checkpoint_path)
+    save_checkpoint_path = logdir / "latest.pt"
+    resume_checkpoint = getattr(config, "resume_checkpoint", None)
+    if resume_checkpoint:
+        load_checkpoint_path = pathlib.Path(resume_checkpoint).expanduser()
+    else:
+        load_checkpoint_path = save_checkpoint_path
+
+    if load_checkpoint_path.exists():
+        print(f"Resuming from {load_checkpoint_path}.")
+        checkpoint = torch.load(load_checkpoint_path)
         agent.load_state_dict(checkpoint["agent_state_dict"])
         tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
         agent._should_pretrain._once = False
+    elif resume_checkpoint:
+        raise FileNotFoundError(f"Checkpoint not found at provided path: {load_checkpoint_path}")
 
     if config.eval_only:
         print("Running offline evaluation only.")
         logger.step = agent._update_count
-        _offline_eval(agent, eval_dataset, config, logger)
+        _offline_eval(agent, eval_dataset, config, logger, eval_sequences)
         if wandb_run is not None:
             try:
                 wandb.finish()
@@ -306,16 +428,16 @@ def offline_train(config):
         if (
             config.offline_eval_every > 0
             and agent._update_count % config.offline_eval_every == 0
-            and config.offline_eval_batches > 0
+            and (config.offline_eval_batches > 0 or config.offline_eval_preserve_length)
         ):
-            _offline_eval(agent, eval_dataset, config, logger)
+            _offline_eval(agent, eval_dataset, config, logger, eval_sequences)
         if (agent._update_count % config.offline_checkpoint_every) == 0:
             torch.save(
                 {
                     "agent_state_dict": agent.state_dict(),
                     "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
                 },
-                checkpoint_path,
+                save_checkpoint_path,
             )
 
     print("Offline training finished.")
@@ -324,12 +446,12 @@ def offline_train(config):
             "agent_state_dict": agent.state_dict(),
             "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
         },
-        checkpoint_path,
+        save_checkpoint_path,
     )
-    if config.offline_eval_batches > 0:
+    if config.offline_eval_batches > 0 or config.offline_eval_preserve_length:
         print("Running offline evaluation after training.")
     logger.step = agent._update_count
-    _offline_eval(agent, eval_dataset, config, logger)
+    _offline_eval(agent, eval_dataset, config, logger, eval_sequences)
     if wandb_run is not None:
         try:
             wandb.finish()
@@ -367,6 +489,8 @@ if __name__ == "__main__":
     defaults.setdefault("offline_eval_video_batches", 1)
     defaults.setdefault("offline_traindir", "")
     defaults.setdefault("offline_evaldir", "")
+    defaults.setdefault("resume_checkpoint", "")
+    defaults.setdefault("offline_eval_preserve_length", False)
 
     parser = argparse.ArgumentParser()
     for key, value in sorted(defaults.items(), key=lambda x: x[0]):

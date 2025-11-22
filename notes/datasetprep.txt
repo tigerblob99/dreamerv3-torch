@@ -1,0 +1,10 @@
+python ./tooljit/dataset_states_to_obs.py --done_mode 2 \
+--dataset ./datasets/liftMH.hdf5 \
+--output_name imageliftMH_v15.hdf5 --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84
+
+python ./toolkit/convert_robomimic_to_dreamer.py \
+  --in_h5 ./datasets/imagecanMH_v15.hdf5 \
+  --out_dir ./datasets/robomimic_data_MV/can_MH_train \
+  --img_keys agentview_image,robot0_eye_in_hand_image \
+  --lowdim_keys robot0_joint_pos,robot0_joint_vel,robot0_gripper_qpos,robot0_gripper_qvel \
+  --aux_only_keys robot0_joint_pos_sin,robot0_joint_pos_cos
