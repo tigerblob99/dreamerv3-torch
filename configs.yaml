@@ -208,7 +208,44 @@ debug:
 robomimic:
   # Robomimic offline setting: single agent camera and physical proprio targets.
   # aux_ sin/cos provided as inputs only (no explicit next-state vector supervision stored).
-  encoder:
+  encoder: &robomimic_encoder
     {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel|aux_.*)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
   decoder:
     {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
+
+bc_defaults:
+  logdir: logdir/BC_MLP/default
+  offline_traindir: ''
+  offline_evaldir: ''
+  device: 'cuda:0'
+  encoder: *robomimic_encoder
+  bc_epochs: 20
+  bc_batch_size: 512
+  bc_lr: 1e-4
+  bc_weight_decay: 0.0
+  bc_eval_every: 100
+  bc_eval_split: 0.1
+  bc_grad_clip: 100.0
+  bc_shuffle: True
+  bc_loss: 'mse'
+  bc_save_path: ''
+
+bc_can_PH:
+  logdir: logdir/BC_MLP/can_PH
+  offline_traindir: datasets/robomimic_data_MV/can_PH_train
+  offline_evaldir: datasets/robomimic_data_MV/can_PH_eval
+  bc_epochs: 100
+  bc_batch_size: 512
+  bc_lr: 5e-4
+  bc_eval_split: 0.1
+  bc_loss: 'mse'
+
+bc_lift_PH:
+  logdir: logdir/BC_MLP/lift_PH
+  offline_traindir: datasets/robomimic_data_MV/lift_PH_train
+  offline_evaldir: datasets/robomimic_data_MV/lift_PH_eval
+  bc_epochs: 50
+  bc_batch_size: 256
+  bc_lr: 3e-4
+  bc_eval_split: 0.2
+  bc_loss: 'mse'

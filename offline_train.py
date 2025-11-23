@@ -168,23 +168,18 @@ def _compute_eval_metrics(agent, batch):
         for key, dist in decoded.items():
             if key not in data:
                 continue
-            recon = dist.mode()
-            truth = data[key]
-            batch_metrics[f"eval/{key}_mse"] = torch.mean((recon - truth) ** 2).item()
+            loss = -dist.log_prob(data[key])
+            batch_metrics[f"eval/{key}_loss"] = torch.mean(loss).item()
 
-        reward_pred = agent._wm.heads["reward"](feat).mode()
-        reward_truth = data["reward"].unsqueeze(-1)
-        batch_metrics["eval/reward_mse"] = (
-            torch.mean((reward_pred - reward_truth) ** 2).item()
-        )
+        if "reward" in data:
+            reward_dist = agent._wm.heads["reward"](feat)
+            reward_loss = -reward_dist.log_prob(data["reward"])
+            batch_metrics["eval/reward_loss"] = torch.mean(reward_loss).item()
 
         if "cont" in agent._wm.heads and "cont" in data:
             cont_dist = agent._wm.heads["cont"](feat)
-            cont_pred = cont_dist.mean if hasattr(cont_dist, "mean") else cont_dist.mode()
-            cont_truth = data["cont"].unsqueeze(-1) if data["cont"].ndim == 2 else data["cont"]
-            batch_metrics["eval/cont_l1"] = (
-                torch.mean(torch.abs(cont_pred - cont_truth)).item()
-            )
+            cont_loss = -cont_dist.log_prob(data["cont"])
+            batch_metrics["eval/cont_loss"] = torch.mean(cont_loss).item()
 
     return batch_metrics
 
@@ -225,9 +220,17 @@ def _setup_config(config):
     )
     config.offline_eval_batches = int(getattr(config, "offline_eval_batches", 0))
     config.offline_eval_video_batches = int(
-        getattr(config, "offline_eval_video_batches", max(1, min(2, config.offline_eval_batches or 1)))
+        getattr(
+            config,
+            "offline_eval_video_batches",
+            max(1, min(2, config.offline_eval_batches or 1)),
+        )
     )
-    config.offline_eval_every = int(getattr(config, "offline_eval_every", config.offline_log_every))
+    raw_eval_every = getattr(config, "offline_eval_every", None)
+    if raw_eval_every is None or raw_eval_every < 0:
+        config.offline_eval_every = config.offline_log_every
+    else:
+        config.offline_eval_every = int(raw_eval_every)
     if not getattr(config, "offline_traindir", None):
         raise ValueError("--offline_traindir must be provided for offline training.")
     dataset_dir = pathlib.Path(config.offline_traindir).expanduser()
@@ -484,7 +487,7 @@ if __name__ == "__main__":
     defaults.setdefault("offline_updates", 100000)
     defaults.setdefault("offline_log_every", 1000)
     defaults.setdefault("offline_checkpoint_every", 10000)
-    defaults.setdefault("offline_eval_every", 0)
+    defaults.setdefault("offline_eval_every", -1)
     defaults.setdefault("offline_eval_batches", 0)
     defaults.setdefault("offline_eval_video_batches", 1)
     defaults.setdefault("offline_traindir", "")
