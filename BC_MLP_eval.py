@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -22,7 +23,6 @@ try:
 except ImportError:
 	cv2 = None
 
-import networks
 import tools
 from BC_MLP_train import _build_encoder, _extract_encoder_state, _load_config
 from envs.robosuite_env import (
@@ -65,9 +65,23 @@ class EvalConfig:
 	replay_demo_key: str | None
 	replay_max_steps: int | None
 	action_dim: int | None = None
+	# Ordered keys from config for consistent encoder input ordering
+	bc_cnn_keys_order: Tuple[str, ...] = ("image",)
+	bc_mlp_keys_order: Tuple[str, ...] = (
+		"robot0_joint_pos",
+		"robot0_joint_vel",
+		"robot0_gripper_qpos",
+		"robot0_gripper_qvel",
+		"aux_robot0_joint_pos_sin",
+		"aux_robot0_joint_pos_cos",
+	)
+	# NPZ-based evaluation (no environment, uses pre-processed observations)
+	replay_use_npz: bool = False  # If True, use NPZ obs instead of env replay
+	npz_evaldir: pathlib.Path | None = None  # Directory containing NPZ episodes
+
+
 def _make_robomimic_can_env(cfg: EvalConfig, image_hw: Tuple[int, int]):
 	suite = importlib.import_module("robosuite")
-
 	load_controller_config = _resolve_controller_loader(suite)
 	controller_cfg = load_controller_config(default_controller=cfg.robosuite_controller)
 	controller_cfg = _ensure_composite_controller_config(controller_cfg, cfg.robosuite_robots)
@@ -110,8 +124,8 @@ def _stack_cameras(obs: Dict[str, Any], camera_keys: Iterable[str], flip_keys: I
 		frame = np.asarray(obs[key])
 		if frame.dtype != np.float32:
 			frame = frame.astype(np.float32)
-		if frame.max() > 1.0:
-			frame /= 255.0
+		#if frame.max() > 1.0:
+		#	frame /= 255.0
 		if key in flip_set:
 			frame = np.flip(frame, axis=(0, 1))
 		frames.append(frame)
@@ -125,6 +139,8 @@ def _log_obs_snapshot(
 	preview: int = 8,
 	full_keys: Iterable[str] | None = None,
 	output_path: pathlib.Path | None = None,
+	image_dir: pathlib.Path | None = None,
+	image_keys: Iterable[str] | None = None,
 ) -> None:
 	full_set = set(full_keys or [])
 	lines = [f"[obs] {label} -> {len(obs)} keys"]
@@ -153,6 +169,18 @@ def _log_obs_snapshot(
 	if output_path is not None:
 		output_path.parent.mkdir(parents=True, exist_ok=True)
 		output_path.write_text(text + "\n")
+	if image_dir is not None and image_keys is not None:
+		image_dir.mkdir(parents=True, exist_ok=True)
+		for key in image_keys:
+			if key not in obs:
+				continue
+			img = np.asarray(obs[key])
+			if img.ndim == 4:
+				img = img[0]
+			if img.dtype != np.uint8:
+				img = np.clip(img * (255.0 if img.max() <= 1.0 else 1.0), 0, 255).astype(np.uint8)
+			path = image_dir / f"{label.replace(' ', '_')}_{key}.png"
+			plt.imsave(path.as_posix(), img)
 
 
 def _load_dataset_obs_frame(
@@ -202,34 +230,44 @@ def _compare_processed_obs(
 def _prepare_obs(
 	raw_obs: Dict[str, Any],
 	*,
+	cnn_keys_order: Tuple[str, ...],
+	mlp_keys_order: Tuple[str, ...],
 	camera_keys: Tuple[str, ...],
 	flip_keys: Tuple[str, ...],
-	mlp_keys: Tuple[str, ...],
 	is_first: bool,
 	is_terminal: bool,
 ) -> Dict[str, Any]:
-	processed: Dict[str, Any] = {}
-	processed["image"] = _stack_cameras(raw_obs, camera_keys, flip_keys)
+	"""Prepare observations in the exact order specified by config keys.
+	
+	The order of keys in the returned OrderedDict matches cnn_keys_order then mlp_keys_order
+	to ensure consistent feature concatenation with training.
+	"""
+	processed: Dict[str, Any] = OrderedDict()
+	
+	# Add CNN keys first in specified order
+	for key in cnn_keys_order:
+		if key == "image":
+			# Stack camera observations into a single image tensor
+			processed["image"] = _stack_cameras(raw_obs, camera_keys, flip_keys)
+		elif key in raw_obs:
+			processed[key] = np.asarray(raw_obs[key], dtype=np.float32)
+	
+	# Mapping for trig keys that need renaming
 	trig_key_map = {
 		"robot0_joint_pos_sin": "aux_robot0_joint_pos_sin",
 		"robot0_joint_pos_cos": "aux_robot0_joint_pos_cos",
 	}
-	seen: set[str] = set()
-	for key in mlp_keys:
-		if key in trig_key_map:
-			# These are renamed below to keep aux_ prefix consistent with training data.
-			continue
-		if key in seen:
-			continue
-		seen.add(key)
-		if key not in raw_obs:
-			continue
-		processed[key] = np.asarray(raw_obs[key], dtype=np.float32)
-
-	for raw_key, aux_key in trig_key_map.items():
-		if raw_key not in raw_obs:
-			continue
-		processed[aux_key] = np.asarray(raw_obs[raw_key], dtype=np.float32)
+	reverse_trig_map = {v: k for k, v in trig_key_map.items()}
+	
+	# Add MLP keys in specified order
+	for key in mlp_keys_order:
+		if key in reverse_trig_map:
+			# This is an aux_ key, get from the original raw key
+			raw_key = reverse_trig_map[key]
+			if raw_key in raw_obs:
+				processed[key] = np.asarray(raw_obs[raw_key], dtype=np.float32)
+		elif key in raw_obs:
+			processed[key] = np.asarray(raw_obs[key], dtype=np.float32)
 
 	processed["is_first"] = np.array([1.0 if is_first else 0.0], dtype=np.float32)
 	processed["is_terminal"] = np.array([1.0 if is_terminal else 0.0], dtype=np.float32)
@@ -237,7 +275,8 @@ def _prepare_obs(
 
 
 def _dict_to_space(obs: Dict[str, Any]):
-	spaces: Dict[str, Any] = {}
+	"""Convert obs dict to gym.spaces.Dict, preserving key order."""
+	spaces: Dict[str, Any] = OrderedDict()
 	for key, value in obs.items():
 		arr = np.asarray(value)
 		dtype = np.uint8 if arr.dtype == np.uint8 else np.float32
@@ -248,13 +287,20 @@ def _dict_to_space(obs: Dict[str, Any]):
 
 
 def _obs_to_torch(obs: Dict[str, Any], device: Any) -> Dict[str, Any]:
-	tensors: Dict[str, Any] = {}
+	"""Convert observation dict to torch tensors, normalizing images to [0, 1].
+	
+	Preserves key ordering from input obs (assumes OrderedDict from _prepare_obs).
+	"""
+	tensors: Dict[str, Any] = OrderedDict()
 	for key, value in obs.items():
 		arr = np.asarray(value)
 		if arr.ndim == 0:
 			arr = arr[None]
 		batch = np.expand_dims(arr, axis=0)
 		tensors[key] = torch.as_tensor(batch, device=device).float()
+		# Normalize images to [0, 1] as done in WorldModel.preprocess()
+		if key == "image":
+			tensors[key] = tensors[key] / 255.0
 	return tensors
 
 
@@ -304,9 +350,10 @@ def _replay_dataset_demo(
 		episode_actions.append(action.copy())
 		step_obs = _prepare_obs(
 			raw_obs,
+			cnn_keys_order=config.bc_cnn_keys_order,
+			mlp_keys_order=config.bc_mlp_keys_order,
 			camera_keys=config.camera_obs_keys,
 			flip_keys=config.flip_camera_keys,
-			mlp_keys=config.mlp_obs_keys,
 			is_first=(idx == 0),
 			is_terminal=False,
 		)
@@ -371,6 +418,131 @@ def _replay_dataset_demo(
 		print(f"[replay] Saved action difference plot to {diff_path}")
 	print(f"[replay] Finished '{demo_key}' replay: reward={total_reward:.2f}, steps={steps}")
 
+
+def _evaluate_npz_demo(
+	config: EvalConfig,
+	npz_evaldir: pathlib.Path,
+	demo_key: str,
+	imgs_dir: pathlib.Path,
+	encoder: torch.nn.Module,
+	policy: torch.nn.Module,
+	device: torch.device,
+	*,
+	max_steps: int | None = None,
+):
+	"""
+	Evaluate policy on NPZ episode data directly (no environment interaction).
+	
+	Uses the pre-processed observations from the NPZ file to compute policy
+	predictions and compare against ground truth actions.
+	"""
+	import tools
+	
+	# Load the specific episode from the NPZ directory
+	npz_files = list(npz_evaldir.glob(f"{demo_key}-*.npz"))
+	if not npz_files:
+		# Try without the length suffix
+		npz_files = list(npz_evaldir.glob(f"{demo_key}*.npz"))
+	if not npz_files:
+		print(f"[npz_eval] demo '{demo_key}' not found in {npz_evaldir}; skipping")
+		return None
+	
+	npz_path = npz_files[0]
+	ep = dict(np.load(npz_path))
+	
+	actions = ep.get("action")
+	if actions is None or actions.size == 0:
+		print(f"[npz_eval] demo '{demo_key}' has no actions; skipping")
+		return None
+	
+	available_steps = actions.shape[0]
+	limit = max_steps if max_steps and max_steps > 0 else available_steps
+	limit = min(limit, available_steps)
+	
+	print(f"[npz_eval] Evaluating '{demo_key}' from NPZ ({limit} steps)")
+	
+	# Get observation keys (exclude action, reward, etc.)
+	obs_keys = [k for k in ep.keys() if k not in ('action', 'reward', 'discount', 'is_first', 'is_terminal') and not k.startswith('log_')]
+	
+	# Build observation tensors for all timesteps at once
+	obs_dict = {}
+	for k in obs_keys:
+		arr = ep[k][:limit]
+		if arr.ndim == 1:
+			arr = arr[:, None]
+		obs_dict[k] = torch.as_tensor(arr, device=device).float()
+		# Normalize images to [0, 1] as done in WorldModel.preprocess()
+		if k == "image":
+			obs_dict[k] = obs_dict[k] / 255.0
+	
+	gt_actions = actions[:limit]
+	
+	# Run policy on all observations
+	encoder.eval()
+	policy.eval()
+	with torch.no_grad():
+		embedding = encoder(obs_dict)
+		pred_actions = policy(embedding).cpu().numpy()
+	
+	if config.clip_actions:
+		pred_actions = np.clip(pred_actions, -1.0, 1.0)
+	
+	# Compute metrics
+	action_diffs = pred_actions - gt_actions
+	mse = np.mean(action_diffs ** 2)
+	mae = np.mean(np.abs(action_diffs))
+	rmse = np.sqrt(mse)
+	
+	per_dim_mse = np.mean(action_diffs ** 2, axis=0)
+	per_dim_mae = np.mean(np.abs(action_diffs), axis=0)
+	
+	print(f"[npz_eval] {demo_key}: MSE={mse:.6f}, MAE={mae:.6f}, RMSE={rmse:.6f}")
+	print(f"[npz_eval] Per-dim MSE: {[f'{x:.4f}' for x in per_dim_mse]}")
+	
+	# Save action comparison plot
+	dim = gt_actions.shape[1]
+	fig, axes = plt.subplots(dim, 1, figsize=(12, 2.4 * dim), sharex=True)
+	if dim == 1:
+		axes = [axes]
+	for i in range(dim):
+		axes[i].plot(gt_actions[:, i], label="dataset", linewidth=2, color='black')
+		axes[i].plot(pred_actions[:, i], label="policy", linewidth=1, linestyle="--", color='red', alpha=0.8)
+		axes[i].set_ylabel(f"Dim {i}")
+		if i == 0:
+			axes[i].legend(loc="upper right")
+	axes[-1].set_xlabel("Timestep")
+	plt.suptitle(f"{demo_key} NPZ Eval - MSE: {mse:.4f}, MAE: {mae:.4f}")
+	plt.tight_layout()
+	plot_path = imgs_dir / f"{demo_key}_npz_eval_actions.png"
+	plt.savefig(plot_path)
+	plt.close(fig)
+	print(f"[npz_eval] Saved action plot to {plot_path}")
+	
+	# Save action difference plot
+	fig, axes = plt.subplots(dim, 1, figsize=(12, 2.0 * dim), sharex=True)
+	if dim == 1:
+		axes = [axes]
+	for i in range(dim):
+		axes[i].plot(action_diffs[:, i], color='blue', alpha=0.7)
+		axes[i].axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+		axes[i].set_ylabel(f"Δ Dim {i}")
+	axes[-1].set_xlabel("Timestep")
+	plt.suptitle(f"{demo_key} Policy − Dataset action difference")
+	plt.tight_layout()
+	diff_path = imgs_dir / f"{demo_key}_npz_eval_action_diff.png"
+	plt.savefig(diff_path)
+	plt.close(fig)
+	print(f"[npz_eval] Saved action difference plot to {diff_path}")
+	
+	return {
+		'demo_key': demo_key,
+		'steps': limit,
+		'mse': float(mse),
+		'mae': float(mae),
+		'rmse': float(rmse),
+		'per_dim_mse': per_dim_mse.tolist(),
+		'per_dim_mae': per_dim_mae.tolist(),
+	}
 
 
 class EpisodeVideoRecorder:
@@ -572,16 +744,23 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 		env.sim.set_state_from_flattened(initial_state)
 		env.sim.forward()
 		obs = env._get_observations()
-		_log_obs_snapshot("initial dataset state (warmup)", obs)
+		_log_obs_snapshot(
+			"initial_dataset_state_warmup",
+			obs,
+		)
 	else:
 		obs = env.reset()
-		_log_obs_snapshot("initial random reset (warmup)", obs)
+		_log_obs_snapshot(
+			"initial_random_reset_warmup",
+			obs,
+		)
 
 	processed = _prepare_obs(
 		obs,
+		cnn_keys_order=config.bc_cnn_keys_order,
+		mlp_keys_order=config.bc_mlp_keys_order,
 		camera_keys=config.camera_obs_keys,
 		flip_keys=config.flip_camera_keys,
-		mlp_keys=config.mlp_obs_keys,
 		is_first=True,
 		is_terminal=False,
 	)
@@ -594,9 +773,10 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 		else:
 			dataset_processed = _prepare_obs(
 				dataset_obs,
+				cnn_keys_order=config.bc_cnn_keys_order,
+				mlp_keys_order=config.bc_mlp_keys_order,
 				camera_keys=config.camera_obs_keys,
 				flip_keys=config.flip_camera_keys,
-				mlp_keys=config.mlp_obs_keys,
 				is_first=True,
 				is_terminal=False,
 			)
@@ -651,11 +831,28 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 	policy.load_state_dict(policy_ckpt["action_mlp_state_dict"])
 
 	if config.replay_dataset_demo:
-		if not dataset_file or not demo_keys:
-			print("[replay] --replay_dataset_demo requested but --dataset_path is missing demos; skipping replay")
+		replay_key = config.replay_demo_key or (demo_keys[0] if demo_keys else "demo_0")
+		
+		if config.replay_use_npz:
+			# NPZ-based evaluation (no environment interaction)
+			if config.npz_evaldir is None or not config.npz_evaldir.exists():
+				print("[npz_eval] --replay_use_npz requested but --npz_evaldir is missing or invalid; skipping")
+			else:
+				_evaluate_npz_demo(
+					config,
+					config.npz_evaldir,
+					replay_key,
+					imgs_dir,
+					encoder,
+					policy,
+					device,
+					max_steps=config.replay_max_steps,
+				)
 		else:
-			replay_key = config.replay_demo_key or demo_keys[0]
-			if replay_key not in dataset_file["data"]:
+			# Environment-based replay (original behavior)
+			if not dataset_file or not demo_keys:
+				print("[replay] --replay_dataset_demo requested but --dataset_path is missing demos; skipping replay")
+			elif replay_key not in dataset_file["data"]:
 				print(f"[replay] demo '{replay_key}' not found in dataset; available keys start with {demo_keys[:3]}")
 			else:
 				_replay_dataset_demo(
@@ -679,13 +876,23 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 			demo_key = demo_keys[episode % len(demo_keys)]
 			initial_state = dataset_file["data"][demo_key]["states"][0]
 			env.reset()
+			rand_obs = env._get_observations()
+			_log_obs_snapshot(
+    			f"episode {episode + 1} random_reset_before_dataset",
+    			rand_obs,
+    			image_dir=pathlib.Path("imgs/initial_obs"),
+    			image_keys=config.camera_obs_keys,
+			)
 			env.sim.set_state_from_flattened(initial_state)
 			env.sim.forward()
-			raw_obs = env._get_observations()
+			
+			raw_obs = env._get_observations(force_update=True)
 			print(f"Initialized episode {episode + 1} from dataset demo '{demo_key}'")
 			_log_obs_snapshot(
 				f"episode {episode + 1} dataset state ({demo_key})",
 				raw_obs,
+				image_dir=pathlib.Path("imgs/initial_obs"),
+				image_keys=config.camera_obs_keys,
 			)
 		else:
 			raw_obs = env.reset()
@@ -695,17 +902,20 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 				raw_obs,
 			)
 		video_recorder.start_episode(episode)
-		video_recorder.add_frame(raw_obs)
+		for i in range(50):
+			video_recorder.add_frame(raw_obs)
 		done = False
 		total_reward = 0.0
 		steps = 0
 		episode_actions = []
+		info = {}  # Initialize info in case loop doesn't execute
 		while not done and steps < config.max_env_steps:
 			step_obs = _prepare_obs(
 				raw_obs,
+				cnn_keys_order=config.bc_cnn_keys_order,
+				mlp_keys_order=config.bc_mlp_keys_order,
 				camera_keys=config.camera_obs_keys,
 				flip_keys=config.flip_camera_keys,
-				mlp_keys=config.mlp_obs_keys,
 				is_first=(steps == 0),
 				is_terminal=done,
 			)
@@ -722,7 +932,10 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 			total_reward += float(reward)
 			steps += 1
 			if done:
-				success_flags.append(_extract_success(info, env))
+				break
+
+		# Always check success at end of episode (whether done naturally or truncated)
+		success_flags.append(_extract_success(info, env))
 
 		if episode_actions:
 			acts = np.array(episode_actions)
@@ -775,7 +988,7 @@ def _parse_args():
 	parser.add_argument(
 		"--flip_camera_keys",
 		nargs="+",
-		default=[],
+		default=["agentview_image", "robot0_eye_in_hand_image"],
 		help="Observation keys whose frames should be flipped vertically and horizontally before stacking",
 	)
 	parser.add_argument(
@@ -837,6 +1050,17 @@ def _parse_args():
 		default="",
 		help="File to store encoder input snapshot for the first dataset demo (empty to disable)",
 	)
+	parser.add_argument(
+		"--replay_use_npz",
+		action="store_true",
+		help="Use NPZ observations directly instead of environment replay (faster, no sim needed)",
+	)
+	parser.add_argument(
+		"--npz_evaldir",
+		type=str,
+		default="",
+		help="Directory containing NPZ episode files for NPZ-based evaluation",
+	)
 	args, remaining = parser.parse_known_args()
 	config = _load_config(args.configs, remaining)
 
@@ -858,6 +1082,7 @@ def _parse_args():
 	encoder_snapshot_path = pathlib.Path(args.encoder_snapshot_file).expanduser() if args.encoder_snapshot_file else None
 	replay_demo_key = args.replay_demo_key.strip() or None
 	replay_max_steps = args.replay_max_steps if args.replay_max_steps > 0 else None
+	npz_evaldir = pathlib.Path(args.npz_evaldir).expanduser() if args.npz_evaldir else None
 
 	eval_cfg = EvalConfig(
 		policy_path=policy_path,
@@ -891,6 +1116,17 @@ def _parse_args():
 		replay_dataset_demo=args.replay_dataset_demo,
 		replay_demo_key=replay_demo_key,
 		replay_max_steps=replay_max_steps,
+		bc_cnn_keys_order=tuple(getattr(config, "bc_cnn_keys_order", ["image"])),
+		bc_mlp_keys_order=tuple(getattr(config, "bc_mlp_keys_order", [
+			"robot0_joint_pos",
+			"robot0_joint_vel",
+			"robot0_gripper_qpos",
+			"robot0_gripper_qvel",
+			"aux_robot0_joint_pos_sin",
+			"aux_robot0_joint_pos_cos",
+		])),
+		replay_use_npz=args.replay_use_npz,
+		npz_evaldir=npz_evaldir,
 	)
 
 	config.camera_obs_keys = eval_cfg.camera_obs_keys

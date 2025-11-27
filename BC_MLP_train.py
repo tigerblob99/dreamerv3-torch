@@ -1,3 +1,62 @@
+"""
+Behavior Cloning (BC) training script using a frozen Dreamer encoder + trainable MLP policy.
+
+This script loads a pre-trained Dreamer encoder from a checkpoint, freezes it, and trains
+an MLP policy head on top using supervised learning (behavior cloning) from offline demonstrations.
+
+Required inputs:
+    1. A Dreamer checkpoint (--checkpoint) containing the trained encoder weights
+    2. An offline dataset directory (--offline_traindir) with NPZ episode files
+       (created by convert_robomimic_to_dreamer.py)
+
+The encoder processes observations exactly as during Dreamer training:
+    - Images are normalized to [0, 1] by dividing by 255
+    - CNN keys (e.g., "image") and MLP keys are concatenated in the order specified
+      by bc_cnn_keys_order and bc_mlp_keys_order in the config
+
+Example usage:
+    # Train BC policy on Can PH dataset using pre-trained Dreamer encoder
+    python BC_MLP_train.py \\
+        --configs bc_defaults bc_can_PH \\
+        --checkpoint logdir/robomimic_offline_can_MH/latest.pt \\
+        --offline_traindir datasets/robomimic_data_MV/can_PH_train \\
+        --bc_epochs 1000 \\
+        --bc_batch_size 512 \\
+        --bc_lr 1e-4
+
+    # Train with custom settings
+    python BC_MLP_train.py \\
+        --configs bc_defaults \\
+        --checkpoint path/to/dreamer/latest.pt \\
+        --offline_traindir path/to/npz/episodes \\
+        --offline_evaldir path/to/eval/episodes \\
+        --bc_epochs 50 \\
+        --bc_batch_size 256 \\
+        --bc_lr 1e-4 \\
+        --bc_save_path path/to/save/bc_policy.pt
+
+Config options (set in configs.yaml or via command line):
+    --checkpoint          Path to Dreamer checkpoint with trained encoder
+    --offline_traindir    Directory containing training NPZ episodes
+    --offline_evaldir     (optional) Directory containing eval NPZ episodes
+    --bc_epochs           Number of training epochs (default: 20)
+    --bc_batch_size       Batch size for training (default: 512)
+    --bc_lr               Learning rate (default: 1e-4)
+    --bc_weight_decay     Weight decay for Adam optimizer (default: 0.0)
+    --bc_eval_every       Evaluate every N epochs (default: 100)
+    --bc_eval_split       Fraction of data for eval if no eval dir (default: 0.1)
+    --bc_grad_clip        Gradient clipping norm (default: 100.0)
+    --bc_shuffle          Shuffle training data each epoch (default: True)
+    --bc_loss             Loss function: 'mse' or 'l1' (default: 'mse')
+    --bc_save_path        Path to save trained policy (default: logdir/bc_action_mlp.pt)
+
+Output:
+    Saves bc_action_mlp.pt containing:
+        - action_mlp_state_dict: trained MLP weights
+        - config: training configuration
+        - encoder_outdim: encoder output dimension (for loading in eval)
+"""
+
 import argparse
 import os
 import pathlib
@@ -5,9 +64,11 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from collections import OrderedDict
 
 os.environ.setdefault("MUJOCO_GL", "osmesa")
 
+import gym
 import ruamel.yaml as yaml
 
 import torch
@@ -54,8 +115,55 @@ def _load_config(config_names, remaining_args):
     return parser.parse_args(remaining_args)
 
 
+def _build_ordered_obs_space(config, reference_episode):
+    """Build an observation space with keys in the order specified by config.
+    
+    Uses bc_cnn_keys_order and bc_mlp_keys_order from config to ensure
+    consistent ordering between training and evaluation.
+    """
+    cnn_keys = getattr(config, "bc_cnn_keys_order", None) or []
+    mlp_keys = getattr(config, "bc_mlp_keys_order", None) or []
+    
+    if not cnn_keys and not mlp_keys:
+        # Fallback to inferring from episode if no explicit ordering given
+        print("Warning: No bc_cnn_keys_order or bc_mlp_keys_order in config, inferring from episode")
+        return _infer_spaces(reference_episode)[0]
+    
+    ordered_spaces = OrderedDict()
+    
+    # Add CNN keys first in specified order
+    for key in cnn_keys:
+        if key not in reference_episode:
+            raise KeyError(f"CNN key '{key}' from config not found in episode data")
+        value = reference_episode[key]
+        shape = value.shape[1:]  # Remove time dimension
+        if value.dtype == np.uint8:
+            ordered_spaces[key] = gym.spaces.Box(
+                low=0, high=255, shape=shape, dtype=np.uint8
+            )
+        else:
+            ordered_spaces[key] = gym.spaces.Box(
+                low=-np.inf, high=np.inf, shape=shape, dtype=np.float32
+            )
+    
+    # Add MLP keys in specified order
+    for key in mlp_keys:
+        if key not in reference_episode:
+            raise KeyError(f"MLP key '{key}' from config not found in episode data")
+        value = reference_episode[key]
+        shape = value.shape[1:]  # Remove time dimension
+        ordered_spaces[key] = gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=shape, dtype=np.float32
+        )
+    
+    print(f"Built ordered obs_space with keys: {list(ordered_spaces.keys())}")
+    return gym.spaces.Dict(ordered_spaces)
+
+
 def _build_encoder(config, obs_space):
-    shapes = {key: tuple(space.shape) for key, space in obs_space.spaces.items()}
+    # Use OrderedDict to preserve key order from obs_space
+    shapes = OrderedDict((key, tuple(space.shape)) for key, space in obs_space.spaces.items())
+    print(f"Building encoder with shapes order: {list(shapes.keys())}")
     encoder = networks.MultiEncoder(shapes, **config.encoder).to(config.device)
     encoder.eval()
     return encoder
@@ -78,7 +186,10 @@ def BC_MLP(config):
     if not dataset:
         raise RuntimeError(f"No episodes found in {config.offline_traindir}.")
     first_episode = next(iter(dataset.values()))
-    obs_space, act_space = _infer_spaces(first_episode)
+    
+    # Use ordered obs_space from config keys, falling back to inferred spaces
+    obs_space = _build_ordered_obs_space(config, first_episode)
+    _, act_space = _infer_spaces(first_episode)
 
     encoder = _build_encoder(config, obs_space)
 
@@ -158,6 +269,9 @@ def _sample_batch(samples, batch_size, device):
         if arr.ndim == 1:
             arr = arr[:, None]
         batch_obs[k] = torch.as_tensor(arr, device=device).float()
+        # Normalize images to [0, 1] as done in WorldModel.preprocess()
+        if k == "image":
+            batch_obs[k] = batch_obs[k] / 255.0
     batch_actions = torch.as_tensor(np.asarray(batch_actions), device=device).float()
     return batch_obs, batch_actions
 
@@ -169,8 +283,10 @@ def BC_MLP_train(config, encoder, action_mlp):
     eval_eps = tools.load_episodes(eval_dir, limit=config.dataset_size) if eval_dir else {}
     if not train_eps:
         raise RuntimeError("No episodes for BC training.")
-    episode_items = list(train_eps.items())
-    if config.bc_eval_split > 0:
+    
+    # Only split training data for eval if no separate eval directory was provided
+    if not eval_eps and config.bc_eval_split > 0:
+        episode_items = list(train_eps.items())
         eval_cut = int(len(episode_items) * config.bc_eval_split)
         eval_eps = dict(episode_items[:eval_cut]) if eval_cut > 0 else {}
         train_eps = dict(episode_items[eval_cut:])
@@ -178,6 +294,8 @@ def BC_MLP_train(config, encoder, action_mlp):
 
     train_samples = _flatten_episodes(train_eps)
     eval_samples = _flatten_episodes(eval_eps) if eval_eps else []
+    # Keep eval episodes as a list for visualization of complete episodes
+    eval_episodes_list = list(eval_eps.values()) if eval_eps else []
     print(f"Flattened train samples: {len(train_samples)}, eval samples: {len(eval_samples)}")
 
     encoder.requires_grad_(False)
@@ -222,6 +340,9 @@ def BC_MLP_train(config, encoder, action_mlp):
                     if arr.ndim == 1:
                         arr = arr[:, None]
                     obs_list[k] = torch.as_tensor(arr, device=config.device).float()
+                    # Normalize images to [0, 1] as done in WorldModel.preprocess()
+                    if k == "image":
+                        obs_list[k] = obs_list[k] / 255.0
                 acts = torch.as_tensor(np.asarray(act_list), device=config.device).float()
                 with torch.no_grad():
                     enc_in = {k: v for k,v in obs_list.items()}
@@ -230,22 +351,30 @@ def BC_MLP_train(config, encoder, action_mlp):
                     loss = loss_fn(pred, acts)
                 losses.append(loss.item())
 
-        # Visualization of the first 100 steps
-        if len(eval_samples) > 0:
+        # Visualization: sample one complete random episode
+        if eval_episodes_list:
             with torch.no_grad():
-                vis_limit = 100
-                vis_chunk = eval_samples[:vis_limit]
-                obs_list = {k: [] for k in vis_chunk[0][0].keys()}
+                # Randomly select one complete episode
+                ep_idx = np.random.randint(0, len(eval_episodes_list))
+                ep = eval_episodes_list[ep_idx]
+                ep_length = ep['action'].shape[0]
+                
+                # Build obs dict for the entire episode
+                obs_list = {k: [] for k in ep.keys() if k not in ('action',) and not k.startswith('log_')}
                 gt_acts = []
-                for obs, act in vis_chunk:
-                    for k, v in obs.items():
-                        obs_list[k].append(v)
-                    gt_acts.append(act)
+                for t in range(ep_length):
+                    for k in obs_list.keys():
+                        obs_list[k].append(ep[k][t])
+                    gt_acts.append(ep['action'][t])
+                
                 for k in obs_list:
                     arr = np.asarray(obs_list[k])
                     if arr.ndim == 1:
                         arr = arr[:, None]
                     obs_list[k] = torch.as_tensor(arr, device=config.device).float()
+                    # Normalize images to [0, 1] as done in WorldModel.preprocess()
+                    if k == "image":
+                        obs_list[k] = obs_list[k] / 255.0
                 
                 enc_in = {k: v for k, v in obs_list.items()}
                 embedding = encoder(enc_in)
@@ -262,6 +391,7 @@ def BC_MLP_train(config, encoder, action_mlp):
                     axes[i].set_ylabel(f'Dim {i}')
                     if i == 0:
                         axes[i].legend()
+                plt.suptitle(f'Episode {ep_idx} ({ep_length} steps)')
                 plt.tight_layout()
                 wandb.log({"eval/action_plots": wandb.Image(fig)}, commit=False)
                 plt.close(fig)

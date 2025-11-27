@@ -219,16 +219,30 @@ bc_defaults:
   offline_evaldir: ''
   device: 'cuda:0'
   encoder: *robomimic_encoder
+  # Explicit key ordering for encoder inputs (must match training data).
+  # These lists define the exact concatenation order for MLP and CNN features.
+  bc_mlp_keys_order:
+    - robot0_joint_pos
+    - robot0_joint_vel
+    - robot0_gripper_qpos
+    - robot0_gripper_qvel
+    - aux_robot0_joint_pos_sin
+    - aux_robot0_joint_pos_cos
+  bc_cnn_keys_order:
+    - image
   bc_epochs: 20
   bc_batch_size: 512
   bc_lr: 1e-4
   bc_weight_decay: 0.0
-  bc_eval_every: 100
+  bc_eval_every: 50
   bc_eval_split: 0.1
   bc_grad_clip: 100.0
   bc_shuffle: True
   bc_loss: 'mse'
   bc_save_path: ''
+  # Replay evaluation mode: 'env' for environment replay, 'npz' for NPZ-based evaluation
+  replay_use_npz: False
+  npz_evaldir: ''
 
 bc_can_PH:
   logdir: logdir/BC_MLP/can_PH
