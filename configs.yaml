@@ -248,7 +248,7 @@ bc_can_PH:
   logdir: logdir/BC_MLP/can_PH
   offline_traindir: datasets/robomimic_data_MV/can_PH_train
   offline_evaldir: datasets/robomimic_data_MV/can_PH_eval
-  bc_epochs: 100
+  bc_epochs: 1000
   bc_batch_size: 512
   bc_lr: 5e-4
   bc_eval_split: 0.1

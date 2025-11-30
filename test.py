@@ -1,255 +1,192 @@
 """
-Compare proprioception observations between NPZ files and environment.
+Compare first-frame images from a converted NPZ demo against freshly rendered
+environment observations initialized to the same joint state.
 
-This script loads a demo from an HDF5 dataset, replays it in the environment,
-and compares the proprioceptive observations at each timestep to identify
-any discrepancies between recorded and simulated observations.
+Usage:
+    python test.py --npz_path /path/to/demo_0-1001.npz \
+                   --task PickPlaceCan \
+                   --camera_keys agentview_image robot0_eye_in_hand_image \
+                   --flip_keys agentview_image robot0_eye_in_hand_image
+
+Notes:
+- The NPZ produced by convert_robomimic_to_dreamer.py does not store simulator
+  states. This script approximates the initial state by setting robot joint
+  positions/velocities (and gripper) from the NPZ low-dim keys if available.
+  If those keys are missing or the env API differs, the script falls back to
+  a plain reset.
+- The script compares only the image tensor stacking along the channel axis.
+  Ensure camera_keys order matches the converter order.
 """
 
+import argparse
 import os
+import pathlib
+from typing import Dict, Iterable, List
+
 os.environ.setdefault("MUJOCO_GL", "osmesa")
 
-import pathlib
 import numpy as np
+
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import h5py
 
-from BC_MLP_eval import (
-    _make_robomimic_can_env,
-    _log_obs_snapshot,
-    EvalConfig,
-)
+import robosuite  # type: ignore
+from envs.robosuite_env import _resolve_controller_loader, _ensure_composite_controller_config
 
 
-def compare_npz_vs_env_proprioception(
-    npz_dir: pathlib.Path,
-    hdf5_path: pathlib.Path,
-    demo_key: str = "demo_0",
-    output_dir: pathlib.Path = pathlib.Path("imgs/obs_comparison"),
-):
-    """
-    Compare proprioception observations between NPZ file and environment replay.
-    
-    Args:
-        npz_dir: Directory containing NPZ files with pre-processed observations
-        hdf5_path: Path to HDF5 dataset with states for environment reset
-        demo_key: Demo key to compare (e.g., "demo_0")
-        output_dir: Directory to save comparison plots
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Load NPZ episode
-    npz_files = list(npz_dir.glob(f"{demo_key}-*.npz"))
-    if not npz_files:
-        npz_files = list(npz_dir.glob(f"{demo_key}*.npz"))
-    if not npz_files:
-        raise FileNotFoundError(f"No NPZ file found for {demo_key} in {npz_dir}")
-    
-    npz_file = npz_files[0]
-    print(f"Loading NPZ from: {npz_file}")
-    npz_data = dict(np.load(npz_file))
-    
-    # Load HDF5 for states
-    print(f"Loading HDF5 from: {hdf5_path}")
-    with h5py.File(hdf5_path, "r") as f:
-        if demo_key not in f["data"]:
-            raise KeyError(f"Demo '{demo_key}' not found in HDF5")
-        demo = f["data"][demo_key]
-        states = np.array(demo["states"])
-        actions = np.array(demo["actions"])
-    
-    # Create environment
-    config = EvalConfig(
-        policy_path=pathlib.Path("."),  # Dummy, not used
-        checkpoint=pathlib.Path("."),   # Dummy, not used
-        episodes=1,
-        max_env_steps=500,
-        camera_obs_keys=("agentview_image", "robot0_eye_in_hand_image"),
-        mlp_obs_keys=("robot0_joint_pos", "robot0_joint_vel", "robot0_gripper_qpos", "robot0_gripper_qvel"),
-        camera_image_key="image",
-        clip_actions=False,
-        render=False,
-        device="cuda:0",
-        seed=0,
-        robosuite_task="PickPlaceCan",
-        robosuite_robots=("Panda",),
-        robosuite_controller="OSC_POSE",
-        robosuite_reward_shaping=False,
-        robosuite_control_freq=20,
-        flip_camera_keys=("agentview_image", "robot0_eye_in_hand_image"),
-        bc_hidden_units=1024,
-        bc_hidden_layers=4,
-        bc_activation="SiLU",
-        bc_use_layernorm=False,
-        video_dir=None,
-        video_fps=20,
-        video_camera=None,
-        video_camera_keys=None,
-        dataset_path=hdf5_path,
-        dataset_obs_path=None,
-        encoder_snapshot_path=None,
-        replay_dataset_demo=False,
-        replay_demo_key=None,
-        replay_max_steps=None,
-    )
-    
-    print("Creating environment...")
-    env = _make_robomimic_can_env(config, (84, 84))
-    
-    # Proprioception keys to compare
-    proprio_keys = [
-        "robot0_joint_pos",
-        "robot0_joint_vel", 
-        "robot0_gripper_qpos",
-        "robot0_gripper_qvel",
-    ]
-    
-    # Also check trig keys if present in NPZ
-    trig_keys = ["aux_robot0_joint_pos_sin", "aux_robot0_joint_pos_cos"]
-    env_trig_keys = ["robot0_joint_pos_sin", "robot0_joint_pos_cos"]
-    
-    num_steps = min(len(actions), len(states) - 1)
-    print(f"Comparing {num_steps} timesteps...")
-    
-    # Storage for comparison
-    npz_obs = {k: [] for k in proprio_keys + trig_keys}
-    env_obs = {k: [] for k in proprio_keys + env_trig_keys}
-    
-    # Reset to initial state
-    env.reset()
-    env.sim.set_state_from_flattened(states[0])
+def _stack_env_cameras(obs: Dict[str, np.ndarray], camera_keys: Iterable[str], flip_keys: Iterable[str]) -> np.ndarray:
+    """Stack camera observations in the specified order, applying vertical flips where requested."""
+    frames: List[np.ndarray] = []
+    flip_set = set(flip_keys)
+    for key in camera_keys:
+        if key not in obs:
+            raise KeyError(f"Camera observation '{key}' missing from environment output")
+        frame = np.asarray(obs[key])
+        if key in flip_set:
+            frame = np.flip(frame, axis=0)  # vertical flip
+        frames.append(frame)
+    return np.concatenate(frames, axis=-1)
+
+
+def _set_robot_state_from_npz(env, npz_obs: Dict[str, np.ndarray]) -> None:
+    """Best-effort: set robot joint/gripper positions (and optionally velocities) from NPZ low-dim keys."""
+    robot = env.robots[0]
+    qpos = env.sim.data.qpos.copy()
+    qvel = env.sim.data.qvel.copy()
+
+    pos_key = "robot0_joint_pos"
+    vel_key = "robot0_joint_vel"
+    grip_pos_key = "robot0_gripper_qpos"
+    grip_vel_key = "robot0_gripper_qvel"
+
+    if hasattr(robot, "_ref_joint_pos_indexes") and pos_key in npz_obs:
+        idxs = robot._ref_joint_pos_indexes  # type: ignore[attr-defined]
+        if len(idxs) == npz_obs[pos_key].shape[-1]:
+            qpos[idxs] = npz_obs[pos_key]
+    if hasattr(robot, "_ref_joint_vel_indexes") and vel_key in npz_obs:
+        idxs = robot._ref_joint_vel_indexes  # type: ignore[attr-defined]
+        if len(idxs) == npz_obs[vel_key].shape[-1]:
+            qvel[idxs] = npz_obs[vel_key]
+
+    if hasattr(robot, "_ref_gripper_joint_pos_indexes") and grip_pos_key in npz_obs:
+        idxs = robot._ref_gripper_joint_pos_indexes  # type: ignore[attr-defined]
+        if len(idxs) == npz_obs[grip_pos_key].shape[-1]:
+            qpos[idxs] = npz_obs[grip_pos_key]
+    if hasattr(robot, "_ref_gripper_joint_vel_indexes") and grip_vel_key in npz_obs:
+        idxs = robot._ref_gripper_joint_vel_indexes  # type: ignore[attr-defined]
+        if len(idxs) == npz_obs[grip_vel_key].shape[-1]:
+            qvel[idxs] = npz_obs[grip_vel_key]
+
+    env.sim.data.qpos[:] = qpos
+    env.sim.data.qvel[:] = qvel
     env.sim.forward()
-    
-    # Collect observations at each step
-    for t in range(num_steps + 1):
-        # Get environment observation
-        raw_obs = env._get_observations(force_update=True)
-        
-        for k in proprio_keys:
-            if k in raw_obs:
-                env_obs[k].append(np.array(raw_obs[k]))
-        for k in env_trig_keys:
-            if k in raw_obs:
-                env_obs[k].append(np.array(raw_obs[k]))
-        
-        # Get NPZ observation for this timestep
-        for k in proprio_keys:
-            if k in npz_data and t < len(npz_data[k]):
-                npz_obs[k].append(npz_data[k][t])
-        for k in trig_keys:
-            if k in npz_data and t < len(npz_data[k]):
-                npz_obs[k].append(npz_data[k][t])
-        
-        # Step environment with recorded action (except last step)
-        if t < num_steps:
-            env.step(actions[t])
-    
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--npz_path", type=pathlib.Path, required=True, help="Path to a single NPZ demo file")
+    parser.add_argument("--task", type=str, default="PickPlaceCan")
+    parser.add_argument("--robots", nargs="+", default=["Panda"])
+    parser.add_argument("--controller", type=str, default="OSC_POSE")
+    parser.add_argument("--camera_keys", nargs="+", default=["agentview_image", "robot0_eye_in_hand_image"])
+    parser.add_argument("--flip_keys", nargs="+", default=["agentview_image", "robot0_eye_in_hand_image"])
+    parser.add_argument("--image_hw", type=int, nargs=2, default=[84, 84], help="Height width for cameras")
+    parser.add_argument("--render", action="store_true", help="Enable on-screen rendering (offscreen always on)")
+    parser.add_argument("--out_dir", type=pathlib.Path, default=pathlib.Path("imgs/env_vs_npz"))
+    args = parser.parse_args()
+
+    out_dir = args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    npz_path = args.npz_path.expanduser()
+    if not npz_path.exists():
+        raise FileNotFoundError(f"NPZ not found: {npz_path}")
+
+    ep = dict(np.load(npz_path))
+    if "image" not in ep:
+        raise KeyError("NPZ is missing 'image' key; cannot compare images.")
+
+    # Pull first-frame low-dim for setting state
+    npz_obs0 = {k: ep[k][0] for k in ep.keys() if not k.startswith("action") and not k.startswith("reward")}
+
+    # Build env
+    load_controller_config = _resolve_controller_loader(robosuite)
+    controller_cfg = load_controller_config(default_controller=args.controller)
+    controller_cfg = _ensure_composite_controller_config(controller_cfg, tuple(args.robots))
+
+    env = robosuite.make(
+        env_name=args.task,
+        robots=args.robots,
+        controller_configs=controller_cfg,
+        use_object_obs=True,
+        use_camera_obs=True,
+        camera_names=[k.replace("_image", "") for k in args.camera_keys],
+        camera_heights=args.image_hw[0],
+        camera_widths=args.image_hw[1],
+        has_renderer=args.render,
+        has_offscreen_renderer=True,
+        reward_shaping=False,
+        control_freq=20,
+        horizon=1000,
+        ignore_done=False,
+    )
+
+    env.reset()
+    try:
+        _set_robot_state_from_npz(env, npz_obs0)
+        print("Applied NPZ joint/gripper state to env.")
+    except Exception as exc:
+        print(f"[warn] Could not apply NPZ state to env: {exc}")
+
+    env_obs = env._get_observations(force_update=True)
+    env_img = _stack_env_cameras(env_obs, args.camera_keys, args.flip_keys)
+
+    npz_img = ep["image"][0]  # (H,W,3*K)
+
+    if env_img.shape != npz_img.shape:
+        print(f"[shape mismatch] env {env_img.shape} vs npz {npz_img.shape}")
+    else:
+        diff = env_img.astype(np.float32) - npz_img.astype(np.float32)
+        print(
+            f"Image diff stats | max: {np.abs(diff).max():.2f}, mean: {np.abs(diff).mean():.2f}, rmse: {np.sqrt((diff**2).mean()):.2f}"
+        )
+
+    # Save side-by-side comparison
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    # Tile multi-camera channels along width for visualization if needed
+    def _tile(img: np.ndarray) -> np.ndarray:
+        if img.shape[-1] % 3 != 0:
+            return img
+        cams = img.shape[-1] // 3
+        slices = [img[..., i * 3 : (i + 1) * 3] for i in range(cams)]
+        return np.concatenate(slices, axis=1)
+
+    npz_vis = _tile(npz_img.astype(np.uint8))
+    env_vis = _tile(env_img.astype(np.uint8))
+
+    axes[0].imshow(npz_vis)
+    axes[0].set_title("NPZ image (t=0)")
+    axes[1].imshow(env_vis)
+    axes[1].set_title("Env image (t=0)")
+    if env_img.shape == npz_img.shape:
+        diff_vis = np.clip(np.abs(env_img.astype(np.int16) - npz_img.astype(np.int16)), 0, 255).astype(np.uint8)
+        axes[2].imshow(_tile(diff_vis))
+        axes[2].set_title("Abs diff")
+    else:
+        axes[2].axis("off")
+        axes[2].set_title("Shapes differ")
+    for ax in axes:
+        ax.axis("off")
+    plt.tight_layout()
+    out_path = out_dir / "env_vs_npz_image.png"
+    plt.savefig(out_path)
+    plt.close(fig)
+    print(f"Saved comparison to {out_path}")
+
     env.close()
-    
-    # Convert to arrays
-    for k in npz_obs:
-        if npz_obs[k]:
-            npz_obs[k] = np.array(npz_obs[k])
-    for k in env_obs:
-        if env_obs[k]:
-            env_obs[k] = np.array(env_obs[k])
-    
-    # Plot comparisons
-    print("\n=== Proprioception Comparison ===")
-    
-    for key in proprio_keys:
-        if key not in npz_obs or len(npz_obs[key]) == 0:
-            print(f"Skipping {key}: not in NPZ")
-            continue
-        if key not in env_obs or len(env_obs[key]) == 0:
-            print(f"Skipping {key}: not in env obs")
-            continue
-        
-        npz_arr = npz_obs[key]
-        env_arr = env_obs[key]
-        
-        # Align lengths
-        min_len = min(len(npz_arr), len(env_arr))
-        npz_arr = npz_arr[:min_len]
-        env_arr = env_arr[:min_len]
-        
-        diff = npz_arr - env_arr
-        
-        print(f"\n{key}:")
-        print(f"  Shape: NPZ={npz_arr.shape}, Env={env_arr.shape}")
-        print(f"  Diff - max: {np.abs(diff).max():.6f}, mean: {np.abs(diff).mean():.6f}, std: {diff.std():.6f}")
-        
-        # Plot
-        dim = npz_arr.shape[1] if npz_arr.ndim > 1 else 1
-        if npz_arr.ndim == 1:
-            npz_arr = npz_arr[:, None]
-            env_arr = env_arr[:, None]
-            diff = diff[:, None]
-        
-        fig, axes = plt.subplots(dim, 3, figsize=(15, 2.5 * dim))
-        if dim == 1:
-            axes = axes[None, :]
-        
-        for i in range(dim):
-            # NPZ vs Env overlay
-            axes[i, 0].plot(npz_arr[:, i], label='NPZ', alpha=0.7)
-            axes[i, 0].plot(env_arr[:, i], label='Env', alpha=0.7, linestyle='--')
-            axes[i, 0].set_ylabel(f'Dim {i}')
-            axes[i, 0].legend(loc='upper right', fontsize=8)
-            if i == 0:
-                axes[i, 0].set_title('NPZ vs Env')
-            
-            # Difference
-            axes[i, 1].plot(diff[:, i], color='red', alpha=0.7)
-            axes[i, 1].axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-            if i == 0:
-                axes[i, 1].set_title('Difference (NPZ - Env)')
-            
-            # Cumulative difference
-            axes[i, 2].plot(np.cumsum(np.abs(diff[:, i])), color='purple', alpha=0.7)
-            if i == 0:
-                axes[i, 2].set_title('Cumulative |Diff|')
-        
-        axes[-1, 0].set_xlabel('Timestep')
-        axes[-1, 1].set_xlabel('Timestep')
-        axes[-1, 2].set_xlabel('Timestep')
-        
-        plt.suptitle(f'{key} - {demo_key}')
-        plt.tight_layout()
-        plt.savefig(output_dir / f"{demo_key}_{key}_comparison.png", dpi=150)
-        plt.close(fig)
-        print(f"  Saved plot to {output_dir / f'{demo_key}_{key}_comparison.png'}")
-    
-    # Compare trig keys
-    for npz_key, env_key in zip(trig_keys, env_trig_keys):
-        if npz_key not in npz_obs or len(npz_obs[npz_key]) == 0:
-            continue
-        if env_key not in env_obs or len(env_obs[env_key]) == 0:
-            continue
-        
-        npz_arr = npz_obs[npz_key]
-        env_arr = env_obs[env_key]
-        
-        min_len = min(len(npz_arr), len(env_arr))
-        npz_arr = npz_arr[:min_len]
-        env_arr = env_arr[:min_len]
-        
-        diff = npz_arr - env_arr
-        
-        print(f"\n{npz_key} (NPZ) vs {env_key} (Env):")
-        print(f"  Shape: NPZ={npz_arr.shape}, Env={env_arr.shape}")
-        print(f"  Diff - max: {np.abs(diff).max():.6f}, mean: {np.abs(diff).mean():.6f}")
-    
-    print("\n=== Done ===")
 
 
 if __name__ == "__main__":
-    # Example usage - adjust paths as needed
-    compare_npz_vs_env_proprioception(
-        npz_dir=pathlib.Path("datasets/robomimic_data_MV/can_PH_train"),
-        hdf5_path=pathlib.Path("datasets/canPH_raw.hdf5"),
-        demo_key="demo_2",
-        output_dir=pathlib.Path("imgs/obs_comparison"),
-    )
+    main()

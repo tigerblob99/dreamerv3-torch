@@ -7,7 +7,7 @@ import pathlib
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import importlib
 
@@ -273,8 +273,8 @@ def _prepare_obs(
 	mlp_keys_order: Tuple[str, ...],
 	camera_keys: Tuple[str, ...],
 	flip_keys: Tuple[str, ...],
-	is_first: bool,
-	is_terminal: bool,
+	is_first: Optional[bool] = None,
+	is_terminal: Optional[bool] = None,
 ) -> Dict[str, Any]:
 	"""Prepare observations in the exact order specified by config keys.
 	
@@ -308,8 +308,11 @@ def _prepare_obs(
 		elif key in raw_obs:
 			processed[key] = np.asarray(raw_obs[key], dtype=np.float32)
 
-	processed["is_first"] = np.array([1.0 if is_first else 0.0], dtype=np.float32)
-	processed["is_terminal"] = np.array([1.0 if is_terminal else 0.0], dtype=np.float32)
+	if is_first is not None:
+		processed["is_first"] = np.array([1.0 if is_first else 0.0], dtype=np.float32)
+	if is_terminal is not None:
+		processed["is_terminal"] = np.array([1.0 if is_terminal else 0.0], dtype=np.float32)
+
 	return processed
 
 
@@ -414,8 +417,6 @@ def _replay_dataset_demo(
 			mlp_keys_order=config.bc_mlp_keys_order,
 			camera_keys=config.camera_obs_keys,
 			flip_keys=config.flip_camera_keys,
-			is_first=(idx == 0),
-			is_terminal=False,
 		)
 		tensor_obs = _obs_to_torch(step_obs, device)
 		with torch.no_grad():
@@ -845,8 +846,6 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 		mlp_keys_order=config.bc_mlp_keys_order,
 		camera_keys=config.camera_obs_keys,
 		flip_keys=config.flip_camera_keys,
-		is_first=True,
-		is_terminal=False,
 	)
 	if dataset_obs_file and obs_demo_keys:
 		dataset_obs = _load_dataset_obs_frame(dataset_obs_file, obs_demo_keys[0], 0)
@@ -861,8 +860,6 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 				mlp_keys_order=config.bc_mlp_keys_order,
 				camera_keys=config.camera_obs_keys,
 				flip_keys=config.flip_camera_keys,
-				is_first=True,
-				is_terminal=False,
 			)
 			_compare_processed_obs(
 				"demo0 processed obs vs env warmup",
@@ -1000,8 +997,6 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 				mlp_keys_order=config.bc_mlp_keys_order,
 				camera_keys=config.camera_obs_keys,
 				flip_keys=config.flip_camera_keys,
-				is_first=(steps == 0),
-				is_terminal=done,
 			)
 			tensor_obs = _obs_to_torch(step_obs, device)
 			with torch.no_grad():
@@ -1241,4 +1236,3 @@ def main():
 
 if __name__ == "__main__":
 	main()
-

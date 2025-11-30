@@ -97,6 +97,12 @@ def _recursive_update(base, update):
 def _load_config(config_names, remaining_args):
     """Loads and merges configuration from YAML files and command line arguments."""
     configs_path = pathlib.Path(__file__).with_name("configs.yaml")
+    if not configs_path.exists():
+        alt = pathlib.Path(__file__).resolve().parent.parent / "configs.yaml"
+        if alt.exists():
+            configs_path = alt
+        else:
+            raise FileNotFoundError(f"configs.yaml not found at {configs_path} or {alt}")
     configs = yaml.safe_load(configs_path.read_text())
     config = {}
     name_list = ["defaults", *(config_names or [])]

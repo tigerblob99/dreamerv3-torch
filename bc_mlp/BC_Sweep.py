@@ -304,7 +304,6 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
             acts = np.stack(episode_actions)
             action_dim = acts.shape[1]
             steps_arr = np.arange(acts.shape[0])
-            # Matplotlib image
             fig, axes = plt.subplots(action_dim, 1, figsize=(10, 2 * action_dim), sharex=True)
             if action_dim == 1:
                 axes = [axes]
@@ -339,7 +338,7 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
     }
     log_fn(metrics)
     if best_video:
-        log_fn({"env/best_video": wandb.Video(str(best_video), fps=env_cfg.video_fps, caption="best_reward", format="mp4")})
+        log_fn({"env/best_video": wandb.Video(str(best_video), fps=env_cfg.video_fps, caption="best_reward")})
     return metrics
 
 
