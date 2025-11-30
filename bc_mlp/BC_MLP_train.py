@@ -86,6 +86,7 @@ from offline_train import _infer_spaces
 
 
 def _recursive_update(base, update):
+    """Recursively updates a base dictionary with values from an update dictionary."""
     for key, value in update.items():
         if isinstance(value, dict) and key in base:
             _recursive_update(base[key], value)
@@ -94,6 +95,7 @@ def _recursive_update(base, update):
 
 
 def _load_config(config_names, remaining_args):
+    """Loads and merges configuration from YAML files and command line arguments."""
     configs_path = pathlib.Path(__file__).with_name("configs.yaml")
     configs = yaml.safe_load(configs_path.read_text())
     config = {}
@@ -122,11 +124,7 @@ def _load_config(config_names, remaining_args):
 
 
 def _build_ordered_obs_space(config, reference_episode):
-    """Build an observation space with keys in the order specified by config.
-    
-    Uses bc_cnn_keys_order and bc_mlp_keys_order from config to ensure
-    consistent ordering between training and evaluation.
-    """
+    """Builds an observation space with keys ordered as specified in the config."""
     cnn_keys = getattr(config, "bc_cnn_keys_order", None) or []
     mlp_keys = getattr(config, "bc_mlp_keys_order", None) or []
     
@@ -167,6 +165,7 @@ def _build_ordered_obs_space(config, reference_episode):
 
 
 def _build_encoder(config, obs_space):
+    """Builds the encoder network based on the observation space."""
     # Use OrderedDict to preserve key order from obs_space
     shapes = OrderedDict((key, tuple(space.shape)) for key, space in obs_space.spaces.items())
     print(f"Building encoder with shapes order: {list(shapes.keys())}")
@@ -176,14 +175,43 @@ def _build_encoder(config, obs_space):
 
 
 def _extract_encoder_state(agent_state_dict):
+    """Extracts encoder state from the agent's state dictionary."""
     prefix = "_wm._orig_mod.encoder."
     filtered = {key[len(prefix) :]: value for key, value in agent_state_dict.items() if key.startswith(prefix)}
     if not filtered:
         raise KeyError("Encoder weights not found in checkpoint.")
     return filtered
 
+def build_action_mlp(encoder_module, action_space, hidden_units=1024, hidden_layers=4, act_name="SiLU", norm=False, device=None):
+    """Builds a raw-output MLP with hidden activations and final activation sized to action space.
+
+    The network returns non-distribution raw activations (no sampling wrapper).
+    Architecture: [encoder_outdim -> 1024 x (hidden_layers) -> action_dim] with activation after final layer.
+    """
+    act_cls = getattr(torch.nn, act_name)
+    action_dim = action_space.shape[0]
+    layers = []
+    inp_dim = getattr(encoder_module, "outdim", None)
+    if inp_dim is None:
+        raise AttributeError("Encoder module missing 'outdim' attribute needed for BC MLP input size.")
+    for i in range(hidden_layers):
+        layers.append(torch.nn.Linear(inp_dim, hidden_units, bias=False))
+        if norm:
+            layers.append(torch.nn.LayerNorm(hidden_units, eps=1e-03))
+        layers.append(act_cls())
+        inp_dim = hidden_units
+    layers.append(torch.nn.Linear(inp_dim, action_dim))  # no final activation (raw action outputs)
+    mlp = torch.nn.Sequential(*layers)
+    mlp.to(device or config.device)
+    # weight init similar to other modules
+    for m in mlp.modules():
+        if isinstance(m, torch.nn.Linear):
+            tools.weight_init(m)
+    return mlp
+
 
 def BC_MLP(config):
+    """Initializes the encoder and action MLP for behavior cloning."""
     if not config.offline_traindir:
         raise ValueError("--offline_traindir must be provided to infer observation shapes.")
     tools.set_seed_everywhere(config.seed)
@@ -249,7 +277,7 @@ def BC_MLP(config):
     return encoder, action_mlp
 
 def _flatten_episodes(episodes):
-    """Flatten episodes dict into list of (obs_dict, action) per timestep."""
+    """Flattens episode dictionaries into a list of (observation, action) pairs."""
     samples = []
     for ep in episodes.values():
         length = ep['action'].shape[0]
@@ -261,6 +289,7 @@ def _flatten_episodes(episodes):
 
 
 def _sample_batch(samples, batch_size, device):
+    """Samples a batch of observations and actions from the flattened samples."""
     idxs = np.random.randint(0, len(samples), size=batch_size)
     batch_obs = {}
     batch_actions = []
@@ -283,6 +312,7 @@ def _sample_batch(samples, batch_size, device):
 
 
 def BC_MLP_train(config, encoder, action_mlp):
+    """Trains the action MLP using behavior cloning on offline episodes."""
     print("Preparing BC dataset...")
     train_eps = tools.load_episodes(config.offline_traindir, limit=config.dataset_size)
     eval_dir = getattr(config, "offline_evaldir", None)
@@ -324,6 +354,7 @@ def BC_MLP_train(config, encoder, action_mlp):
     )
     wandb.watch(action_mlp, log="all")
     def evaluate():
+        """Evaluates the action MLP on evaluation samples and logs visualizations."""
         if not eval_samples:
             return None
         action_mlp.eval()
