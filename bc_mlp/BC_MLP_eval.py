@@ -86,7 +86,7 @@ class EvalConfig:
 	npz_evaldir: pathlib.Path | None = None  # Directory containing NPZ episodes
 
 
-def _make_robomimic_can_env(cfg: EvalConfig, image_hw: Tuple[int, int]):
+def _make_robomimic_env(cfg: EvalConfig, image_hw: Tuple[int, int]):
 	"""Create and configure a robosuite Can environment.
 
 	Returns a configured environment matching the evaluation settings in ``cfg``
@@ -102,7 +102,9 @@ def _make_robomimic_can_env(cfg: EvalConfig, image_hw: Tuple[int, int]):
 	"""
 	suite = importlib.import_module("robosuite")
 	load_controller_config = _resolve_controller_loader(suite)
-	controller_cfg = load_controller_config(default_controller=cfg.robosuite_controller)
+	controller_cfg = getattr(cfg, "controller_configs", None)
+	if controller_cfg is None:
+		controller_cfg = load_controller_config(default_controller=cfg.robosuite_controller)
 	controller_cfg = _ensure_composite_controller_config(controller_cfg, cfg.robosuite_robots)
 
 	env = suite.make(
@@ -110,16 +112,17 @@ def _make_robomimic_can_env(cfg: EvalConfig, image_hw: Tuple[int, int]):
 		robots=list(cfg.robosuite_robots),
 		controller_configs=controller_cfg,
 		use_object_obs=True,
-		use_camera_obs=True,
+		use_camera_obs=getattr(cfg, "use_camera_obs", True),
 		camera_names=[name.replace("_image", "") for name in cfg.camera_obs_keys],
 		camera_heights=image_hw[0],
 		camera_widths=image_hw[1],
-		has_renderer=cfg.render,
-		has_offscreen_renderer=True,
+		camera_depths=getattr(cfg, "camera_depths", False),
+		has_renderer=getattr(cfg, "has_renderer", cfg.render),
+		has_offscreen_renderer=getattr(cfg, "has_offscreen_renderer", True),
 		reward_shaping=cfg.robosuite_reward_shaping,
 		control_freq=cfg.robosuite_control_freq,
 		horizon=cfg.max_env_steps,
-		ignore_done=False,
+		ignore_done=getattr(cfg, "ignore_done", False),
 	)
 
 	try:
@@ -801,7 +804,7 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 		camera_keys=config.video_camera_keys,
 		flip_keys=config.flip_camera_keys,
 	)
-	env = _make_robomimic_can_env(config, size)
+	env = _make_robomimic_env(config, size)
 	imgs_dir = pathlib.Path("imgs")
 	imgs_dir.mkdir(exist_ok=True)
 

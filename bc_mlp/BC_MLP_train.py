@@ -286,10 +286,14 @@ def _flatten_episodes(episodes):
     """Flattens episode dictionaries into a list of (observation, action) pairs."""
     samples = []
     for ep in episodes.values():
-        length = ep['action'].shape[0]
-        for t in range(length):
-            obs = {k: v[t] for k, v in ep.items() if k not in ('action',) and not k.startswith('log_')}
-            action = ep['action'][t]
+        actions = ep["action"]
+        # Dreamer-style offline data has a dummy action at index 0; real actions start at 1.
+        if actions.shape[0] <= 1:
+            continue  # nothing but dummy
+        for t in range(1, actions.shape[0]):
+            obs_idx = t - 1  # observation before action[t]
+            obs = {k: v[obs_idx] for k, v in ep.items() if k not in ("action",) and not k.startswith("log_")}
+            action = actions[t]
             samples.append((obs, action))
     return samples
 

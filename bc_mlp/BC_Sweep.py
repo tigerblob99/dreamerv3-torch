@@ -7,6 +7,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import ruamel.yaml as yaml
 import torch
 import wandb
 
@@ -22,7 +23,7 @@ from bc_mlp.BC_MLP_train import (
 )
 from offline_train import _infer_spaces
 from bc_mlp.BC_MLP_eval import (
-    _make_robomimic_can_env,
+    _make_robomimic_env,
     _prepare_obs,
     _obs_to_torch,
     _extract_success,
@@ -42,6 +43,23 @@ DEFAULT_MLP_KEYS = (
     "aux_robot0_joint_pos_cos",
 )
 DEFAULT_CAMERA_KEYS = ("agentview_image", "robot0_eye_in_hand_image")
+
+
+def _load_env_block(name: str | None):
+    """Load env config block from configs.yaml if provided."""
+    if not name:
+        return None
+    cfg_path = pathlib.Path(__file__).resolve().parent.parent / "configs.yaml"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"configs.yaml not found at {cfg_path}")
+    parser = yaml.YAML(typ="safe")
+    configs = parser.load(cfg_path.read_text())
+    if name not in configs:
+        raise KeyError(f"Config block '{name}' not found in {cfg_path}")
+    block = configs[name] or {}
+    if not isinstance(block, dict):
+        raise TypeError(f"Config block '{name}' must be a mapping.")
+    return block
 
 
 def _build_scratch_policy(config):
@@ -252,13 +270,18 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
     encoder.eval().to(device)
     policy.eval().to(device)
 
-    env = _make_robomimic_can_env(env_cfg, size)
-    video_recorder = EpisodeVideoRecorder(
-        directory=env_cfg.video_dir,
-        fps=env_cfg.video_fps,
-        camera_key=env_cfg.video_camera,
-        camera_keys=env_cfg.video_camera_keys,
-        flip_keys=env_cfg.flip_camera_keys,
+    env = _make_robomimic_env(env_cfg, size)
+    record_video = not bool(getattr(env_cfg, "disable_video", False))
+    video_recorder = (
+        EpisodeVideoRecorder(
+            directory=env_cfg.video_dir,
+            fps=env_cfg.video_fps,
+            camera_key=env_cfg.video_camera,
+            camera_keys=env_cfg.video_camera_keys,
+            flip_keys=env_cfg.flip_camera_keys,
+        )
+        if record_video
+        else None
     )
 
     rewards = []
@@ -272,7 +295,8 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
         total_reward = 0.0
         steps = 0
         info = {}
-        video_recorder.start_episode(episode)
+        if video_recorder:
+            video_recorder.start_episode(episode)
         episode_actions: list = []
         while not done and steps < env_cfg.max_env_steps:
             step_obs = _prepare_obs(
@@ -291,13 +315,15 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
             if env_cfg.clip_actions:
                 action_np = np.clip(action_np, -1.0, 1.0)
             raw_obs, reward, done, info = env.step(action_np)
-            video_recorder.add_frame(raw_obs)
+            if video_recorder:
+                video_recorder.add_frame(raw_obs)
             total_reward += float(reward)
             steps += 1
             if done:
                 break
 
-        success = _extract_success(info, env)
+        env_success = _extract_success(info, env)
+        success = total_reward > 0.0
         rewards.append(total_reward)
         successes.append(success)
         if episode_actions:
@@ -316,11 +342,12 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
             plt.tight_layout()
             log_fn({f"env/episode_{episode}/actions_image": wandb.Image(fig)}, commit=False)
             plt.close(fig)
-        saved_video = video_recorder.finish_episode()
+        saved_video = video_recorder.finish_episode() if video_recorder else None
         log_fn(
             {
                 "env/episode_reward": total_reward,
                 "env/episode_success": success,
+                "env/episode_env_success": env_success,
                 "env/episode_steps": steps,
             },
             commit=False,
@@ -382,8 +409,12 @@ def _parse_args():
     sweep_parser.add_argument("--wandb_group", type=str, default="bc_sweep")
     sweep_parser.add_argument("--save_dir", type=str, default="")
     sweep_parser.add_argument("--scratch_encoder", action="store_true", help="Train with a freshly initialized encoder instead of loading Dreamer weights")
+    sweep_parser.add_argument("--env_config", type=str, default=None, help="Config block name in configs.yaml for env settings (e.g., lift_env_eval)")
     args, remaining = sweep_parser.parse_known_args()
     config = _load_config(args.configs, remaining)
+    env_block = _load_env_block(args.env_config)
+    if env_block:
+        config.env_config = env_block
     return args, config
 
 
@@ -444,6 +475,26 @@ def main():
             run_config.bc_max_steps = -1
             tools.set_seed_everywhere(run_config.seed)
 
+            env_block = getattr(run_config, "env_config", None) or {}
+            for key in ("robosuite_task", "robosuite_controller", "robosuite_reward_shaping", "robosuite_control_freq", "has_renderer", "has_offscreen_renderer", "ignore_done", "camera_depths", "use_camera_obs"):
+                if key in env_block:
+                    setattr(run_config, key, env_block[key])
+            if "robosuite_robots" in env_block:
+                robots = env_block["robosuite_robots"]
+                run_config.robosuite_robots = tuple(robots) if isinstance(robots, (list, tuple)) else (robots,)
+            if "controller_configs" in env_block:
+                run_config.controller_configs = env_block["controller_configs"]
+            if "camera_obs_keys" in env_block:
+                run_config.camera_obs_keys = tuple(env_block["camera_obs_keys"])
+            if "flip_camera_keys" in env_block:
+                run_config.flip_camera_keys = tuple(env_block["flip_camera_keys"])
+            if "bc_cnn_keys_order" in env_block:
+                run_config.bc_cnn_keys_order = tuple(env_block["bc_cnn_keys_order"])
+            if "bc_mlp_keys_order" in env_block:
+                run_config.bc_mlp_keys_order = tuple(env_block["bc_mlp_keys_order"])
+            if "camera_heights" in env_block and "camera_widths" in env_block:
+                run_config.size = (int(env_block["camera_heights"]), int(env_block["camera_widths"]))
+
             base_name = f"lr{run_config.bc_lr:g}_wd{run_config.bc_weight_decay:g}"
             encoder_init = "scratch" if args.scratch_encoder else "dreamer"
             if encoder_init == "scratch":
@@ -485,8 +536,8 @@ def main():
                     robosuite_reward_shaping=run_config.robosuite_reward_shaping,
                     robosuite_control_freq=run_config.robosuite_control_freq,
                     max_env_steps=args.env_max_steps,
-                    camera_obs_keys=tuple(args.camera_obs_keys),
-                    flip_camera_keys=tuple(args.flip_camera_keys),
+                    camera_obs_keys=tuple(getattr(run_config, "camera_obs_keys", tuple(args.camera_obs_keys))),
+                    flip_camera_keys=tuple(getattr(run_config, "flip_camera_keys", tuple(args.flip_camera_keys))),
                     bc_cnn_keys_order=run_config.bc_cnn_keys_order,
                     bc_mlp_keys_order=run_config.bc_mlp_keys_order,
                     clip_actions=run_config.clip_actions,
@@ -496,6 +547,12 @@ def main():
                     video_fps=args.video_fps,
                     video_camera=args.video_camera or (args.video_camera_keys[0] if args.video_camera_keys else args.camera_obs_keys[0]),
                     video_camera_keys=tuple(args.video_camera_keys) if args.video_camera_keys else tuple(args.camera_obs_keys),
+                    controller_configs=getattr(run_config, "controller_configs", None),
+                    has_offscreen_renderer=getattr(run_config, "has_offscreen_renderer", True),
+                    has_renderer=getattr(run_config, "has_renderer", run_config.render),
+                    ignore_done=getattr(run_config, "ignore_done", False),
+                    camera_depths=getattr(run_config, "camera_depths", False),
+                    use_camera_obs=getattr(run_config, "use_camera_obs", True),
                 )
                 env_metrics = evaluate_in_environment(run_config, enc, mlp, env_cfg, run=run)
                 run.summary.update({f"epoch_{epoch}/eval_loss": eval_loss, **{f"epoch_{epoch}/{k}": v for k, v in env_metrics.items()}})

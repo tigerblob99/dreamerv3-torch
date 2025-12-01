@@ -209,7 +209,7 @@ robomimic:
   # Robomimic offline setting: single agent camera and physical proprio targets.
   # aux_ sin/cos provided as inputs only (no explicit next-state vector supervision stored).
   encoder: &robomimic_encoder
-    {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel|aux_.*)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
+    {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel|aux_.*)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 16, kernel_size: 4, minres: 4, mlp_layers: 2, mlp_units: 1024, symlog_inputs: True}
   decoder:
     {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
 
@@ -231,7 +231,7 @@ bc_defaults:
   bc_cnn_keys_order:
     - image
   bc_epochs: 20
-  bc_batch_size: 512
+  bc_batch_size: 256
   bc_lr: 1e-4
   bc_weight_decay: 0.0
   bc_eval_every: 50
@@ -249,7 +249,7 @@ bc_can_PH:
   offline_traindir: datasets/robomimic_data_MV/can_PH_train
   offline_evaldir: datasets/robomimic_data_MV/can_PH_eval
   bc_epochs: 1000
-  bc_batch_size: 512
+  bc_batch_size: 256
   bc_lr: 5e-4
   bc_eval_split: 0.1
   bc_loss: 'mse'
@@ -263,3 +263,53 @@ bc_lift_PH:
   bc_lr: 3e-4
   bc_eval_split: 0.2
   bc_loss: 'mse'
+
+lift_env_eval:
+  #robosuite_task: Lift
+  #robosuite_robots:
+  #  - Panda
+  #robosuite_controller: OSC_POSE
+  #robosuite_reward_shaping: false
+  #robosuite_control_freq: 20
+  #has_renderer: false
+  #has_offscreen_renderer: true
+  #ignore_done: true
+  #use_camera_obs: true
+  #camera_depths: false
+  #camera_heights: 84
+  #camera_widths: 84
+  #camera_obs_keys:
+  #  - agentview_image
+  #  - robot0_eye_in_hand_image
+  #bc_cnn_keys_order:
+  #  - image
+  #bc_mlp_keys_order:
+  #  - robot0_joint_pos
+  #  - robot0_joint_vel
+  #  - robot0_gripper_qpos
+  #  - robot0_gripper_qvel
+  #  - aux_robot0_joint_pos_sin
+  #  - aux_robot0_joint_pos_cos
+  controller_configs:
+    type: BASIC
+    body_parts:
+      right:
+        type: OSC_POSE
+        input_max: 1
+        input_min: -1
+        output_max: [0.05, 0.05, 0.05, 0.5, 0.5, 0.5]
+        output_min: [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5]
+        kp: 150
+        damping: 1
+        impedance_mode: fixed
+        kp_limits: [0, 300]
+        damping_limits: [0, 10]
+        position_limits: null
+        orientation_limits: null
+        uncouple_pos_ori: true
+        control_delta: true
+        interpolation: null
+        ramp_ratio: 0.2
+        input_ref_frame: world
+        gripper:
+          type: GRIP

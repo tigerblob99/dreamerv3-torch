@@ -1,0 +1,1 @@
+python evals/lift_eval.py --checkpoint checkpoints/bc_sweep_lift/scratch_lr0.0001_wd1e-05_epoch800.pt --offline_traindir datasets/robomimic_data_MV/lift_PH_train --episodes 50 --video_dir videos/lift_eval_test  --env_config lift_env_eval  --no_video 
