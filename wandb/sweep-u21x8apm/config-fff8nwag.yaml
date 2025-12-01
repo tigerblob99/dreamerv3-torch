@@ -1,0 +1,8 @@
+wandb_version: 1
+
+bc_lr:
+  value: 1.0e-05
+bc_weight_decay:
+  value: 0.001
+seed:
+  value: 0
