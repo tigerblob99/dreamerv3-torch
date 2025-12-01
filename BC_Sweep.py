@@ -339,7 +339,24 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
     }
     log_fn(metrics)
     if best_video:
-        log_fn({"env/best_video": wandb.Video(str(best_video), fps=env_cfg.video_fps, caption="best_reward", format="mp4")})
+        try:
+            # W&B only accepts gif/mp4/webm/ogg and non-empty files.
+            suffix = best_video.suffix.lower()
+            if suffix in {".mp4", ".gif", ".webm", ".ogg"} and best_video.exists() and best_video.stat().st_size > 0:
+                log_fn(
+                    {
+                        "env/best_video": wandb.Video(
+                            str(best_video),
+                            fps=env_cfg.video_fps,
+                            caption="best_reward",
+                            format=suffix.lstrip("."),
+                        )
+                    }
+                )
+            else:
+                print(f"[warn] Skipping W&B video upload; invalid or empty file: {best_video}")
+        except Exception as exc:
+            print(f"[warn] Failed to log video to W&B: {exc}")
     return metrics
 
 
@@ -373,7 +390,7 @@ def _parse_args():
     sweep_parser.add_argument("--clip_actions", action="store_true")
     sweep_parser.add_argument("--render", action="store_true")
     sweep_parser.add_argument("--image_size", type=int, nargs=2, default=[84, 84])
-    sweep_parser.add_argument("--robosuite_task", type=str, default="PickPlaceCan")
+    sweep_parser.add_argument("--robosuite_task", type=str, default="Lift")
     sweep_parser.add_argument("--robosuite_robots", nargs="+", default=["Panda"])
     sweep_parser.add_argument("--robosuite_controller", type=str, default="OSC_POSE")
     sweep_parser.add_argument("--robosuite_reward_shaping", action="store_true")

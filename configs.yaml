@@ -257,9 +257,9 @@ bc_can_PH:
 bc_lift_PH:
   logdir: logdir/BC_MLP/lift_PH
   offline_traindir: datasets/robomimic_data_MV/lift_PH_train
-  offline_evaldir: datasets/robomimic_data_MV/lift_PH_eval
-  bc_epochs: 50
-  bc_batch_size: 256
+  #offline_evaldir: datasets/robomimic_data_MV/lift_PH_eval
+  bc_epochs: 1000
+  bc_batch_size: 512
   bc_lr: 3e-4
   bc_eval_split: 0.2
   bc_loss: 'mse'

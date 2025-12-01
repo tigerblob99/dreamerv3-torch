@@ -1,6 +1,6 @@
-python ./tooljit/dataset_states_to_obs.py --done_mode 2 \
---dataset ./datasets/liftMH.hdf5 \
---output_name imageliftMH_v15.hdf5 --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84
+python ./toolkit/dataset_states_to_obs.py --done_mode 2 \
+--dataset ./datasets/lift_PH_RAW.hdf5 \
+--output_name imageliftPH_v15.hdf5 --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84
 
 python ./toolkit/convert_robomimic_to_dreamer.py \
   --in_h5 ./datasets/imagecanMH_v15.hdf5 \
