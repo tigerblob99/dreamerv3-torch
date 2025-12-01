@@ -677,10 +677,16 @@ class EpisodeVideoRecorder:
 			if cv2 is None:
 				raise ImportError("opencv-python is required for video recording; install it to enable --video_dir")
 			self._init_writer()
-			self._path = self._dir / f"episode_{self._episode_idx:03d}.mp4"
-			fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 			h, w = frame_uint8.shape[0], frame_uint8.shape[1]
-			self._writer = cv2.VideoWriter(str(self._path), fourcc, self._fps, (w, h))
+			# Use H.264 / avc1 inside an MP4 container for W&B compatibility.
+			self._path = self._dir / f"episode_{self._episode_idx:03d}.mp4"
+			fourcc = cv2.VideoWriter_fourcc(*"avc1")
+			writer = cv2.VideoWriter(str(self._path), fourcc, self._fps, (w, h))
+			if not writer.isOpened():
+				writer.release()
+				raise RuntimeError("Unable to open video writer with avc1 codec for MP4 output")
+			self._writer = writer
+			print(f"[video] Using codec avc1 for {self._path.name}")
 		self._writer.write(cv2.cvtColor(frame_uint8, cv2.COLOR_RGB2BGR))
 
 	def finish_episode(self) -> pathlib.Path | None:
