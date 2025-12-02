@@ -364,13 +364,13 @@ def BC_MLP_train(config, encoder, action_mlp):
                 ep_idx = np.random.randint(0, len(eval_episodes_list))
                 ep = eval_episodes_list[ep_idx]
                 ep_length = ep['action'].shape[0]
-                
-                # Build obs dict for the entire episode
+                # Skip dummy action at index 0; align obs[t-1] with action[t].
                 obs_list = {k: [] for k in ep.keys() if k not in ('action',) and not k.startswith('log_')}
                 gt_acts = []
-                for t in range(ep_length):
+                for t in range(1, ep_length):
+                    obs_idx = t - 1
                     for k in obs_list.keys():
-                        obs_list[k].append(ep[k][t])
+                        obs_list[k].append(ep[k][obs_idx])
                     gt_acts.append(ep['action'][t])
                 
                 for k in obs_list:

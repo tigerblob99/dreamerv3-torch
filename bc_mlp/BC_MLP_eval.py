@@ -60,6 +60,8 @@ class EvalConfig:
 	bc_hidden_layers: int
 	bc_activation: str
 	bc_use_layernorm: bool
+	bc_crop_height: int
+	bc_crop_width: int
 	video_dir: pathlib.Path | None
 	video_fps: int
 	video_camera: str | None
@@ -276,6 +278,8 @@ def _prepare_obs(
 	mlp_keys_order: Tuple[str, ...],
 	camera_keys: Tuple[str, ...],
 	flip_keys: Tuple[str, ...],
+	crop_height: Optional[int] = None,
+	crop_width: Optional[int] = None,
 	is_first: Optional[bool] = None,
 	is_terminal: Optional[bool] = None,
 ) -> Dict[str, Any]:
@@ -290,7 +294,12 @@ def _prepare_obs(
 	for key in cnn_keys_order:
 		if key == "image":
 			# Stack camera observations into a single image tensor
-			processed["image"] = _stack_cameras(raw_obs, camera_keys, flip_keys)
+			img = _stack_cameras(raw_obs, camera_keys, flip_keys)
+			if crop_height and crop_width and img.shape[0] >= crop_height and img.shape[1] >= crop_width:
+				top = (img.shape[0] - crop_height) // 2
+				left = (img.shape[1] - crop_width) // 2
+				img = img[top : top + crop_height, left : left + crop_width, :]
+			processed["image"] = img
 		elif key in raw_obs:
 			processed[key] = np.asarray(raw_obs[key], dtype=np.float32)
 	
@@ -420,6 +429,8 @@ def _replay_dataset_demo(
 			mlp_keys_order=config.bc_mlp_keys_order,
 			camera_keys=config.camera_obs_keys,
 			flip_keys=config.flip_camera_keys,
+			crop_height=getattr(config, "bc_crop_height", None),
+			crop_width=getattr(config, "bc_crop_width", None),
 		)
 		tensor_obs = _obs_to_torch(step_obs, device)
 		with torch.no_grad():
@@ -765,16 +776,8 @@ def _extract_success(info, env) -> bool:
 		if isinstance(env_info, dict):
 			success = bool(env_info.get("task_success", env_info.get("success", success)))
 		success = bool(info.get("task_success", success))
-	checker = getattr(env, "is_success", None)
-	if callable(checker):
-		try:
-			result = checker()
-			if isinstance(result, dict):
-				success = bool(result.get("task", success))
-			else:
-				success = bool(result)
-		except Exception:
-			pass
+	env_success = env._check_success()
+	success = success or env_success
 	return success
 
 
@@ -855,6 +858,8 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 		mlp_keys_order=config.bc_mlp_keys_order,
 		camera_keys=config.camera_obs_keys,
 		flip_keys=config.flip_camera_keys,
+		crop_height=getattr(config, "bc_crop_height", None),
+		crop_width=getattr(config, "bc_crop_width", None),
 	)
 	if dataset_obs_file and obs_demo_keys:
 		dataset_obs = _load_dataset_obs_frame(dataset_obs_file, obs_demo_keys[0], 0)
@@ -869,6 +874,8 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 				mlp_keys_order=config.bc_mlp_keys_order,
 				camera_keys=config.camera_obs_keys,
 				flip_keys=config.flip_camera_keys,
+				crop_height=getattr(config, "bc_crop_height", None),
+				crop_width=getattr(config, "bc_crop_width", None),
 			)
 			_compare_processed_obs(
 				"demo0 processed obs vs env warmup",
@@ -1006,6 +1013,8 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 				mlp_keys_order=config.bc_mlp_keys_order,
 				camera_keys=config.camera_obs_keys,
 				flip_keys=config.flip_camera_keys,
+				crop_height=getattr(config, "bc_crop_height", None),
+				crop_width=getattr(config, "bc_crop_width", None),
 			)
 			tensor_obs = _obs_to_torch(step_obs, device)
 			with torch.no_grad():
@@ -1108,6 +1117,8 @@ def _parse_args():
 	parser.add_argument("--bc_hidden_layers", type=int, default=4)
 	parser.add_argument("--bc_activation", type=str, default="SiLU")
 	parser.add_argument("--bc_use_layernorm", action="store_true")
+	parser.add_argument("--bc_crop_height", type=int, default=0, help="Center crop height for image observations (0 = no crop)")
+	parser.add_argument("--bc_crop_width", type=int, default=0, help="Center crop width for image observations (0 = no crop)")
 	parser.add_argument("--dataset_path", type=str, default="datasets/canPH_raw.hdf5", help="Path to HDF5 dataset for initial states")
 	parser.add_argument(
 		"--dataset_obs_path",
@@ -1194,6 +1205,8 @@ def _parse_args():
 		bc_hidden_layers=args.bc_hidden_layers,
 		bc_activation=args.bc_activation,
 		bc_use_layernorm=args.bc_use_layernorm,
+		bc_crop_height=args.bc_crop_height,
+		bc_crop_width=args.bc_crop_width,
 		video_dir=video_dir,
 		video_fps=args.video_fps,
 		video_camera=video_camera,
@@ -1229,6 +1242,8 @@ def _parse_args():
 	config.bc_hidden_layers = eval_cfg.bc_hidden_layers
 	config.bc_activation = eval_cfg.bc_activation
 	config.bc_use_layernorm = eval_cfg.bc_use_layernorm
+	config.bc_crop_height = eval_cfg.bc_crop_height
+	config.bc_crop_width = eval_cfg.bc_crop_width
 	config.video_dir = eval_cfg.video_dir
 	config.video_fps = eval_cfg.video_fps
 	config.video_camera = eval_cfg.video_camera

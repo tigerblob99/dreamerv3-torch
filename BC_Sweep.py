@@ -20,13 +20,13 @@ from bc_mlp.BC_MLP_train import (
     _build_ordered_obs_space,
     _build_encoder,
     build_action_mlp,
+    _center_crop,
 )
 from offline_train import _infer_spaces
 from bc_mlp.BC_MLP_eval import (
     _make_robomimic_env,
     _prepare_obs,
     _obs_to_torch,
-    _extract_success,
     EpisodeVideoRecorder,
 )
 
@@ -163,6 +163,12 @@ def BC_MLP_train(
                         arr = arr[:, None]
                     obs_tensor = torch.as_tensor(arr, device=config.device).float()
                     if k == "image":
+                        if getattr(config, "bc_crop_height", 0) and getattr(config, "bc_crop_width", 0):
+                            obs_tensor = _center_crop(
+                                obs_tensor,
+                                int(getattr(config, "bc_crop_height", 0)),
+                                int(getattr(config, "bc_crop_width", 0)),
+                            )
                         obs_tensor = obs_tensor / 255.0
                     obs_list[k] = obs_tensor
                 acts = torch.as_tensor(np.asarray(act_list), device=config.device).float()
@@ -176,11 +182,13 @@ def BC_MLP_train(
                 ep_idx = np.random.randint(0, len(eval_episodes_list))
                 ep = eval_episodes_list[ep_idx]
                 ep_length = ep["action"].shape[0]
+                # Skip the dummy action at index 0; align obs[t-1] with action[t].
                 obs_list = {k: [] for k in ep.keys() if k not in ("action",) and not k.startswith("log_")}
                 gt_acts = []
-                for t in range(ep_length):
+                for t in range(1, ep_length):
+                    obs_idx = t - 1
                     for k in obs_list.keys():
-                        obs_list[k].append(ep[k][t])
+                        obs_list[k].append(ep[k][obs_idx])
                     gt_acts.append(ep["action"][t])
 
                 for k in obs_list:
@@ -189,6 +197,12 @@ def BC_MLP_train(
                         arr = arr[:, None]
                     obs_tensor = torch.as_tensor(arr, device=config.device).float()
                     if k == "image":
+                        if getattr(config, "bc_crop_height", 0) and getattr(config, "bc_crop_width", 0):
+                            obs_tensor = _center_crop(
+                                obs_tensor,
+                                int(getattr(config, "bc_crop_height", 0)),
+                                int(getattr(config, "bc_crop_width", 0)),
+                            )
                         obs_tensor = obs_tensor / 255.0
                     obs_list[k] = obs_tensor
 
@@ -226,7 +240,13 @@ def BC_MLP_train(
         for _ in range(steps_per_epoch):
             if global_step >= total_steps:
                 break
-            batch_obs, batch_actions = _sample_batch(train_samples, config.bc_batch_size, config.device)
+            batch_obs, batch_actions = _sample_batch(
+                train_samples,
+                config.bc_batch_size,
+                config.device,
+                getattr(config, "bc_crop_height", 0),
+                getattr(config, "bc_crop_width", 0),
+            )
             embedding = encoder(batch_obs)
             pred_actions = action_mlp(embedding)
             loss = loss_fn(pred_actions, batch_actions)
@@ -286,6 +306,7 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
 
     rewards = []
     successes = []
+    successes_env = []
     best_reward = -np.inf
     best_video = None
 
@@ -295,6 +316,7 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
         total_reward = 0.0
         steps = 0
         info = {}
+        env_success = False
         if video_recorder:
             video_recorder.start_episode(episode)
         episode_actions: list = []
@@ -305,6 +327,8 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
                 mlp_keys_order=env_cfg.bc_mlp_keys_order,
                 camera_keys=env_cfg.camera_obs_keys,
                 flip_keys=env_cfg.flip_camera_keys,
+                crop_height=getattr(env_cfg, "bc_crop_height", None),
+                crop_width=getattr(env_cfg, "bc_crop_width", None),
             )
             tensor_obs = _obs_to_torch(step_obs, device)
             with torch.no_grad():
@@ -319,10 +343,14 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
                 video_recorder.add_frame(raw_obs)
             total_reward += float(reward)
             steps += 1
+            env_success = env._check_success()
+            if env_success:
+                done = True
             if done:
                 break
 
-        env_success = _extract_success(info, env)
+        env_success = env._check_success()
+        successes_env.append(env_success)
         success = total_reward > 0.0
         rewards.append(total_reward)
         successes.append(success)
@@ -353,15 +381,26 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
             },
             commit=False,
         )
+        print(f"[env eval] episode {episode+1}/{env_cfg.episodes} reward={total_reward:.3f} success={success} env_success={env_success} steps={steps}")
         if saved_video and total_reward >= best_reward:
             best_reward = total_reward
             best_video = saved_video
 
+        # Debug: print env info and is_success for troubleshooting success detection.
+        try:
+            success_state = env.is_success() if hasattr(env, "is_success") else None
+        except Exception:
+            success_state = None
+        print(f"[env eval] episode {episode+1} info={info} is_success={success_state}")
+
     mean_reward = float(np.mean(rewards)) if rewards else float("nan")
-    success_rate = float(np.mean(successes)) if successes else 0.0
+    env_successes = [s for s in successes_env] if 'successes_env' in locals() else []
+    env_success_rate = float(np.mean(env_successes)) if env_successes else 0.0
+    reward_success_rate = float(np.mean(successes)) if successes else 0.0
     metrics = {
         "env/mean_reward": mean_reward,
-        "env/success_rate": success_rate,
+        "env/success_rate": env_success_rate,
+        "env/reward_success_rate": reward_success_rate,
         "env/best_reward": best_reward,
     }
     log_fn(metrics)
@@ -417,7 +456,7 @@ def _parse_args():
     sweep_parser.add_argument("--clip_actions", action="store_true")
     sweep_parser.add_argument("--render", action="store_true")
     sweep_parser.add_argument("--image_size", type=int, nargs=2, default=[84, 84])
-    sweep_parser.add_argument("--robosuite_task", type=str, default="Lift")
+    sweep_parser.add_argument("--robosuite_task", type=str, default="PickPlaceCan")
     sweep_parser.add_argument("--robosuite_robots", nargs="+", default=["Panda"])
     sweep_parser.add_argument("--robosuite_controller", type=str, default="OSC_POSE")
     sweep_parser.add_argument("--robosuite_reward_shaping", action="store_true")
@@ -494,7 +533,7 @@ def main():
             tools.set_seed_everywhere(run_config.seed)
 
             env_block = getattr(run_config, "env_config", None) or {}
-            for key in ("robosuite_task", "robosuite_controller", "robosuite_reward_shaping", "robosuite_control_freq", "has_renderer", "has_offscreen_renderer", "ignore_done", "camera_depths", "use_camera_obs"):
+            for key in ("robosuite_task", "robosuite_controller", "robosuite_reward_shaping", "robosuite_control_freq", "has_renderer", "has_offscreen_renderer", "ignore_done", "camera_depths", "use_camera_obs", "bc_crop_height", "bc_crop_width"):
                 if key in env_block:
                     setattr(run_config, key, env_block[key])
             if "robosuite_robots" in env_block:
@@ -571,6 +610,8 @@ def main():
                     ignore_done=getattr(run_config, "ignore_done", False),
                     camera_depths=getattr(run_config, "camera_depths", False),
                     use_camera_obs=getattr(run_config, "use_camera_obs", True),
+                    bc_crop_height=getattr(run_config, "bc_crop_height", 0),
+                    bc_crop_width=getattr(run_config, "bc_crop_width", 0),
                 )
                 env_metrics = evaluate_in_environment(run_config, enc, mlp, env_cfg, run=run)
                 run.summary.update({f"epoch_{epoch}/eval_loss": eval_loss, **{f"epoch_{epoch}/{k}": v for k, v in env_metrics.items()}})

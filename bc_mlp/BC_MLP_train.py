@@ -133,6 +133,8 @@ def _build_ordered_obs_space(config, reference_episode):
     """Builds an observation space with keys ordered as specified in the config."""
     cnn_keys = getattr(config, "bc_cnn_keys_order", None) or []
     mlp_keys = getattr(config, "bc_mlp_keys_order", None) or []
+    crop_h = int(getattr(config, "bc_crop_height", 0) or 0)
+    crop_w = int(getattr(config, "bc_crop_width", 0) or 0)
     
     if not cnn_keys and not mlp_keys:
         # Fallback to inferring from episode if no explicit ordering given
@@ -147,6 +149,9 @@ def _build_ordered_obs_space(config, reference_episode):
             raise KeyError(f"CNN key '{key}' from config not found in episode data")
         value = reference_episode[key]
         shape = value.shape[1:]  # Remove time dimension
+        if key == "image" and crop_h > 0 and crop_w > 0:
+            # Override spatial dims to match cropped image size
+            shape = (crop_h, crop_w, shape[-1])
         if value.dtype == np.uint8:
             ordered_spaces[key] = gym.spaces.Box(
                 low=0, high=255, shape=shape, dtype=np.uint8
@@ -187,6 +192,33 @@ def _extract_encoder_state(agent_state_dict):
     if not filtered:
         raise KeyError("Encoder weights not found in checkpoint.")
     return filtered
+
+
+def _random_crop(imgs: torch.Tensor, crop_h: int, crop_w: int) -> torch.Tensor:
+    """Random crop a batch of NHWC images (float tensors)."""
+    if crop_h <= 0 or crop_w <= 0:
+        return imgs
+    b, h, w, c = imgs.shape
+    if crop_h > h or crop_w > w:
+        return imgs
+    top = torch.randint(0, h - crop_h + 1, (b,), device=imgs.device)
+    left = torch.randint(0, w - crop_w + 1, (b,), device=imgs.device)
+    out = torch.empty((b, crop_h, crop_w, c), device=imgs.device, dtype=imgs.dtype)
+    for i in range(b):
+        out[i] = imgs[i, top[i] : top[i] + crop_h, left[i] : left[i] + crop_w, :]
+    return out
+
+
+def _center_crop(imgs: torch.Tensor, crop_h: int, crop_w: int) -> torch.Tensor:
+    """Center crop a batch of NHWC images (float tensors)."""
+    if crop_h <= 0 or crop_w <= 0:
+        return imgs
+    b, h, w, c = imgs.shape
+    if crop_h > h or crop_w > w:
+        return imgs
+    top = (h - crop_h) // 2
+    left = (w - crop_w) // 2
+    return imgs[:, top : top + crop_h, left : left + crop_w, :]
 
 def build_action_mlp(encoder_module, action_space, hidden_units=1024, hidden_layers=4, act_name="SiLU", norm=False, device=None):
     """Builds a raw-output MLP with hidden activations and final activation sized to action space.
@@ -298,7 +330,7 @@ def _flatten_episodes(episodes):
     return samples
 
 
-def _sample_batch(samples, batch_size, device):
+def _sample_batch(samples, batch_size, device, crop_height=0, crop_width=0):
     """Samples a batch of observations and actions from the flattened samples."""
     idxs = np.random.randint(0, len(samples), size=batch_size)
     batch_obs = {}
@@ -316,6 +348,8 @@ def _sample_batch(samples, batch_size, device):
         batch_obs[k] = torch.as_tensor(arr, device=device).float()
         # Normalize images to [0, 1] as done in WorldModel.preprocess()
         if k == "image":
+            if crop_height and crop_width and arr.shape[1] >= crop_height and arr.shape[2] >= crop_width:
+                batch_obs[k] = _random_crop(batch_obs[k], int(crop_height), int(crop_width))
             batch_obs[k] = batch_obs[k] / 255.0
     batch_actions = torch.as_tensor(np.asarray(batch_actions), device=device).float()
     return batch_obs, batch_actions
@@ -454,7 +488,13 @@ def BC_MLP_train(config, encoder, action_mlp):
         for step in range(steps_per_epoch):
             if global_step >= total_steps:
                 break
-            batch_obs, batch_actions = _sample_batch(train_samples, config.bc_batch_size, config.device)
+            batch_obs, batch_actions = _sample_batch(
+                train_samples,
+                config.bc_batch_size,
+                config.device,
+                getattr(config, "bc_crop_height", 0),
+                getattr(config, "bc_crop_width", 0),
+            )
             with torch.no_grad():
                 embedding = encoder(batch_obs)
             pred_actions = action_mlp(embedding)

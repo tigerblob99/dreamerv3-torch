@@ -79,6 +79,8 @@ def _load_policy_from_checkpoint(checkpoint_path: pathlib.Path, *, device: str |
         config.offline_traindir = offline_traindir
     config.device = device or getattr(config, "device", "cpu")
     config.size = tuple(getattr(config, "size", (84, 84)))
+    config.bc_crop_height = int(getattr(config, "bc_crop_height", 0) or 0)
+    config.bc_crop_width = int(getattr(config, "bc_crop_width", 0) or 0)
     config.bc_cnn_keys_order = _as_tuple(getattr(config, "bc_cnn_keys_order", None), tuple(DEFAULT_CNN_KEYS))
     config.bc_mlp_keys_order = _as_tuple(getattr(config, "bc_mlp_keys_order", None), tuple(DEFAULT_MLP_KEYS))
     config.camera_obs_keys = _as_tuple(getattr(config, "camera_obs_keys", None), tuple(DEFAULT_CAMERA_KEYS))
@@ -125,7 +127,7 @@ def _build_env_cfg(config: SimpleNamespace, args) -> SimpleNamespace:
     camera_keys = _as_tuple(args.camera_obs_keys, getattr(config, "camera_obs_keys", tuple(DEFAULT_CAMERA_KEYS)))
     video_cam_keys = _as_tuple(args.video_camera_keys, camera_keys)
     return SimpleNamespace(
-        robosuite_task=getattr(config, "robosuite_task", "Lift"),
+        robosuite_task=getattr(config, "robosuite_task", "PickPlaceCan"),
         robosuite_robots=_as_tuple(getattr(config, "robosuite_robots", ("Panda",)), ("Panda",)),
         robosuite_controller=getattr(config, "robosuite_controller", "OSC_POSE"),
         render=bool(getattr(config, "has_renderer", getattr(config, "render", False)) or args.render),
@@ -150,6 +152,8 @@ def _build_env_cfg(config: SimpleNamespace, args) -> SimpleNamespace:
         has_renderer=getattr(config, "has_renderer", getattr(config, "render", False)),
         camera_depths=bool(getattr(config, "camera_depths", False)),
         use_camera_obs=bool(getattr(config, "use_camera_obs", True)),
+        bc_crop_height=getattr(config, "bc_crop_height", 0),
+        bc_crop_width=getattr(config, "bc_crop_width", 0),
     )
 
 
@@ -183,7 +187,7 @@ def main():
         args.checkpoint, device=args.device, offline_traindir=args.offline_traindir
     )
     config.env_config = env_overrides or getattr(config, "env_config", None)
-    for key in ("robosuite_task", "robosuite_controller", "robosuite_reward_shaping", "robosuite_control_freq", "has_renderer", "has_offscreen_renderer", "ignore_done", "camera_depths", "use_camera_obs"):
+    for key in ("robosuite_task", "robosuite_controller", "robosuite_reward_shaping", "robosuite_control_freq", "has_renderer", "has_offscreen_renderer", "ignore_done", "camera_depths", "use_camera_obs", "bc_crop_height", "bc_crop_width"):
         if key in env_overrides:
             setattr(config, key, env_overrides[key])
     if "robosuite_robots" in env_overrides:

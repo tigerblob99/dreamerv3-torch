@@ -240,6 +240,8 @@ bc_defaults:
   bc_shuffle: True
   bc_loss: 'mse'
   bc_save_path: ''
+  bc_crop_height: 78
+  bc_crop_width: 78
   # Replay evaluation mode: 'env' for environment replay, 'npz' for NPZ-based evaluation
   replay_use_npz: False
   npz_evaldir: ''
@@ -259,7 +261,7 @@ bc_lift_PH:
   offline_traindir: datasets/robomimic_data_MV/lift_PH_train
   #offline_evaldir: datasets/robomimic_data_MV/lift_PH_eval
   bc_epochs: 1000
-  bc_batch_size: 512
+  bc_batch_size: 256
   bc_lr: 3e-4
   bc_eval_split: 0.2
   bc_loss: 'mse'
