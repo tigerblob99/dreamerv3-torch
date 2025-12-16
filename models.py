@@ -33,7 +33,23 @@ class WorldModel(nn.Module):
         self._use_amp = True if config.precision == 16 else False
         self._config = config
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
-        self.encoder = networks.MultiEncoder(shapes, **config.encoder)
+        center_inputs = not config.image_standardize
+        offset_outputs = not config.image_standardize
+        self._dataset_image_mean = None
+        self._dataset_image_std = None
+        if getattr(config, "image_standardize_dataset", False):
+            mean = getattr(config, "image_dataset_mean", None)
+            std = getattr(config, "image_dataset_std", None)
+            if mean is not None and std is not None:
+                self._dataset_image_mean = torch.tensor(
+                    mean, device=config.device, dtype=torch.float32
+                )
+                self._dataset_image_std = torch.tensor(
+                    std, device=config.device, dtype=torch.float32
+                )
+        self.encoder = networks.MultiEncoder(
+            shapes, center_inputs=center_inputs, **config.encoder
+        )
         self.embed_size = self.encoder.outdim
         self.dynamics = networks.RSSM(
             config.dyn_stoch,
@@ -58,7 +74,7 @@ class WorldModel(nn.Module):
         else:
             feat_size = config.dyn_stoch + config.dyn_deter
         self.heads["decoder"] = networks.MultiDecoder(
-            feat_size, shapes, **config.decoder
+            feat_size, shapes, offset_outputs=offset_outputs, **config.decoder
         )
         self.heads["reward"] = networks.MLP(
             feat_size,
@@ -176,7 +192,25 @@ class WorldModel(nn.Module):
             k: torch.tensor(v, device=self._config.device, dtype=torch.float32)
             for k, v in obs.items()
         }
-        obs["image"] = obs["image"] / 255.0
+        if "image" in obs:
+            image = obs["image"] / 255.0
+            if self._config.image_standardize:
+                if self._dataset_image_mean is not None and self._dataset_image_std is not None:
+                    image_mean = self._dataset_image_mean
+                    image_std = self._dataset_image_std
+                    while image_mean.dim() < image.dim():
+                        image_mean = image_mean.unsqueeze(0)
+                        image_std = image_std.unsqueeze(0)
+                    image_std = torch.clamp(image_std, min=self._config.image_std_min)
+                else:
+                    flat = image.reshape([-1] + list(image.shape[-3:]))
+                    image_mean = flat.mean(dim=0, keepdim=True)
+                    image_std = flat.std(dim=0, keepdim=True, unbiased=False)
+                    image_std = torch.clamp(image_std, min=self._config.image_std_min)
+                image = (image - image_mean) / image_std
+                obs["image_mean"] = image_mean.detach()
+                obs["image_std"] = image_std.detach()
+            obs["image"] = image
         if "discount" in obs:
             obs["discount"] *= self._config.discount
             # (batch_size, batch_length) -> (batch_size, batch_length, 1)
@@ -190,26 +224,75 @@ class WorldModel(nn.Module):
 
     def video_pred(self, data):
         data = self.preprocess(data)
+        image_mean = data.get("image_mean")
+        image_std = data.get("image_std")
+
+        def destandardize(x):
+            if self._config.image_standardize and image_mean is not None and image_std is not None:
+                return x * image_std + image_mean
+            return x
+
         embed = self.encoder(data)
 
         states, _ = self.dynamics.observe(
             embed[:6, :5], data["action"][:6, :5], data["is_first"][:6, :5]
         )
-        recon = self.heads["decoder"](self.dynamics.get_feat(states))["image"].mode()[
-            :6
-        ]
+        recon = destandardize(
+            self.heads["decoder"](self.dynamics.get_feat(states))["image"].mode()[
+                :6
+            ]
+        )
         reward_post = self.heads["reward"](self.dynamics.get_feat(states)).mode()[:6]
         init = {k: v[:, -1] for k, v in states.items()}
         prior = self.dynamics.imagine_with_action(data["action"][:6, 5:], init)
-        openl = self.heads["decoder"](self.dynamics.get_feat(prior))["image"].mode()
+        openl = destandardize(
+            self.heads["decoder"](self.dynamics.get_feat(prior))["image"].mode()
+        )
         reward_prior = self.heads["reward"](self.dynamics.get_feat(prior)).mode()
         # observed image is given until 5 steps
         model = torch.cat([recon[:, :5], openl], 1)
-        truth = data["image"][:6]
-        model = model
+        truth = destandardize(data["image"][:6])
+        model = torch.clamp(model, 0.0, 1.0)
+        truth = torch.clamp(truth, 0.0, 1.0)
         error = (model - truth + 1.0) / 2.0
 
         return torch.cat([truth, model, error], 2)
+
+    def open_loop_metrics(self, data, context_frames=5):
+        """Compute open-loop reconstruction error over a batch for evaluation."""
+        data = self.preprocess(data)
+        image_mean = data.get("image_mean")
+        image_std = data.get("image_std")
+
+        def destandardize(x):
+            if self._config.image_standardize and image_mean is not None and image_std is not None:
+                return x * image_std + image_mean
+            return x
+
+        B, T = data["image"].shape[:2]
+        if T <= 1:
+            return {}
+        context = min(context_frames, T - 1)
+
+        embed = self.encoder(data)
+        states, _ = self.dynamics.observe(
+            embed[:, :context], data["action"][:, :context], data["is_first"][:, :context]
+        )
+        recon = self.heads["decoder"](self.dynamics.get_feat(states))["image"].mode()
+        init = {k: v[:, -1] for k, v in states.items()}
+        prior = self.dynamics.imagine_with_action(data["action"][:, context:], init)
+        openl = self.heads["decoder"](self.dynamics.get_feat(prior))["image"].mode()
+        model = torch.cat([recon, openl], 1)
+
+        truth = destandardize(data["image"])
+        model = destandardize(model)
+        # Focus metric on open-loop segment only.
+        pred = model[:, context:]
+        target = truth[:, context:]
+        if pred.numel() == 0:
+            return {}
+        mse = torch.mean((pred - target) ** 2)
+        return {"open_loop_image_mse": mse.detach()}
 
 
 class ImagBehavior(nn.Module):

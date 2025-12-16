@@ -46,6 +46,9 @@ defaults:
     {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
   decoder:
     {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
+  image_standardize: True
+  image_standardize_dataset: True
+  image_std_min: 1e-3
   actor:
     {layers: 2, dist: 'normal', entropy: 3e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
   critic:
@@ -209,7 +212,7 @@ robomimic:
   # Robomimic offline setting: single agent camera and physical proprio targets.
   # aux_ sin/cos provided as inputs only (no explicit next-state vector supervision stored).
   encoder: &robomimic_encoder
-    {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel|aux_.*)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 16, kernel_size: 4, minres: 4, mlp_layers: 2, mlp_units: 1024, symlog_inputs: True}
+    {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel|aux_.*)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
   decoder:
     {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
 

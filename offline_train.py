@@ -181,6 +181,11 @@ def _compute_eval_metrics(agent, batch):
             cont_loss = -cont_dist.log_prob(data["cont"])
             batch_metrics["eval/cont_loss"] = torch.mean(cont_loss).item()
 
+        # Open-loop image prediction error over the eval batch.
+        ol_metrics = agent._wm.open_loop_metrics(batch)
+        for name, val in ol_metrics.items():
+            batch_metrics[f"eval/{name}"] = float(val)
+
     return batch_metrics
 
 
@@ -343,6 +348,15 @@ def offline_train(config):
     train_eps = tools.load_episodes(config.offline_traindir, limit=config.dataset_size)
     if not train_eps:
         raise RuntimeError(f"No episodes found in {config.offline_traindir}.")
+    if getattr(config, "image_standardize", False) and getattr(
+        config, "image_standardize_dataset", False
+    ):
+        print("Computing dataset-wide image mean/std for standardization.")
+        ds_mean, ds_std = tools.compute_image_dataset_stats(train_eps)
+        ds_std = np.maximum(ds_std, config.image_std_min)
+        config.image_dataset_mean = ds_mean.astype(np.float32)
+        config.image_dataset_std = ds_std.astype(np.float32)
+        print("Dataset stats ready with shape", ds_mean.shape)
     if config.offline_evaldir:
         eval_eps = tools.load_episodes(config.offline_evaldir)
     else:
@@ -487,13 +501,13 @@ if __name__ == "__main__":
     defaults.setdefault("offline_updates", 100000)
     defaults.setdefault("offline_log_every", 1000)
     defaults.setdefault("offline_checkpoint_every", 10000)
-    defaults.setdefault("offline_eval_every", -1)
-    defaults.setdefault("offline_eval_batches", 0)
-    defaults.setdefault("offline_eval_video_batches", 1)
+    defaults.setdefault("offline_eval_every", 1000)
+    defaults.setdefault("offline_eval_batches", 5)
+    defaults.setdefault("offline_eval_video_batches", 5)
     defaults.setdefault("offline_traindir", "")
     defaults.setdefault("offline_evaldir", "")
     defaults.setdefault("resume_checkpoint", "")
-    defaults.setdefault("offline_eval_preserve_length", False)
+    defaults.setdefault("offline_eval_preserve_length", True)
 
     parser = argparse.ArgumentParser()
     for key, value in sorted(defaults.items(), key=lambda x: x[0]):

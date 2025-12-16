@@ -304,6 +304,7 @@ class MultiEncoder(nn.Module):
         mlp_layers,
         mlp_units,
         symlog_inputs,
+        center_inputs=True,
     ):
         super(MultiEncoder, self).__init__()
         excluded = ("is_first", "is_last", "is_terminal", "reward")
@@ -328,7 +329,13 @@ class MultiEncoder(nn.Module):
             input_ch = sum([v[-1] for v in self.cnn_shapes.values()])
             input_shape = tuple(self.cnn_shapes.values())[0][:2] + (input_ch,)
             self._cnn = ConvEncoder(
-                input_shape, cnn_depth, act, norm, kernel_size, minres
+                input_shape,
+                cnn_depth,
+                act,
+                norm,
+                kernel_size,
+                minres,
+                center_inputs=center_inputs,
             )
             self.outdim += self._cnn.outdim
         if self.mlp_shapes:
@@ -375,6 +382,7 @@ class MultiDecoder(nn.Module):
         image_dist,
         vector_dist,
         outscale,
+        offset_outputs=True,
     ):
         super(MultiDecoder, self).__init__()
         excluded = ("is_first", "is_last", "is_terminal")
@@ -403,6 +411,7 @@ class MultiDecoder(nn.Module):
                 minres,
                 outscale=outscale,
                 cnn_sigmoid=cnn_sigmoid,
+                offset_outputs=offset_outputs,
             )
         if self.mlp_shapes:
             self._mlp = MLP(
@@ -454,9 +463,11 @@ class ConvEncoder(nn.Module):
         norm=True,
         kernel_size=4,
         minres=4,
+        center_inputs=True,
     ):
         super(ConvEncoder, self).__init__()
         act = getattr(torch.nn, act)
+        self._center_inputs = center_inputs
         h, w, input_ch = input_shape
         stages = int(np.log2(h) - np.log2(minres))
         in_dim = input_ch
@@ -487,7 +498,8 @@ class ConvEncoder(nn.Module):
             self.outdim = int(np.prod(dummy_out.shape[1:]))
 
     def forward(self, obs):
-        obs -= 0.5
+        if self._center_inputs:
+            obs = obs - 0.5
         # (batch, time, h, w, ch) -> (batch * time, h, w, ch)
         x = obs.reshape((-1,) + tuple(obs.shape[-3:]))
         # (batch * time, h, w, ch) -> (batch * time, ch, h, w)
@@ -511,9 +523,11 @@ class ConvDecoder(nn.Module):
         minres=4,
         outscale=1.0,
         cnn_sigmoid=False,
+        offset_outputs=True,
     ):
         super(ConvDecoder, self).__init__()
         act = getattr(torch.nn, act)
+        self._offset_outputs = offset_outputs
         self._shape = shape
         self._cnn_sigmoid = cnn_sigmoid
         layer_num = int(np.log2(shape[1]) - np.log2(minres))
@@ -587,8 +601,8 @@ class ConvDecoder(nn.Module):
         mean = mean.permute(0, 1, 3, 4, 2)
         if self._cnn_sigmoid:
             mean = F.sigmoid(mean)
-        else:
-            mean += 0.5
+        elif self._offset_outputs:
+            mean = mean + 0.5
         return mean
 
 

@@ -483,6 +483,43 @@ def load_episodes(directory, limit=None, reverse=True):
     return episodes
 
 
+def compute_image_dataset_stats(episodes):
+    """Compute per-pixel mean and std over all frames in all episodes.
+
+    Returns (mean, std) with shape (1, H, W, C) in float64 numpy arrays. Raises
+    if no image key is present.
+    """
+    first = None
+    for ep in episodes.values():
+        if "image" in ep:
+            first = np.asarray(ep["image"])
+            break
+    if first is None:
+        raise ValueError("No 'image' key found in provided episodes for statistics computation.")
+    if first.ndim != 4:
+        raise ValueError(f"Expected image shape [T, H, W, C], got {first.shape}.")
+    pixel_shape = first.shape[1:]
+    total_frames = 0
+    sum_img = np.zeros(pixel_shape, dtype=np.float64)
+    sum_sq = np.zeros(pixel_shape, dtype=np.float64)
+    for ep in episodes.values():
+        if "image" not in ep:
+            continue
+        imgs = np.asarray(ep["image"], dtype=np.float64)
+        if imgs.ndim != 4:
+            raise ValueError(f"Expected image shape [T, H, W, C], got {imgs.shape}.")
+        imgs = imgs / 255.0
+        sum_img += imgs.sum(axis=0)
+        sum_sq += np.square(imgs).sum(axis=0)
+        total_frames += imgs.shape[0]
+    if total_frames == 0:
+        raise ValueError("No frames available to compute image statistics.")
+    mean = sum_img / total_frames
+    var = np.maximum(sum_sq / total_frames - np.square(mean), 0.0)
+    std = np.sqrt(var)
+    return mean[None, ...], std[None, ...]
+
+
 class SampleDist:
     def __init__(self, dist, samples=100):
         self._dist = dist
