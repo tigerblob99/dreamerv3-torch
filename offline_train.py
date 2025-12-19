@@ -189,6 +189,37 @@ def _compute_eval_metrics(agent, batch):
     return batch_metrics
 
 
+def _crop_image_sequence(arr: np.ndarray, crop_h: int, crop_w: int, random_crop: bool) -> np.ndarray:
+    """Crop a (T, H, W, C) uint8 image tensor to the target size."""
+    if crop_h <= 0 or crop_w <= 0:
+        return arr
+    if arr.ndim != 4:
+        return arr
+    _, h, w, _ = arr.shape
+    if h < crop_h or w < crop_w:
+        raise ValueError(f"Crop size ({crop_h}, {crop_w}) exceeds image size ({h}, {w}).")
+    if random_crop:
+        top = np.random.randint(0, h - crop_h + 1)
+        left = np.random.randint(0, w - crop_w + 1)
+    else:
+        top = (h - crop_h) // 2
+        left = (w - crop_w) // 2
+    return arr[:, top : top + crop_h, left : left + crop_w, :]
+
+
+def _maybe_crop_episodes(episodes: Dict[str, Dict[str, np.ndarray]], crop_h: int, crop_w: int, random_crop: bool):
+    if crop_h <= 0 or crop_w <= 0:
+        return episodes
+    for ep in episodes.values():
+        if not isinstance(ep, dict):
+            continue
+        for key, value in list(ep.items()):
+            arr = np.asarray(value)
+            if arr.dtype == np.uint8 and arr.ndim == 4:
+                ep[key] = _crop_image_sequence(arr, crop_h, crop_w, random_crop)
+    return episodes
+
+
 def _infer_spaces(episode: Dict[str, np.ndarray]) -> Tuple[gym.spaces.Dict, gym.spaces.Box]:
     obs_spaces = {}
     for key, value in episode.items():
@@ -248,6 +279,9 @@ def _setup_config(config):
     config.evaldir = config.evaldir or dataset_dir
     config.log_every = config.offline_log_every
     config.eval_every = config.offline_eval_every
+    config.image_crop_height = int(getattr(config, "image_crop_height", 0) or 0)
+    config.image_crop_width = int(getattr(config, "image_crop_width", 0) or 0)
+    config.image_crop_random = bool(getattr(config, "image_crop_random", False))
     preserve_lengths = bool(getattr(config, "offline_eval_preserve_length", False))
     config.offline_eval_preserve_length = preserve_lengths
     if getattr(config, "eval_only", False) and config.offline_eval_batches <= 0 and not preserve_lengths:
@@ -348,6 +382,9 @@ def offline_train(config):
     train_eps = tools.load_episodes(config.offline_traindir, limit=config.dataset_size)
     if not train_eps:
         raise RuntimeError(f"No episodes found in {config.offline_traindir}.")
+    train_eps = _maybe_crop_episodes(
+        train_eps, config.image_crop_height, config.image_crop_width, config.image_crop_random
+    )
     if getattr(config, "image_standardize", False) and getattr(
         config, "image_standardize_dataset", False
     ):
@@ -361,6 +398,9 @@ def offline_train(config):
         eval_eps = tools.load_episodes(config.offline_evaldir)
     else:
         eval_eps = train_eps
+    eval_eps = _maybe_crop_episodes(
+        eval_eps, config.image_crop_height, config.image_crop_width, config.image_crop_random
+    )
     first_episode = next(iter(train_eps.values()))
     obs_space, act_space = _infer_spaces(first_episode)
     config.num_actions = getattr(act_space, "n", act_space.shape[0])
@@ -508,6 +548,9 @@ if __name__ == "__main__":
     defaults.setdefault("offline_evaldir", "")
     defaults.setdefault("resume_checkpoint", "")
     defaults.setdefault("offline_eval_preserve_length", True)
+    defaults.setdefault("image_crop_height", 0)
+    defaults.setdefault("image_crop_width", 0)
+    defaults.setdefault("image_crop_random", False)
 
     parser = argparse.ArgumentParser()
     for key, value in sorted(defaults.items(), key=lambda x: x[0]):

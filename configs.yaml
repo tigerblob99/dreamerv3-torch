@@ -49,6 +49,9 @@ defaults:
   image_standardize: True
   image_standardize_dataset: True
   image_std_min: 1e-3
+  image_crop_height: 0
+  image_crop_width: 0
+  image_crop_random: False
   actor:
     {layers: 2, dist: 'normal', entropy: 3e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
   critic:
