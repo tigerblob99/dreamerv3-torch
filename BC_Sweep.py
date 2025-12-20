@@ -27,6 +27,7 @@ from bc_mlp.BC_MLP_eval import (
     _make_robomimic_env,
     _prepare_obs,
     _obs_to_torch,
+    _extract_success,
     EpisodeVideoRecorder,
 )
 
@@ -49,7 +50,7 @@ def _load_env_block(name: str | None):
     """Load env config block from configs.yaml if provided."""
     if not name:
         return None
-    cfg_path = pathlib.Path(__file__).resolve().parent / "configs.yaml"
+    cfg_path = pathlib.Path(__file__).resolve().parent.parent / "configs.yaml"
     if not cfg_path.exists():
         raise FileNotFoundError(f"configs.yaml not found at {cfg_path}")
     parser = yaml.YAML(typ="safe")
@@ -78,13 +79,13 @@ def _build_scratch_policy(config):
         encoder,
         act_space,
         hidden_units=getattr(config, "bc_hidden_units", 1024),
-        hidden_layers=getattr(config, "bc_hidden_layers", 2),
+        hidden_layers=getattr(config, "bc_hidden_layers", 4),
         act_name=getattr(config, "bc_activation", "SiLU"),
         norm=getattr(config, "bc_use_layernorm", False),
         device=config.device,
     )
     print(
-        f"Built scratch encoder+MLP: hidden_layers={getattr(config, 'bc_hidden_layers', 2)}, "
+        f"Built scratch encoder+MLP: hidden_layers={getattr(config, 'bc_hidden_layers', 4)}, "
         f"hidden_units={getattr(config, 'bc_hidden_units', 1024)}, action_dim={act_space.shape[0]}"
     )
     return encoder, action_mlp
@@ -119,18 +120,24 @@ def BC_MLP_train(
     train_samples,
     eval_samples,
     eval_episodes_list,
+    train_encoder=True,
     run=None,
     checkpoint_epochs=None,
     checkpoint_cb=None,
 ):
     """Train encoder + policy head and return final eval loss."""
     log_fn = run.log if run else wandb.log
-
-    encoder.requires_grad_(True)
-    encoder.train()
+    if train_encoder:
+        encoder.requires_grad_(True)
+        encoder.train()
+        trainable_params = list(encoder.parameters()) + list(action_mlp.parameters())
+    else:
+        encoder.requires_grad_(False)
+        encoder.eval()
+        trainable_params = list(action_mlp.parameters())
     action_mlp.train()
     optimizer = torch.optim.AdamW(
-        list(encoder.parameters()) + list(action_mlp.parameters()),
+        trainable_params,
         lr=config.bc_lr,
         weight_decay=config.bc_weight_decay,
     )
@@ -143,7 +150,6 @@ def BC_MLP_train(
     def evaluate():
         if not eval_samples:
             return None
-        prev_mode = encoder.training
         encoder.eval()
         action_mlp.eval()
         losses = []
@@ -182,7 +188,7 @@ def BC_MLP_train(
                 ep_idx = np.random.randint(0, len(eval_episodes_list))
                 ep = eval_episodes_list[ep_idx]
                 ep_length = ep["action"].shape[0]
-                # Skip the dummy action at index 0; align obs[t-1] with action[t].
+                # Skip dummy action at index 0 and align obs[t-1] with action[t].
                 obs_list = {k: [] for k in ep.keys() if k not in ("action",) and not k.startswith("log_")}
                 gt_acts = []
                 for t in range(1, ep_length):
@@ -226,8 +232,7 @@ def BC_MLP_train(
                 plt.close(fig)
 
         action_mlp.train()
-        if prev_mode:
-            encoder.train()
+        encoder.train(mode=train_encoder)
         return float(np.mean(losses)) if losses else None
 
     checkpoint_set = set(checkpoint_epochs or [])
@@ -247,12 +252,16 @@ def BC_MLP_train(
                 getattr(config, "bc_crop_height", 0),
                 getattr(config, "bc_crop_width", 0),
             )
-            embedding = encoder(batch_obs)
+            if train_encoder:
+                embedding = encoder(batch_obs)
+            else:
+                with torch.no_grad():
+                    embedding = encoder(batch_obs)
             pred_actions = action_mlp(embedding)
             loss = loss_fn(pred_actions, batch_actions)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(action_mlp.parameters()), config.bc_grad_clip)
+            torch.nn.utils.clip_grad_norm_(trainable_params, config.bc_grad_clip)
             optimizer.step()
             epoch_losses.append(loss.item())
             global_step += 1
@@ -343,13 +352,13 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
                 video_recorder.add_frame(raw_obs)
             total_reward += float(reward)
             steps += 1
-            env_success = env._check_success()
+            env_success = env_success or env._check_success()
             if env_success:
                 done = True
             if done:
                 break
 
-        env_success = env._check_success()
+        env_success = env_success or env._check_success()
         successes_env.append(env_success)
         success = total_reward > 0.0
         rewards.append(total_reward)
@@ -358,7 +367,6 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
             acts = np.stack(episode_actions)
             action_dim = acts.shape[1]
             steps_arr = np.arange(acts.shape[0])
-            # Matplotlib image
             fig, axes = plt.subplots(action_dim, 1, figsize=(10, 2 * action_dim), sharex=True)
             if action_dim == 1:
                 axes = [axes]
@@ -405,24 +413,7 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
     }
     log_fn(metrics)
     if best_video:
-        try:
-            # W&B only accepts gif/mp4/webm/ogg and non-empty files.
-            suffix = best_video.suffix.lower()
-            if suffix in {".mp4", ".gif", ".webm", ".ogg"} and best_video.exists() and best_video.stat().st_size > 0:
-                log_fn(
-                    {
-                        "env/best_video": wandb.Video(
-                            str(best_video),
-                            fps=env_cfg.video_fps,
-                            caption="best_reward",
-                            format=suffix.lstrip("."),
-                        )
-                    }
-                )
-            else:
-                print(f"[warn] Skipping W&B video upload; invalid or empty file: {best_video}")
-        except Exception as exc:
-            print(f"[warn] Failed to log video to W&B: {exc}")
+        log_fn({"env/best_video": wandb.Video(str(best_video), fps=env_cfg.video_fps, caption="best_reward")})
     return metrics
 
 
@@ -456,7 +447,7 @@ def _parse_args():
     sweep_parser.add_argument("--clip_actions", action="store_true")
     sweep_parser.add_argument("--render", action="store_true")
     sweep_parser.add_argument("--image_size", type=int, nargs=2, default=[84, 84])
-    sweep_parser.add_argument("--robosuite_task", type=str, default="PickPlaceCan")
+    sweep_parser.add_argument("--robosuite_task", type=str, default="Lift")
     sweep_parser.add_argument("--robosuite_robots", nargs="+", default=["Panda"])
     sweep_parser.add_argument("--robosuite_controller", type=str, default="OSC_POSE")
     sweep_parser.add_argument("--robosuite_reward_shaping", action="store_true")
@@ -615,7 +606,7 @@ def main():
                 )
                 env_metrics = evaluate_in_environment(run_config, enc, mlp, env_cfg, run=run)
                 run.summary.update({f"epoch_{epoch}/eval_loss": eval_loss, **{f"epoch_{epoch}/{k}": v for k, v in env_metrics.items()}})
-                enc.train()
+                enc.train(mode=bool(args.scratch_encoder))
                 mlp.train()
 
             final_eval_loss = BC_MLP_train(
@@ -625,6 +616,7 @@ def main():
                 train_samples,
                 eval_samples,
                 eval_episodes_list,
+                train_encoder=bool(args.scratch_encoder),
                 run=run,
                 checkpoint_epochs=checkpoint_epochs,
                 checkpoint_cb=on_checkpoint,

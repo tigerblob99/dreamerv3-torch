@@ -120,18 +120,24 @@ def BC_MLP_train(
     train_samples,
     eval_samples,
     eval_episodes_list,
+    train_encoder=True,
     run=None,
     checkpoint_epochs=None,
     checkpoint_cb=None,
 ):
     """Train encoder + policy head and return final eval loss."""
     log_fn = run.log if run else wandb.log
-
-    encoder.requires_grad_(True)
-    encoder.train()
+    if train_encoder:
+        encoder.requires_grad_(True)
+        encoder.train()
+        trainable_params = list(encoder.parameters()) + list(action_mlp.parameters())
+    else:
+        encoder.requires_grad_(False)
+        encoder.eval()
+        trainable_params = list(action_mlp.parameters())
     action_mlp.train()
     optimizer = torch.optim.AdamW(
-        list(encoder.parameters()) + list(action_mlp.parameters()),
+        trainable_params,
         lr=config.bc_lr,
         weight_decay=config.bc_weight_decay,
     )
@@ -144,7 +150,6 @@ def BC_MLP_train(
     def evaluate():
         if not eval_samples:
             return None
-        prev_mode = encoder.training
         encoder.eval()
         action_mlp.eval()
         losses = []
@@ -227,8 +232,7 @@ def BC_MLP_train(
                 plt.close(fig)
 
         action_mlp.train()
-        if prev_mode:
-            encoder.train()
+        encoder.train(mode=train_encoder)
         return float(np.mean(losses)) if losses else None
 
     checkpoint_set = set(checkpoint_epochs or [])
@@ -248,12 +252,16 @@ def BC_MLP_train(
                 getattr(config, "bc_crop_height", 0),
                 getattr(config, "bc_crop_width", 0),
             )
-            embedding = encoder(batch_obs)
+            if train_encoder:
+                embedding = encoder(batch_obs)
+            else:
+                with torch.no_grad():
+                    embedding = encoder(batch_obs)
             pred_actions = action_mlp(embedding)
             loss = loss_fn(pred_actions, batch_actions)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(action_mlp.parameters()), config.bc_grad_clip)
+            torch.nn.utils.clip_grad_norm_(trainable_params, config.bc_grad_clip)
             optimizer.step()
             epoch_losses.append(loss.item())
             global_step += 1
@@ -598,7 +606,7 @@ def main():
                 )
                 env_metrics = evaluate_in_environment(run_config, enc, mlp, env_cfg, run=run)
                 run.summary.update({f"epoch_{epoch}/eval_loss": eval_loss, **{f"epoch_{epoch}/{k}": v for k, v in env_metrics.items()}})
-                enc.train()
+                enc.train(mode=bool(args.scratch_encoder))
                 mlp.train()
 
             final_eval_loss = BC_MLP_train(
@@ -608,6 +616,7 @@ def main():
                 train_samples,
                 eval_samples,
                 eval_episodes_list,
+                train_encoder=bool(args.scratch_encoder),
                 run=run,
                 checkpoint_epochs=checkpoint_epochs,
                 checkpoint_cb=on_checkpoint,

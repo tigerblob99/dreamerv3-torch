@@ -19,6 +19,18 @@ Run ``python offline_train.py --configs <name> --offline_traindir <dataset>`` to
 start training, or add ``--eval_only True`` (with optional
 ``--resume_checkpoint``/``--offline_eval_preserve_length``) for evaluation-only
 jobs.
+
+python offline_train.py \
+  --configs robomimic \
+  --offline_traindir ./datasets/robomimic_data_MV/can_MH_train \
+  --offline_evaldir ./datasets/robomimic_data_MV/can_MH_eval \
+  --logdir ./logdir/robomimic_offline_can_MH_cropped \
+  --image_crop_height 78 \
+  --image_crop_width 78 \
+  --image_crop_random False \
+  --image_standardize False \
+  --offline_eval_preserve_length True \
+  --image_standardize_dataset False
 """
 
 import argparse

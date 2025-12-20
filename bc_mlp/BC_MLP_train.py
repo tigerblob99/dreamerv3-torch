@@ -403,6 +403,8 @@ def BC_MLP_train(config, encoder, action_mlp):
             return None
         action_mlp.eval()
         losses = []
+        crop_h = int(getattr(config, "bc_crop_height", 0) or 0)
+        crop_w = int(getattr(config, "bc_crop_width", 0) or 0)
         with torch.no_grad():
             batch_size = min(config.bc_batch_size, len(eval_samples))
             # iterate in chunks
@@ -423,6 +425,8 @@ def BC_MLP_train(config, encoder, action_mlp):
                     obs_list[k] = torch.as_tensor(arr, device=config.device).float()
                     # Normalize images to [0, 1] as done in WorldModel.preprocess()
                     if k == "image":
+                        if crop_h and crop_w and arr.shape[1] >= crop_h and arr.shape[2] >= crop_w:
+                            obs_list[k] = _center_crop(obs_list[k], crop_h, crop_w)
                         obs_list[k] = obs_list[k] / 255.0
                 acts = torch.as_tensor(np.asarray(act_list), device=config.device).float()
                 with torch.no_grad():
@@ -455,6 +459,8 @@ def BC_MLP_train(config, encoder, action_mlp):
                     obs_list[k] = torch.as_tensor(arr, device=config.device).float()
                     # Normalize images to [0, 1] as done in WorldModel.preprocess()
                     if k == "image":
+                        if crop_h and crop_w and arr.shape[1] >= crop_h and arr.shape[2] >= crop_w:
+                            obs_list[k] = _center_crop(obs_list[k], crop_h, crop_w)
                         obs_list[k] = obs_list[k] / 255.0
                 
                 enc_in = {k: v for k, v in obs_list.items()}
