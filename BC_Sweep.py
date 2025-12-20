@@ -1,3 +1,22 @@
+"""
+python BC_Sweep.py \
+  --configs bc_defaults bc_can_PH \
+  --checkpoint /workspace/dreamerv3-torch/dreamerv3-torch/logdir/robomimic_offline_can_MH_cropped/latest.pt \
+  --offline_traindir ./datasets/robomimic_data_MV/can_PH_train \
+  --offline_evaldir ./datasets/robomimic_data_MV/can_PH_eval \
+  --lr_grid 1e-4 1e-5 1e-3 \
+  --weight_decay_grid 0.0 1e-5 1e-4 1e-3 \
+  --sweep_name bc_frozen_encoder_cropped \
+  --env_config lift_env_eval \
+  --video_dir ./videos/bc_sweep_frozen_cropped \
+  --save_dir ./checkpoints/bc_sweep_frozen_cropped \
+  --env_episodes 10 \
+  --env_max_steps 500 \
+  --eval_epochs 200 400 600 800 1000 \
+  --bc_crop_height 78 \
+  --bc_crop_width 78 \
+"""
+
 import argparse
 import os
 import pathlib
@@ -50,7 +69,7 @@ def _load_env_block(name: str | None):
     """Load env config block from configs.yaml if provided."""
     if not name:
         return None
-    cfg_path = pathlib.Path(__file__).resolve().parent.parent / "configs.yaml"
+    cfg_path = pathlib.Path(__file__).resolve().parent / "configs.yaml"
     if not cfg_path.exists():
         raise FileNotFoundError(f"configs.yaml not found at {cfg_path}")
     parser = yaml.YAML(typ="safe")
