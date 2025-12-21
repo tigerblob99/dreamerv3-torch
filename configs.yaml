@@ -273,7 +273,57 @@ bc_lift_PH:
   bc_loss: 'mse'
 
 lift_env_eval:
-  #robosuite_task: Lift
+  robosuite_task: Lift
+  #robosuite_robots:
+  #  - Panda
+  #robosuite_controller: OSC_POSE
+  #robosuite_reward_shaping: false
+  #robosuite_control_freq: 20
+  #has_renderer: false
+  #has_offscreen_renderer: true
+  #ignore_done: true
+  #use_camera_obs: true
+  #camera_depths: false
+  #camera_heights: 84
+  #camera_widths: 84
+  #camera_obs_keys:
+  #  - agentview_image
+  #  - robot0_eye_in_hand_image
+  #bc_cnn_keys_order:
+  #  - image
+  #bc_mlp_keys_order:
+  #  - robot0_joint_pos
+  #  - robot0_joint_vel
+  #  - robot0_gripper_qpos
+  #  - robot0_gripper_qvel
+  #  - aux_robot0_joint_pos_sin
+  #  - aux_robot0_joint_pos_cos
+  controller_configs:
+    type: BASIC
+    body_parts:
+      right:
+        type: OSC_POSE
+        input_max: 1
+        input_min: -1
+        output_max: [0.05, 0.05, 0.05, 0.5, 0.5, 0.5]
+        output_min: [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5]
+        kp: 150
+        damping: 1
+        impedance_mode: fixed
+        kp_limits: [0, 300]
+        damping_limits: [0, 10]
+        position_limits: null
+        orientation_limits: null
+        uncouple_pos_ori: true
+        control_delta: true
+        interpolation: null
+        ramp_ratio: 0.2
+        input_ref_frame: world
+        gripper:
+          type: GRIP
+
+can_env_eval:
+  robosuite_task: PickPlaceCan
   #robosuite_robots:
   #  - Panda
   #robosuite_controller: OSC_POSE

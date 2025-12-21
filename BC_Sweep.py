@@ -14,7 +14,7 @@ python BC_Sweep.py \
   --env_max_steps 500 \
   --eval_epochs 200 400 600 800 1000 \
   --bc_crop_height 78 \
-  --bc_crop_width 78 \
+  --bc_crop_width 78
 """
 
 import argparse
