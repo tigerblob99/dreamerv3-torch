@@ -399,11 +399,10 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
         heapq.heappush(video_heap, (reward_value, path))
         if len(video_heap) > video_top_k:
             drop_reward, drop_path = heapq.heappop(video_heap)
-            if drop_path != path:
-                try:
-                    drop_path.unlink()
-                except FileNotFoundError:
-                    pass
+            try:
+                drop_path.unlink()
+            except FileNotFoundError:
+                pass
 
     rewards: list[float] = []
     successes: list[bool] = []
