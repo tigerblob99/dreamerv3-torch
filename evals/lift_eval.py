@@ -100,7 +100,7 @@ def _load_policy_from_checkpoint(checkpoint_path: pathlib.Path, *, device: str |
         encoder,
         act_space,
         hidden_units=getattr(config, "bc_hidden_units", 1024),
-        hidden_layers=getattr(config, "bc_hidden_layers", 2),
+        hidden_layers=getattr(config, "bc_hidden_layers", 4),
         act_name=getattr(config, "bc_activation", "SiLU"),
         norm=getattr(config, "bc_use_layernorm", False),
         device=config.device,

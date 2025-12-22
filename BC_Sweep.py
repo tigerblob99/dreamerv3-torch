@@ -406,7 +406,8 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
     # Spin up env processes.
     for env_id in range(max_envs):
         cfg_copy = copy.deepcopy(env_cfg)
-        env = Parallel(lambda cfg=cfg_copy: _EnvWorker(cfg, size), "process")
+        worker_env = _EnvWorker(cfg_copy, size)
+        env = Parallel(worker_env, "process")
         recorder = None
         if record_video:
             recorder = EpisodeVideoRecorder(
