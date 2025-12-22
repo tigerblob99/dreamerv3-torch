@@ -1,1 +1,3 @@
 python evals/lift_eval.py --checkpoint checkpoints/bc_sweep_can/scratch_lr0.0001_wd1e-05_final.pt --offline_traindir datasets/robomimic_data_MV/can_PH_train --episodes 50 --video_dir videos/can_eval_test  --env_config lift_env_eval  --no_video 
+
+python evals/lift_eval.py --checkpoint checkpoints/bc_sweep_frozen_cropped/lr1e-05_wd0.0001_final.pt --offline_traindir datasets/robomimic_data_MV/can_PH_train --episodes 50 --video_dir videos/can_frozen_cropped_eval_test  --env_config can_env_eval  --no_video 

@@ -628,6 +628,7 @@ class EpisodeVideoRecorder:
 		camera_key: str | None,
 		camera_keys: Tuple[str, ...] | None = None,
 		flip_keys: Iterable[str] = (),
+		name_template: str | None = "episode_{episode_idx:03d}.mp4",
 	):
 		self._dir = directory
 		self._fps = fps
@@ -637,13 +638,15 @@ class EpisodeVideoRecorder:
 		self._writer = None
 		self._path: pathlib.Path | None = None
 		self._episode_idx: int | None = None
+		self._name_template = name_template
+		self._filename_override: pathlib.Path | None = None
 
 	def enabled(self) -> bool:
 		if self._dir is None:
 			return False
 		return bool(self._camera_key or (self._camera_keys and len(self._camera_keys) > 0))
 
-	def start_episode(self, episode_idx: int):
+	def start_episode(self, episode_idx: int, filename: pathlib.Path | str | None = None):
 		"""Begin recording a new episode.
 
 		Sets the current episode index and clears any existing writer so a new
@@ -651,6 +654,7 @@ class EpisodeVideoRecorder:
 		"""
 		self._episode_idx = episode_idx
 		self._path = None
+		self._filename_override = pathlib.Path(filename) if filename else None
 		self._release()
 
 	def add_frame(self, obs: Dict[str, Any]):
@@ -693,7 +697,12 @@ class EpisodeVideoRecorder:
 			self._init_writer()
 			h, w = frame_uint8.shape[0], frame_uint8.shape[1]
 			# Use MPEG-4 / mp4v inside an MP4 container for W&B compatibility.
-			self._path = self._dir / f"episode_{self._episode_idx:03d}.mp4"
+			if self._filename_override is not None:
+				self._path = self._filename_override if self._filename_override.is_absolute() else self._dir / self._filename_override
+			elif self._name_template:
+				self._path = self._dir / self._name_template.format(episode_idx=self._episode_idx if self._episode_idx is not None else 0)
+			else:
+				self._path = self._dir / f"episode_{self._episode_idx:03d}.mp4"
 			fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 			writer = cv2.VideoWriter(str(self._path), fourcc, self._fps, (w, h))
 			if not writer.isOpened():
@@ -723,6 +732,7 @@ class EpisodeVideoRecorder:
 		if self._writer is not None:
 			self._writer.release()
 		self._writer = None
+		self._filename_override = None
 
 	@staticmethod
 	def _combine_frames(frames: List[np.ndarray]) -> np.ndarray:

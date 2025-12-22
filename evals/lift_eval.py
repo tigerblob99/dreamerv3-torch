@@ -140,9 +140,11 @@ def _build_env_cfg(config: SimpleNamespace, args) -> SimpleNamespace:
         bc_mlp_keys_order=_as_tuple(getattr(config, "bc_mlp_keys_order", None), tuple(DEFAULT_MLP_KEYS)),
         clip_actions=bool(getattr(config, "clip_actions", False) or args.clip_actions),
         episodes=args.episodes,
+        num_envs=args.num_envs,
         seed=getattr(config, "seed", 0),
         video_dir=pathlib.Path(args.video_dir).expanduser(),
         video_fps=args.video_fps,
+        video_top_k=args.video_top_k,
         video_camera=args.video_camera or (video_cam_keys[0] if video_cam_keys else None),
         video_camera_keys=video_cam_keys,
         disable_video=bool(args.no_video),
@@ -168,12 +170,14 @@ def _parse_args():
     parser.add_argument("--video_fps", type=int, default=20, help="Video FPS")
     parser.add_argument("--video_camera", type=str, default="", help="Specific camera for video rendering (defaults to first camera key)")
     parser.add_argument("--video_camera_keys", nargs="+", default=None, help="Camera keys to stack for video rendering")
+    parser.add_argument("--video_top_k", type=int, default=-1, help="Keep only top-K reward episode videos (-1 keeps all, 0 disables video)")
     parser.add_argument("--no_video", action="store_true", help="Disable video recording/encoding during eval")
     parser.add_argument("--camera_obs_keys", nargs="+", default=None, help="Camera observation keys to feed into encoder")
     parser.add_argument("--flip_camera_keys", nargs="+", default=None, help="Camera keys to vertically flip before stacking")
     parser.add_argument("--clip_actions", action="store_true", help="Clip actions to [-1, 1] before env step")
     parser.add_argument("--render", action="store_true", help="Enable on-screen rendering (slow)")
     parser.add_argument("--image_size", type=int, nargs=2, default=None, help="Override image size (height width)")
+    parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel envs to use during eval")
     parser.add_argument("--env_config", type=str, default=None, help="Config block name in configs.yaml to override env settings (e.g., lift_env_eval)")
     args = parser.parse_args()
     args.env_config_block = _load_env_block(args.env_config) if args.env_config else None

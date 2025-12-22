@@ -18,6 +18,8 @@ python BC_Sweep.py \
 """
 
 import argparse
+import copy
+import heapq
 import os
 import pathlib
 from types import SimpleNamespace
@@ -31,6 +33,7 @@ import torch
 import wandb
 
 import tools
+from parallel import Parallel
 from bc_mlp.BC_MLP_train import (
     _load_config,
     BC_MLP,
@@ -310,7 +313,7 @@ def BC_MLP_train(
 
 
 def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
-    """Roll out the trained policy in the real environment and log metrics."""
+    """Parallel env eval with batched inference and optional top-K video keeping."""
     log_fn = run.log if run else wandb.log
 
     size = tuple(getattr(config, "size", (84, 84)))
@@ -318,39 +321,151 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
     encoder.eval().to(device)
     policy.eval().to(device)
 
-    env = _make_robomimic_env(env_cfg, size)
-    record_video = not bool(getattr(env_cfg, "disable_video", False))
-    video_recorder = (
-        EpisodeVideoRecorder(
-            directory=env_cfg.video_dir,
-            fps=env_cfg.video_fps,
-            camera_key=env_cfg.video_camera,
-            camera_keys=env_cfg.video_camera_keys,
-            flip_keys=env_cfg.flip_camera_keys,
-        )
-        if record_video
-        else None
-    )
+    num_envs = max(1, int(getattr(env_cfg, "num_envs", 1)))
+    total_episodes = int(getattr(env_cfg, "episodes", 1))
+    video_top_k = int(getattr(env_cfg, "video_top_k", -1))
+    record_video = (not bool(getattr(env_cfg, "disable_video", False))) and video_top_k != 0
+    video_dir = pathlib.Path(getattr(env_cfg, "video_dir", "videos/bc_sweep")).expanduser()
 
-    rewards = []
-    successes = []
-    successes_env = []
+    class _EnvWorker:
+        def __init__(self, cfg, image_size):
+            self._env = _make_robomimic_env(cfg, image_size)
+
+        def reset(self, seed=None):
+            if seed is not None:
+                try:
+                    return self._env.reset(seed=seed)
+                except TypeError:
+                    try:
+                        self._env.seed(seed)
+                    except Exception:
+                        pass
+            return self._env.reset()
+
+        def step(self, action):
+            obs, reward, done, info = self._env.step(action)
+            try:
+                env_success = bool(self._env._check_success())
+            except Exception:
+                env_success = False
+            return obs, reward, done, info, env_success
+
+        def close(self):
+            try:
+                self._env.close()
+            except Exception:
+                pass
+
+    def _batch_to_torch(obs_list):
+        keys = obs_list[0].keys()
+        batched = {}
+        for key in keys:
+            arrs = []
+            for obs in obs_list:
+                arr = np.asarray(obs[key])
+                if arr.ndim == 0:
+                    arr = arr[None]
+                arrs.append(arr)
+            stacked = np.stack(arrs, axis=0)
+            tensor = torch.as_tensor(stacked, device=device).float()
+            if key == "image":
+                tensor = tensor / 255.0
+            batched[key] = tensor
+        return batched
+
+    video_heap: list[tuple[float, pathlib.Path]] = []
     best_reward = -np.inf
-    best_video = None
+    best_video: pathlib.Path | None = None
 
-    for episode in range(env_cfg.episodes):
-        raw_obs = env.reset()
-        done = False
-        total_reward = 0.0
-        steps = 0
-        info = {}
-        env_success = False
-        if video_recorder:
-            video_recorder.start_episode(episode)
-        episode_actions: list = []
-        while not done and steps < env_cfg.max_env_steps:
+    def _maybe_keep_video(reward_value: float, path: pathlib.Path | None):
+        nonlocal best_reward, best_video
+        if path is None:
+            return
+        if reward_value >= best_reward:
+            best_reward = reward_value
+            best_video = path
+        if video_top_k < 0:
+            return
+        heapq.heappush(video_heap, (reward_value, path))
+        if len(video_heap) > video_top_k:
+            drop_reward, drop_path = heapq.heappop(video_heap)
+            if drop_path != path:
+                try:
+                    drop_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    rewards: list[float] = []
+    successes: list[bool] = []
+    successes_env: list[bool] = []
+    env_states = []
+    completed = 0
+    global_episode = 0
+    max_envs = min(num_envs, total_episodes) if total_episodes > 0 else num_envs
+
+    # Spin up env processes.
+    for env_id in range(max_envs):
+        cfg_copy = copy.deepcopy(env_cfg)
+        env = Parallel(lambda cfg=cfg_copy: _EnvWorker(cfg, size), "process")
+        recorder = None
+        if record_video:
+            recorder = EpisodeVideoRecorder(
+                directory=video_dir,
+                fps=env_cfg.video_fps,
+                camera_key=env_cfg.video_camera,
+                camera_keys=env_cfg.video_camera_keys,
+                flip_keys=env_cfg.flip_camera_keys,
+            )
+        env_states.append(
+            {
+                "env": env,
+                "env_id": env_id,
+                "recorder": recorder,
+                "raw_obs": None,
+                "reward": 0.0,
+                "steps": 0,
+                "done": False,
+                "env_success": False,
+                "episode_id": None,
+                "actions": [],
+            }
+        )
+
+    def _start_episode(state) -> bool:
+        nonlocal global_episode
+        if global_episode >= total_episodes:
+            state["done"] = True
+            return False
+        episode_id = global_episode
+        global_episode += 1
+        seed = int(getattr(env_cfg, "seed", 0) or 0) + episode_id
+        obs = state["env"].reset(seed=seed)()
+        state.update(
+            {
+                "episode_id": episode_id,
+                "raw_obs": obs,
+                "reward": 0.0,
+                "steps": 0,
+                "done": False,
+                "env_success": False,
+                "actions": [],
+            }
+        )
+        if state["recorder"]:
+            filename = f"ep_{episode_id:05d}_env_{state['env_id']:02d}.mp4"
+            state["recorder"].start_episode(episode_id, filename=filename)
+        return True
+
+    # Initialize first episodes for each env.
+    for state in env_states:
+        _start_episode(state)
+
+    while completed < total_episodes and any(not s["done"] for s in env_states):
+        active_states = [s for s in env_states if not s["done"]]
+        obs_list = []
+        for state in active_states:
             step_obs = _prepare_obs(
-                raw_obs,
+                state["raw_obs"],
                 cnn_keys_order=env_cfg.bc_cnn_keys_order,
                 mlp_keys_order=env_cfg.bc_mlp_keys_order,
                 camera_keys=env_cfg.camera_obs_keys,
@@ -358,77 +473,96 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
                 crop_height=getattr(env_cfg, "bc_crop_height", None),
                 crop_width=getattr(env_cfg, "bc_crop_width", None),
             )
-            tensor_obs = _obs_to_torch(step_obs, device)
-            with torch.no_grad():
-                embedding = encoder(tensor_obs)
-                action = policy(embedding)
-            action_np = action.squeeze(0).cpu().numpy()
-            episode_actions.append(action_np.copy())
+            obs_list.append(step_obs)
+        if not obs_list:
+            break
+        batch_obs = _batch_to_torch(obs_list)
+        with torch.no_grad():
+            embedding = encoder(batch_obs)
+            actions = policy(embedding)
+        actions_np = actions.detach().cpu().numpy()
+
+        # Dispatch steps.
+        futures = []
+        for idx, state in enumerate(active_states):
+            action_np = actions_np[idx]
+            state["actions"].append(action_np.copy())
             if env_cfg.clip_actions:
                 action_np = np.clip(action_np, -1.0, 1.0)
-            raw_obs, reward, done, info = env.step(action_np)
-            if video_recorder:
-                video_recorder.add_frame(raw_obs)
-            total_reward += float(reward)
-            steps += 1
-            env_success = env_success or env._check_success()
-            if env_success:
+            futures.append(state["env"].step(action_np))
+        results = [f() for f in futures]
+
+        for state, result in zip(active_states, results):
+            raw_obs, reward, done, info, env_success_step = result
+            if state["recorder"]:
+                state["recorder"].add_frame(raw_obs)
+            state["reward"] += float(reward)
+            state["steps"] += 1
+            state["raw_obs"] = raw_obs
+            state["env_success"] = state["env_success"] or bool(env_success_step)
+            if state["steps"] >= env_cfg.max_env_steps:
                 done = True
+            if state["env_success"]:
+                done = True
+
             if done:
-                break
+                completed += 1
+                success = state["reward"] > 0.0
+                rewards.append(state["reward"])
+                successes.append(success)
+                successes_env.append(state["env_success"])
+                saved_video = state["recorder"].finish_episode() if state["recorder"] else None
+                _maybe_keep_video(state["reward"], saved_video)
+                if state["actions"]:
+                    acts = np.stack(state["actions"])
+                    action_dim = acts.shape[1]
+                    steps_arr = np.arange(acts.shape[0])
+                    fig, axes = plt.subplots(action_dim, 1, figsize=(10, 2 * action_dim), sharex=True)
+                    if action_dim == 1:
+                        axes = [axes]
+                    for i in range(action_dim):
+                        axes[i].plot(steps_arr, acts[:, i], label="policy_action")
+                        axes[i].set_ylabel(f"Dim {i}")
+                        if i == 0:
+                            axes[i].legend()
+                    axes[-1].set_xlabel("Step")
+                    plt.tight_layout()
+                    log_fn({f"env/episode_{state['episode_id']}/actions_image": wandb.Image(fig)}, commit=False)
+                    plt.close(fig)
+                log_fn(
+                    {
+                        "env/episode_reward": state["reward"],
+                        "env/episode_success": success,
+                        "env/episode_env_success": state["env_success"],
+                        "env/episode_steps": state["steps"],
+                    },
+                    commit=False,
+                )
+                print(
+                    f"[env eval] episode {state['episode_id']+1}/{total_episodes} reward={state['reward']:.3f} "
+                    f"success={success} env_success={state['env_success']} steps={state['steps']} env={state['env_id']}"
+                )
+                if completed < total_episodes:
+                    _start_episode(state)
+                else:
+                    state["done"] = True
 
-        env_success = env_success or env._check_success()
-        successes_env.append(env_success)
-        success = total_reward > 0.0
-        rewards.append(total_reward)
-        successes.append(success)
-        if episode_actions:
-            acts = np.stack(episode_actions)
-            action_dim = acts.shape[1]
-            steps_arr = np.arange(acts.shape[0])
-            fig, axes = plt.subplots(action_dim, 1, figsize=(10, 2 * action_dim), sharex=True)
-            if action_dim == 1:
-                axes = [axes]
-            for i in range(action_dim):
-                axes[i].plot(steps_arr, acts[:, i], label="policy_action")
-                axes[i].set_ylabel(f"Dim {i}")
-                if i == 0:
-                    axes[i].legend()
-            axes[-1].set_xlabel("Step")
-            plt.tight_layout()
-            log_fn({f"env/episode_{episode}/actions_image": wandb.Image(fig)}, commit=False)
-            plt.close(fig)
-        saved_video = video_recorder.finish_episode() if video_recorder else None
-        log_fn(
-            {
-                "env/episode_reward": total_reward,
-                "env/episode_success": success,
-                "env/episode_env_success": env_success,
-                "env/episode_steps": steps,
-            },
-            commit=False,
-        )
-        print(f"[env eval] episode {episode+1}/{env_cfg.episodes} reward={total_reward:.3f} success={success} env_success={env_success} steps={steps}")
-        if saved_video and total_reward >= best_reward:
-            best_reward = total_reward
-            best_video = saved_video
-
-        # Debug: print env info and is_success for troubleshooting success detection.
+    # Cleanup workers
+    for state in env_states:
         try:
-            success_state = env.is_success() if hasattr(env, "is_success") else None
+            state["env"].close()
         except Exception:
-            success_state = None
-        print(f"[env eval] episode {episode+1} info={info} is_success={success_state}")
+            pass
 
     mean_reward = float(np.mean(rewards)) if rewards else float("nan")
-    env_successes = [s for s in successes_env] if 'successes_env' in locals() else []
-    env_success_rate = float(np.mean(env_successes)) if env_successes else 0.0
+    env_success_rate = float(np.mean(successes_env)) if successes_env else 0.0
     reward_success_rate = float(np.mean(successes)) if successes else 0.0
+    best_reward_metric = best_reward if best_reward > -np.inf else (max(rewards) if rewards else float("nan"))
     metrics = {
         "env/mean_reward": mean_reward,
         "env/success_rate": env_success_rate,
         "env/reward_success_rate": reward_success_rate,
-        "env/best_reward": best_reward,
+        "env/best_reward": best_reward_metric,
     }
     log_fn(metrics)
     if best_video:
@@ -446,9 +580,11 @@ def _parse_args():
     sweep_parser.add_argument("--sweep_name", type=str, default="", help="Optional name for a newly created sweep")
     sweep_parser.add_argument("--agent_count", type=int, default=0, help="Number of sweep runs to execute (0 = all grid combos)")
     sweep_parser.add_argument("--env_episodes", type=int, default=3)
+    sweep_parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel envs to use during eval")
     sweep_parser.add_argument("--env_max_steps", type=int, default=500)
     sweep_parser.add_argument("--video_dir", type=str, default="videos/bc_sweep")
     sweep_parser.add_argument("--video_fps", type=int, default=20)
+    sweep_parser.add_argument("--video_top_k", type=int, default=-1, help="Keep only top-K reward episode videos (-1 keeps all, 0 disables video)")
     sweep_parser.add_argument("--video_camera", type=str, default=None)
     sweep_parser.add_argument("--video_camera_keys", nargs="+", default=None)
     sweep_parser.add_argument("--camera_obs_keys", nargs="+", default=list(DEFAULT_CAMERA_KEYS))
@@ -609,9 +745,11 @@ def main():
                     bc_mlp_keys_order=run_config.bc_mlp_keys_order,
                     clip_actions=run_config.clip_actions,
                     episodes=args.env_episodes,
+                    num_envs=args.num_envs,
                     seed=run_config.seed,
                     video_dir=pathlib.Path(args.video_dir) / f"{run_name}_epoch{epoch}",
                     video_fps=args.video_fps,
+                    video_top_k=args.video_top_k,
                     video_camera=args.video_camera or (args.video_camera_keys[0] if args.video_camera_keys else args.camera_obs_keys[0]),
                     video_camera_keys=tuple(args.video_camera_keys) if args.video_camera_keys else tuple(args.camera_obs_keys),
                     controller_configs=getattr(run_config, "controller_configs", None),
