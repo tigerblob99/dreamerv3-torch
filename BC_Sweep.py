@@ -329,9 +329,16 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
 
     class _EnvWorker:
         def __init__(self, cfg, image_size):
-            self._env = _make_robomimic_env(cfg, image_size)
+            self._cfg = cfg
+            self._image_size = image_size
+            self._env = None
+
+        def _ensure_env(self):
+            if self._env is None:
+                self._env = _make_robomimic_env(self._cfg, self._image_size)
 
         def reset(self, seed=None):
+            self._ensure_env()
             if seed is not None:
                 try:
                     return self._env.reset(seed=seed)
@@ -343,6 +350,7 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
             return self._env.reset()
 
         def step(self, action):
+            self._ensure_env()
             obs, reward, done, info = self._env.step(action)
             try:
                 env_success = bool(self._env._check_success())
@@ -351,6 +359,8 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
             return obs, reward, done, info, env_success
 
         def close(self):
+            if self._env is None:
+                return
             try:
                 self._env.close()
             except Exception:
