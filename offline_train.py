@@ -1,38 +1,4 @@
-"""Offline Dreamer training and evaluation entry point.
-
-Usage highlights:
-
-- Provide one or more config names via ``--configs`` (they are merged on top of
-    ``defaults`` from ``configs.yaml``) and always point ``--offline_traindir`` to a
-    directory of offline rollouts. The script auto-derives ``logdir`` next to that
-    dataset unless you override it.
-- Resume from any checkpoint by passing ``--resume_checkpoint path/to/model.pt``;
-    if omitted the script falls back to ``<logdir>/latest.pt`` as before.
-- Control evaluation style with ``--offline_eval_batches`` (batched/padded) or
-    enable length-preserving, per-episode evaluation with
-    ``--offline_eval_preserve_length True``. When that flag is on, episodes are run
-    sequentially without truncation or padding. Both modes respect
-    ``--offline_eval_every`` for periodic evals and run automatically after
-    training when enabled.
-
-Run ``python offline_train.py --configs <name> --offline_traindir <dataset>`` to
-start training, or add ``--eval_only True`` (with optional
-``--resume_checkpoint``/``--offline_eval_preserve_length``) for evaluation-only
-jobs.
-
-python offline_train.py \
-  --configs robomimic \
-  --offline_traindir ./datasets/robomimic_data_MV/can_MH_train \
-  --offline_evaldir ./datasets/robomimic_data_MV/can_MH_eval \
-  --logdir ./logdir/robomimic_offline_can_MH_cropped \
-  --image_crop_height 78 \
-  --image_crop_width 78 \
-  --image_crop_random False \
-  --image_standardize False \
-  --offline_eval_preserve_length True \
-  --image_standardize_dataset False
-"""
-
+"""Offline Dreamer training and evaluation entry point."""
 import argparse
 import os
 import pathlib
@@ -51,8 +17,8 @@ import tools
 from dreamer import Dreamer, make_dataset
 
 try:
-    import wandb  
-except ImportError:  
+    import wandb
+except ImportError:
     wandb = None
 
 
@@ -193,7 +159,6 @@ def _compute_eval_metrics(agent, batch):
             cont_loss = -cont_dist.log_prob(data["cont"])
             batch_metrics["eval/cont_loss"] = torch.mean(cont_loss).item()
 
-        # Open-loop image prediction error over the eval batch.
         ol_metrics = agent._wm.open_loop_metrics(batch)
         for name, val in ol_metrics.items():
             batch_metrics[f"eval/{name}"] = float(val)
@@ -201,43 +166,71 @@ def _compute_eval_metrics(agent, batch):
     return batch_metrics
 
 
-def _crop_image_sequence(arr: np.ndarray, crop_h: int, crop_w: int, random_crop: bool) -> np.ndarray:
-    """Crop a (T, H, W, C) uint8 image tensor to the target size."""
+def _crop_batch(batch: Dict[str, torch.Tensor], crop_h: int, crop_w: int, random: bool = False):
+    """Crops a batch of images non-destructively."""
     if crop_h <= 0 or crop_w <= 0:
-        return arr
-    if arr.ndim != 4:
-        return arr
-    _, h, w, _ = arr.shape
-    if h < crop_h or w < crop_w:
-        raise ValueError(f"Crop size ({crop_h}, {crop_w}) exceeds image size ({h}, {w}).")
-    if random_crop:
-        top = np.random.randint(0, h - crop_h + 1)
-        left = np.random.randint(0, w - crop_w + 1)
-    else:
-        top = (h - crop_h) // 2
-        left = (w - crop_w) // 2
-    return arr[:, top : top + crop_h, left : left + crop_w, :]
+        return batch
+    
+    if "image" not in batch:
+        return batch
+    
+    imgs = batch["image"] # Shape: (Batch, Time, Height, Width, Channel)
+    
+    # Handle non-5D input (e.g. single sequence 4D: T, H, W, C)
+    if imgs.ndim != 5:
+        if imgs.ndim == 4: # T, H, W, C
+            T, H, W, C = imgs.shape
+            if H < crop_h or W < crop_w: return batch
+            if random:
+                top = np.random.randint(0, H - crop_h + 1)
+                left = np.random.randint(0, W - crop_w + 1)
+            else:
+                top = (H - crop_h) // 2
+                left = (W - crop_w) // 2
+            batch["image"] = imgs[:, top : top + crop_h, left : left + crop_w, :]
+            return batch
+        return batch
+
+    B, T, H, W, C = imgs.shape
+    
+    if H < crop_h or W < crop_w:
+        return batch
+
+    # Output container
+    cropped_imgs = torch.empty((B, T, crop_h, crop_w, C), dtype=imgs.dtype, device=imgs.device)
+
+    for b in range(B):
+        # 1. Generate a unique random crop for THIS episode (b)
+        if random:
+            top = np.random.randint(0, H - crop_h + 1)
+            left = np.random.randint(0, W - crop_w + 1)
+        else:
+            # Center crop for evaluation
+            top = (H - crop_h) // 2
+            left = (W - crop_w) // 2
+        
+        # 2. Apply it to ALL timesteps (:) of this episode
+        # This preserves the physics/optical flow
+        cropped_imgs[b] = imgs[b, :, top : top + crop_h, left : left + crop_w, :]
+        
+    batch["image"] = cropped_imgs
+    return batch
 
 
-def _maybe_crop_episodes(episodes: Dict[str, Dict[str, np.ndarray]], crop_h: int, crop_w: int, random_crop: bool):
-    if crop_h <= 0 or crop_w <= 0:
-        return episodes
-    for ep in episodes.values():
-        if not isinstance(ep, dict):
-            continue
-        for key, value in list(ep.items()):
-            arr = np.asarray(value)
-            if arr.dtype == np.uint8 and arr.ndim == 4:
-                ep[key] = _crop_image_sequence(arr, crop_h, crop_w, random_crop)
-    return episodes
-
-
-def _infer_spaces(episode: Dict[str, np.ndarray]) -> Tuple[gym.spaces.Dict, gym.spaces.Box]:
+def _infer_spaces(episode: Dict[str, np.ndarray], config) -> Tuple[gym.spaces.Dict, gym.spaces.Box]:
     obs_spaces = {}
     for key, value in episode.items():
         if key in _EXCLUDE_KEYS:
             continue
         shape = value.shape[1:]
+        
+        # Override shape if this is the image and cropping is enabled
+        if key == "image":
+            h = getattr(config, "image_crop_height", 0)
+            w = getattr(config, "image_crop_width", 0)
+            if h > 0 and w > 0:
+                shape = (h, w, shape[-1])
+
         if value.dtype == np.uint8:
             low = np.zeros(shape, dtype=np.uint8)
             high = np.full(shape, 255, dtype=np.uint8)
@@ -246,9 +239,11 @@ def _infer_spaces(episode: Dict[str, np.ndarray]) -> Tuple[gym.spaces.Dict, gym.
             low = np.full(shape, -np.inf, dtype=np.float32)
             high = np.full(shape, np.inf, dtype=np.float32)
             obs_spaces[key] = gym.spaces.Box(low=low, high=high, dtype=np.float32, shape=shape)
+            
     if not obs_spaces:
         raise ValueError("Episode does not contain observable keys besides action/reward scalars.")
     obs_space = gym.spaces.Dict(obs_spaces)
+    
     action = episode.get("action")
     if action is None:
         raise ValueError("Episode is missing the 'action' key required for offline training.")
@@ -325,6 +320,12 @@ def _offline_eval(agent, eval_dataset, config, logger, eval_sequences=None):
     processed_batches = 0
     for batch_idx in range(config.offline_eval_batches):
         batch = next(dataset)
+        batch = _crop_batch(
+            batch, 
+            config.image_crop_height, 
+            config.image_crop_width, 
+            random=False # Always center crop for eval
+        )
         batch_metrics = _compute_eval_metrics(agent, batch)
         for name, value in batch_metrics.items():
             metrics[name].append(value)
@@ -362,6 +363,12 @@ def _offline_eval_sequential(agent, eval_sequences, config, logger):
     processed_batches = 0
     for batch_idx in range(target_batches):
         batch = eval_sequences[batch_idx]
+        batch = _crop_batch(
+            batch, 
+            config.image_crop_height, 
+            config.image_crop_width, 
+            random=False # Always center crop for eval
+        )
         batch_metrics = _compute_eval_metrics(agent, batch)
         for name, value in batch_metrics.items():
             metrics[name].append(value)
@@ -394,9 +401,6 @@ def offline_train(config):
     train_eps = tools.load_episodes(config.offline_traindir, limit=config.dataset_size)
     if not train_eps:
         raise RuntimeError(f"No episodes found in {config.offline_traindir}.")
-    train_eps = _maybe_crop_episodes(
-        train_eps, config.image_crop_height, config.image_crop_width, config.image_crop_random
-    )
     if getattr(config, "image_standardize", False) and getattr(
         config, "image_standardize_dataset", False
     ):
@@ -410,14 +414,16 @@ def offline_train(config):
         eval_eps = tools.load_episodes(config.offline_evaldir)
     else:
         eval_eps = train_eps
-    eval_eps = _maybe_crop_episodes(
-        eval_eps, config.image_crop_height, config.image_crop_width, config.image_crop_random
-    )
+    
+    # FIX: Removed the call to _maybe_crop_episodes here, as it was destructive.
+
     first_episode = next(iter(train_eps.values()))
-    obs_space, act_space = _infer_spaces(first_episode)
+    obs_space, act_space = _infer_spaces(first_episode, config)
     config.num_actions = getattr(act_space, "n", act_space.shape[0])
 
     train_dataset = None if config.eval_only else make_dataset(train_eps, config)
+    
+    # FIX: Added the missing eval_dataset definition here
     eval_dataset = _make_eval_dataset(eval_eps, config)
     eval_sequences = _make_eval_sequences(eval_eps)
 
@@ -473,7 +479,14 @@ def offline_train(config):
 
     print("Starting offline training.")
     for update in range(config.offline_updates):
-        agent._train(next(train_dataset))
+        data_batch = next(train_dataset)
+        data_batch = _crop_batch(
+            data_batch, 
+            config.image_crop_height, 
+            config.image_crop_width, 
+            random=config.image_crop_random
+        )
+        agent._train(data_batch)
         agent._update_count += 1
         agent._metrics.setdefault("update_count", []).append(agent._update_count)
         logger.step = agent._update_count

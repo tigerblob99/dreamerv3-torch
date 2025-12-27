@@ -7,7 +7,7 @@ import pathlib
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import importlib
 
@@ -60,6 +60,8 @@ class EvalConfig:
 	bc_hidden_layers: int
 	bc_activation: str
 	bc_use_layernorm: bool
+	bc_crop_height: int
+	bc_crop_width: int
 	video_dir: pathlib.Path | None
 	video_fps: int
 	video_camera: str | None
@@ -86,11 +88,25 @@ class EvalConfig:
 	npz_evaldir: pathlib.Path | None = None  # Directory containing NPZ episodes
 
 
-def _make_robomimic_can_env(cfg: EvalConfig, image_hw: Tuple[int, int]):
-# Create and return a robomimic Can environment with specified configuration and image size.
+def _make_robomimic_env(cfg: EvalConfig, image_hw: Tuple[int, int]):
+	"""Create and configure a robosuite Can environment.
+
+	Returns a configured environment matching the evaluation settings in ``cfg``
+	and sized according to ``image_hw``. Handles seeding differences between
+	robsuite versions.
+
+	Args:
+		cfg: Evaluation configuration containing robosuite settings.
+		image_hw: (height, width) for camera observations.
+
+	Returns:
+		An instantiated and seeded robosuite environment.
+	"""
 	suite = importlib.import_module("robosuite")
 	load_controller_config = _resolve_controller_loader(suite)
-	controller_cfg = load_controller_config(default_controller=cfg.robosuite_controller)
+	controller_cfg = getattr(cfg, "controller_configs", None)
+	if controller_cfg is None:
+		controller_cfg = load_controller_config(default_controller=cfg.robosuite_controller)
 	controller_cfg = _ensure_composite_controller_config(controller_cfg, cfg.robosuite_robots)
 
 	env = suite.make(
@@ -98,16 +114,17 @@ def _make_robomimic_can_env(cfg: EvalConfig, image_hw: Tuple[int, int]):
 		robots=list(cfg.robosuite_robots),
 		controller_configs=controller_cfg,
 		use_object_obs=True,
-		use_camera_obs=True,
+		use_camera_obs=getattr(cfg, "use_camera_obs", True),
 		camera_names=[name.replace("_image", "") for name in cfg.camera_obs_keys],
 		camera_heights=image_hw[0],
 		camera_widths=image_hw[1],
-		has_renderer=cfg.render,
-		has_offscreen_renderer=True,
+		camera_depths=getattr(cfg, "camera_depths", False),
+		has_renderer=getattr(cfg, "has_renderer", cfg.render),
+		has_offscreen_renderer=getattr(cfg, "has_offscreen_renderer", True),
 		reward_shaping=cfg.robosuite_reward_shaping,
 		control_freq=cfg.robosuite_control_freq,
 		horizon=cfg.max_env_steps,
-		ignore_done=False,
+		ignore_done=getattr(cfg, "ignore_done", False),
 	)
 
 	try:
@@ -123,7 +140,20 @@ def _make_robomimic_can_env(cfg: EvalConfig, image_hw: Tuple[int, int]):
 
 
 def _stack_cameras(obs: Dict[str, Any], camera_keys: Iterable[str], flip_keys: Iterable[str] = ()): 
-# Stack and vertically flip camera images from observation dict as needed.
+	"""Stack camera frames from ``obs`` into a single image tensor.
+
+	This function collects frames from ``camera_keys`` in order, optionally
+	flipping frames listed in ``flip_keys``, converts them to float32 and
+	concatenates along the channel axis.
+
+	Args:
+		obs: Raw observation dict from the environment.
+		camera_keys: Iterable of observation keys to stack.
+		flip_keys: Keys whose frames should be vertically flipped.
+
+	Returns:
+		A single numpy array with stacked frames along the channel axis.
+	"""
 	frames: List[Any] = []
 	flip_set = set(flip_keys)
 	for key in camera_keys:
@@ -141,7 +171,6 @@ def _stack_cameras(obs: Dict[str, Any], camera_keys: Iterable[str], flip_keys: I
 
 
 def _log_obs_snapshot(
-# Log and optionally save a snapshot of observation keys, values, and images.
 	label: str,
 	obs: Dict[str, Any],
 	*,
@@ -151,6 +180,12 @@ def _log_obs_snapshot(
 	image_dir: pathlib.Path | None = None,
 	image_keys: Iterable[str] | None = None,
 ) -> None:
+	"""Log a snapshot of observation data to console, file, and/or images.
+
+	This function prints a summary of the observation dict, optionally saves
+	the full text to a file, and saves images for specified keys to disk.
+	Useful for debugging observation preprocessing and encoder inputs.
+	"""
 	full_set = set(full_keys or [])
 	lines = [f"[obs] {label} -> {len(obs)} keys"]
 	for key in sorted(obs.keys()):
@@ -193,7 +228,6 @@ def _log_obs_snapshot(
 
 
 def _load_dataset_obs_frame(
-# Load a single observation frame from an HDF5 dataset demo.
 	dataset_file: h5py.File,
 	demo_key: str,
 	frame_idx: int,
@@ -216,7 +250,6 @@ def _load_dataset_obs_frame(
 
 
 def _compare_processed_obs(
-# Compare two processed observation dicts and print per-key differences.
 	label: str,
 	ref_obs: Dict[str, Any],
 	candidate_obs: Dict[str, Any],
@@ -239,15 +272,16 @@ def _compare_processed_obs(
 
 
 def _prepare_obs(
-# Prepare and order observation dict for encoder input, stacking images and adding flags.
 	raw_obs: Dict[str, Any],
 	*,
 	cnn_keys_order: Tuple[str, ...],
 	mlp_keys_order: Tuple[str, ...],
 	camera_keys: Tuple[str, ...],
 	flip_keys: Tuple[str, ...],
-	is_first: bool,
-	is_terminal: bool,
+	crop_height: Optional[int] = None,
+	crop_width: Optional[int] = None,
+	is_first: Optional[bool] = None,
+	is_terminal: Optional[bool] = None,
 ) -> Dict[str, Any]:
 	"""Prepare observations in the exact order specified by config keys.
 	
@@ -260,7 +294,12 @@ def _prepare_obs(
 	for key in cnn_keys_order:
 		if key == "image":
 			# Stack camera observations into a single image tensor
-			processed["image"] = _stack_cameras(raw_obs, camera_keys, flip_keys)
+			img = _stack_cameras(raw_obs, camera_keys, flip_keys)
+			if crop_height and crop_width and img.shape[0] >= crop_height and img.shape[1] >= crop_width:
+				top = (img.shape[0] - crop_height) // 2
+				left = (img.shape[1] - crop_width) // 2
+				img = img[top : top + crop_height, left : left + crop_width, :]
+			processed["image"] = img
 		elif key in raw_obs:
 			processed[key] = np.asarray(raw_obs[key], dtype=np.float32)
 	
@@ -281,13 +320,15 @@ def _prepare_obs(
 		elif key in raw_obs:
 			processed[key] = np.asarray(raw_obs[key], dtype=np.float32)
 
-	processed["is_first"] = np.array([1.0 if is_first else 0.0], dtype=np.float32)
-	processed["is_terminal"] = np.array([1.0 if is_terminal else 0.0], dtype=np.float32)
+	if is_first is not None:
+		processed["is_first"] = np.array([1.0 if is_first else 0.0], dtype=np.float32)
+	if is_terminal is not None:
+		processed["is_terminal"] = np.array([1.0 if is_terminal else 0.0], dtype=np.float32)
+
 	return processed
 
 
 def _dict_to_space(obs: Dict[str, Any]):
-# Convert an observation dict to a gym.spaces.Dict, preserving key order.
 	"""Convert obs dict to gym.spaces.Dict, preserving key order."""
 	spaces: Dict[str, Any] = OrderedDict()
 	for key, value in obs.items():
@@ -300,7 +341,6 @@ def _dict_to_space(obs: Dict[str, Any]):
 
 
 def _obs_to_torch(obs: Dict[str, Any], device: Any) -> Dict[str, Any]:
-# Convert observation dict to torch tensors, normalizing images to [0, 1].
 	"""Convert observation dict to torch tensors, normalizing images to [0, 1].
 	
 	Preserves key ordering from input obs (assumes OrderedDict from _prepare_obs).
@@ -319,7 +359,6 @@ def _obs_to_torch(obs: Dict[str, Any], device: Any) -> Dict[str, Any]:
 
 
 def _replay_dataset_demo(
-# Replay a dataset demo in the environment, saving video and action plots.
 	env,
 	config: EvalConfig,
 	dataset_file: h5py.File,
@@ -332,6 +371,27 @@ def _replay_dataset_demo(
 	*,
 	max_steps: int | None = None,
 ):
+	"""Open-loop replay of a dataset demo inside the environment.
+
+	This replays dataset actions in the provided ``env`` starting from the
+	saved initial state. It records video frames, computes policy-vs-dataset
+	action differences, and saves diagnostic plots to ``imgs_dir``.
+
+	Args:
+		env: The robosuite environment instance.
+		config: Evaluation configuration.
+		dataset_file: HDF5 dataset containing demo trajectories.
+		demo_key: Key of the demo to replay.
+		video_recorder: EpisodeVideoRecorder for recording frames.
+		imgs_dir: Directory to save plots and images.
+		encoder: The Dreamer encoder used to produce embeddings.
+		policy: The BC policy (MLP) applied to embeddings.
+		device: Torch device to run encoder/policy on.
+		max_steps: Optional maximum number of steps to replay.
+
+	Returns:
+		None. Outputs saved files to disk and prints summary info.
+	"""
 	data_group = dataset_file["data"].get(demo_key)
 	if data_group is None:
 		print(f"[replay] demo '{demo_key}' missing from dataset; skipping open-loop replay")
@@ -369,8 +429,8 @@ def _replay_dataset_demo(
 			mlp_keys_order=config.bc_mlp_keys_order,
 			camera_keys=config.camera_obs_keys,
 			flip_keys=config.flip_camera_keys,
-			is_first=(idx == 0),
-			is_terminal=False,
+			crop_height=getattr(config, "bc_crop_height", None),
+			crop_width=getattr(config, "bc_crop_width", None),
 		)
 		tensor_obs = _obs_to_torch(step_obs, device)
 		with torch.no_grad():
@@ -435,7 +495,6 @@ def _replay_dataset_demo(
 
 
 def _evaluate_npz_demo(
-# Evaluate policy on a pre-processed NPZ episode, comparing actions and saving plots.
 	config: EvalConfig,
 	npz_evaldir: pathlib.Path,
 	demo_key: str,
@@ -562,7 +621,6 @@ def _evaluate_npz_demo(
 
 
 class EpisodeVideoRecorder:
-# Utility class for recording and saving episode videos from environment observations.
 	def __init__(
 		self,
 		directory: pathlib.Path | None,
@@ -570,6 +628,7 @@ class EpisodeVideoRecorder:
 		camera_key: str | None,
 		camera_keys: Tuple[str, ...] | None = None,
 		flip_keys: Iterable[str] = (),
+		name_template: str | None = "episode_{episode_idx:03d}.mp4",
 	):
 		self._dir = directory
 		self._fps = fps
@@ -579,18 +638,32 @@ class EpisodeVideoRecorder:
 		self._writer = None
 		self._path: pathlib.Path | None = None
 		self._episode_idx: int | None = None
+		self._name_template = name_template
+		self._filename_override: pathlib.Path | None = None
 
 	def enabled(self) -> bool:
 		if self._dir is None:
 			return False
 		return bool(self._camera_key or (self._camera_keys and len(self._camera_keys) > 0))
 
-	def start_episode(self, episode_idx: int):
+	def start_episode(self, episode_idx: int, filename: pathlib.Path | str | None = None):
+		"""Begin recording a new episode.
+
+		Sets the current episode index and clears any existing writer so a new
+		file will be created on the next call to ``add_frame``.
+		"""
 		self._episode_idx = episode_idx
 		self._path = None
+		self._filename_override = pathlib.Path(filename) if filename else None
 		self._release()
 
 	def add_frame(self, obs: Dict[str, Any]):
+		"""Add a frame to the current episode video.
+
+		Extracts the configured camera frames from ``obs``, converts and
+		normalizes them to uint8, initializes the writer if necessary, and
+		appends the frame to the video file.
+		"""
 		if not self.enabled():
 			return
 		frames: List[np.ndarray] = []
@@ -622,28 +695,52 @@ class EpisodeVideoRecorder:
 			if cv2 is None:
 				raise ImportError("opencv-python is required for video recording; install it to enable --video_dir")
 			self._init_writer()
-			self._path = self._dir / f"episode_{self._episode_idx:03d}.mp4"
-			fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 			h, w = frame_uint8.shape[0], frame_uint8.shape[1]
-			self._writer = cv2.VideoWriter(str(self._path), fourcc, self._fps, (w, h))
+			# Use MPEG-4 / mp4v inside an MP4 container for W&B compatibility.
+			if self._filename_override is not None:
+				self._path = self._filename_override if self._filename_override.is_absolute() else self._dir / self._filename_override
+			elif self._name_template:
+				self._path = self._dir / self._name_template.format(episode_idx=self._episode_idx if self._episode_idx is not None else 0)
+			else:
+				self._path = self._dir / f"episode_{self._episode_idx:03d}.mp4"
+			fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+			writer = cv2.VideoWriter(str(self._path), fourcc, self._fps, (w, h))
+			if not writer.isOpened():
+				writer.release()
+				raise RuntimeError("Unable to open video writer with mp4v codec for MP4 output")
+			self._writer = writer
+			print(f"[video] Using codec mp4v for {self._path.name}")
 		self._writer.write(cv2.cvtColor(frame_uint8, cv2.COLOR_RGB2BGR))
 
 	def finish_episode(self) -> pathlib.Path | None:
+		"""Finish the current episode and release the video writer.
+
+		Returns the path to the saved video file, or ``None`` if recording was
+		disabled.
+		"""
 		self._release()
 		return self._path
 
 	def _init_writer(self):
+		"""Ensure the video directory exists before creating a writer."""
 		if self._dir is None:
 			return
 		self._dir.mkdir(parents=True, exist_ok=True)
 
 	def _release(self):
+		"""Release and close the underlying video writer if open."""
 		if self._writer is not None:
 			self._writer.release()
 		self._writer = None
+		self._filename_override = None
 
 	@staticmethod
 	def _combine_frames(frames: List[np.ndarray]) -> np.ndarray:
+		"""Combine multiple camera frames horizontally for video output.
+
+		All frames must share the same height and width. If only one frame is
+		provided it is returned unchanged.
+		"""
 		if len(frames) == 1:
 			return frames[0]
 		shapes = [frame.shape for frame in frames]
@@ -655,6 +752,7 @@ class EpisodeVideoRecorder:
 
 	@staticmethod
 	def _to_uint8(frame: Any) -> Any:
+		"""Convert a numeric frame to uint8 suitable for video writing."""
 		if frame.dtype == np.uint8:
 			return frame
 		if np.issubdtype(frame.dtype, np.floating):
@@ -664,7 +762,6 @@ class EpisodeVideoRecorder:
 
 
 def _build_action_mlp(input_dim: int, action_dim: int, cfg: EvalConfig, *, use_layernorm: bool, use_bias: bool):
-# Build the MLP policy network for action prediction given encoder output.
 	act_cls = getattr(torch.nn, cfg.bc_activation)
 	layers: List[Any] = []
 	last_dim = input_dim
@@ -681,7 +778,6 @@ def _build_action_mlp(input_dim: int, action_dim: int, cfg: EvalConfig, *, use_l
 
 
 def _extract_success(info, env) -> bool:
-# Extract task success flag from environment info or env methods.
 	success = False
 	if isinstance(info, dict):
 		if "success" in info:
@@ -690,22 +786,13 @@ def _extract_success(info, env) -> bool:
 		if isinstance(env_info, dict):
 			success = bool(env_info.get("task_success", env_info.get("success", success)))
 		success = bool(info.get("task_success", success))
-	checker = getattr(env, "is_success", None)
-	if callable(checker):
-		try:
-			result = checker()
-			if isinstance(result, dict):
-				success = bool(result.get("task", success))
-			else:
-				success = bool(result)
-		except Exception:
-			pass
+	env_success = env._check_success()
+	success = success or env_success
 	return success
 
 
 
 def evaluate_policy(config: EvalConfig, dreamer_cfg):
-# Main evaluation loop: loads models, runs policy in environment, logs results.
 	tools.set_seed_everywhere(config.seed)
 	size = tuple(getattr(dreamer_cfg, "size", (84, 84)))
 	device = torch.device(config.device)
@@ -730,7 +817,7 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 		camera_keys=config.video_camera_keys,
 		flip_keys=config.flip_camera_keys,
 	)
-	env = _make_robomimic_can_env(config, size)
+	env = _make_robomimic_env(config, size)
 	imgs_dir = pathlib.Path("imgs")
 	imgs_dir.mkdir(exist_ok=True)
 
@@ -763,7 +850,7 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 		env.reset()
 		env.sim.set_state_from_flattened(initial_state)
 		env.sim.forward()
-		obs = env._get_observations()
+		obs = env._get_observations(force_update=True)
 		_log_obs_snapshot(
 			"initial_dataset_state_warmup",
 			obs,
@@ -781,8 +868,8 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 		mlp_keys_order=config.bc_mlp_keys_order,
 		camera_keys=config.camera_obs_keys,
 		flip_keys=config.flip_camera_keys,
-		is_first=True,
-		is_terminal=False,
+		crop_height=getattr(config, "bc_crop_height", None),
+		crop_width=getattr(config, "bc_crop_width", None),
 	)
 	if dataset_obs_file and obs_demo_keys:
 		dataset_obs = _load_dataset_obs_frame(dataset_obs_file, obs_demo_keys[0], 0)
@@ -797,8 +884,8 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 				mlp_keys_order=config.bc_mlp_keys_order,
 				camera_keys=config.camera_obs_keys,
 				flip_keys=config.flip_camera_keys,
-				is_first=True,
-				is_terminal=False,
+				crop_height=getattr(config, "bc_crop_height", None),
+				crop_width=getattr(config, "bc_crop_width", None),
 			)
 			_compare_processed_obs(
 				"demo0 processed obs vs env warmup",
@@ -936,8 +1023,8 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 				mlp_keys_order=config.bc_mlp_keys_order,
 				camera_keys=config.camera_obs_keys,
 				flip_keys=config.flip_camera_keys,
-				is_first=(steps == 0),
-				is_terminal=done,
+				crop_height=getattr(config, "bc_crop_height", None),
+				crop_width=getattr(config, "bc_crop_width", None),
 			)
 			tensor_obs = _obs_to_torch(step_obs, device)
 			with torch.no_grad():
@@ -990,7 +1077,6 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 
 
 def _parse_args():
-# Parse command-line arguments and config, returning EvalConfig and Dreamer config.
 	parser = argparse.ArgumentParser(description="Evaluate BC policy in robomimic Can environment")
 	parser.add_argument("--configs", nargs="+", default=["bc_defaults"], help="Config presets to load")
 	parser.add_argument("--policy_path", type=pathlib.Path, required=True, help="Path to saved bc_action_mlp.pt")
@@ -1041,6 +1127,8 @@ def _parse_args():
 	parser.add_argument("--bc_hidden_layers", type=int, default=4)
 	parser.add_argument("--bc_activation", type=str, default="SiLU")
 	parser.add_argument("--bc_use_layernorm", action="store_true")
+	parser.add_argument("--bc_crop_height", type=int, default=0, help="Center crop height for image observations (0 = no crop)")
+	parser.add_argument("--bc_crop_width", type=int, default=0, help="Center crop width for image observations (0 = no crop)")
 	parser.add_argument("--dataset_path", type=str, default="datasets/canPH_raw.hdf5", help="Path to HDF5 dataset for initial states")
 	parser.add_argument(
 		"--dataset_obs_path",
@@ -1127,6 +1215,8 @@ def _parse_args():
 		bc_hidden_layers=args.bc_hidden_layers,
 		bc_activation=args.bc_activation,
 		bc_use_layernorm=args.bc_use_layernorm,
+		bc_crop_height=args.bc_crop_height,
+		bc_crop_width=args.bc_crop_width,
 		video_dir=video_dir,
 		video_fps=args.video_fps,
 		video_camera=video_camera,
@@ -1162,6 +1252,8 @@ def _parse_args():
 	config.bc_hidden_layers = eval_cfg.bc_hidden_layers
 	config.bc_activation = eval_cfg.bc_activation
 	config.bc_use_layernorm = eval_cfg.bc_use_layernorm
+	config.bc_crop_height = eval_cfg.bc_crop_height
+	config.bc_crop_width = eval_cfg.bc_crop_width
 	config.video_dir = eval_cfg.video_dir
 	config.video_fps = eval_cfg.video_fps
 	config.video_camera = eval_cfg.video_camera
@@ -1172,11 +1264,9 @@ def _parse_args():
 
 
 def main():
-# Entry point: parse arguments and run policy evaluation.
 	eval_cfg, dreamer_cfg = _parse_args()
 	evaluate_policy(eval_cfg, dreamer_cfg)
 
 
 if __name__ == "__main__":
 	main()
-

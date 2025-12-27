@@ -1,25 +1,4 @@
-"""
-python BC_Sweep.py \
-  --configs bc_defaults bc_can_PH \
-  --checkpoint /workspace/dreamerv3-torch/dreamerv3-torch/logdir/robomimic_offline_can_MH_cropped/latest.pt \
-  --offline_traindir ./datasets/robomimic_data_MV/can_PH_train \
-  --offline_evaldir ./datasets/robomimic_data_MV/can_PH_eval \
-  --lr_grid 1e-4 1e-5 1e-3 \
-  --weight_decay_grid 0.0 1e-5 1e-4 1e-3 \
-  --sweep_name bc_frozen_encoder_cropped \
-  --env_config lift_env_eval \
-  --video_dir ./videos/bc_sweep_frozen_cropped \
-  --save_dir ./checkpoints/bc_sweep_frozen_cropped \
-  --env_episodes 10 \
-  --env_max_steps 500 \
-  --eval_epochs 200 400 600 800 1000 \
-  --bc_crop_height 78 \
-  --bc_crop_width 78
-"""
-
 import argparse
-import copy
-import heapq
 import os
 import pathlib
 from types import SimpleNamespace
@@ -31,14 +10,13 @@ import matplotlib.pyplot as plt
 import ruamel.yaml as yaml
 import torch
 import wandb
+from torch.utils.data import DataLoader 
 
 import tools
-from parallel import Parallel
 from bc_mlp.BC_MLP_train import (
     _load_config,
     BC_MLP,
-    _flatten_episodes,
-    _sample_batch,
+    BehaviorCloningDataset,
     _build_ordered_obs_space,
     _build_encoder,
     build_action_mlp,
@@ -72,7 +50,7 @@ def _load_env_block(name: str | None):
     """Load env config block from configs.yaml if provided."""
     if not name:
         return None
-    cfg_path = pathlib.Path(__file__).resolve().parent / "configs.yaml"
+    cfg_path = pathlib.Path(__file__).resolve().parent.parent / "configs.yaml"
     if not cfg_path.exists():
         raise FileNotFoundError(f"configs.yaml not found at {cfg_path}")
     parser = yaml.YAML(typ="safe")
@@ -128,19 +106,19 @@ def _prepare_datasets(config):
         eval_eps = dict(episode_items[:eval_cut]) if eval_cut > 0 else {}
         train_eps = dict(episode_items[eval_cut:])
 
-    train_samples = _flatten_episodes(train_eps)
-    eval_samples = _flatten_episodes(eval_eps) if eval_eps else []
+    train_dataset = BehaviorCloningDataset(train_eps, config, mode='train')
+    eval_dataset = BehaviorCloningDataset(eval_eps, config, mode='eval') if eval_eps else None
     eval_episodes_list = list(eval_eps.values()) if eval_eps else []
-    print(f"Loaded {len(train_samples)} train samples and {len(eval_samples)} eval samples.")
-    return train_samples, eval_samples, eval_episodes_list
+    print(f"Prepared {len(train_dataset)} train samples and {len(eval_dataset) if eval_dataset else 0} eval samples.")
+    return train_dataset, eval_dataset, eval_episodes_list
 
 
 def BC_MLP_train(
     config,
     encoder,
     action_mlp,
-    train_samples,
-    eval_samples,
+    train_dataset,
+    eval_dataset,
     eval_episodes_list,
     train_encoder=True,
     run=None,
@@ -165,45 +143,42 @@ def BC_MLP_train(
     )
     loss_fn = torch.nn.MSELoss()
 
-    steps_per_epoch = max(1, len(train_samples) // config.bc_batch_size)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.bc_batch_size,
+        shuffle=True,
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True,
+        drop_last=True
+    )
+    
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=config.bc_batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    ) if eval_dataset else None
+
+    steps_per_epoch = len(train_loader)
     total_steps = config.bc_epochs * steps_per_epoch if config.bc_max_steps < 0 else config.bc_max_steps
     print(f"BC training: epochs={config.bc_epochs}, steps_per_epoch={steps_per_epoch}, total_steps={total_steps}")
 
     def evaluate():
-        if not eval_samples:
+        if not eval_loader:
             return None
         encoder.eval()
         action_mlp.eval()
         losses = []
         with torch.no_grad():
-            batch_size = min(config.bc_batch_size, len(eval_samples))
-            for start in range(0, len(eval_samples), batch_size):
-                chunk = eval_samples[start : start + batch_size]
-                obs_list = {k: [] for k in chunk[0][0].keys()}
-                act_list = []
-                for obs, act in chunk:
-                    for k, v in obs.items():
-                        obs_list[k].append(v)
-                    act_list.append(act)
-                for k in obs_list:
-                    arr = np.asarray(obs_list[k])
-                    if arr.ndim == 1:
-                        arr = arr[:, None]
-                    obs_tensor = torch.as_tensor(arr, device=config.device).float()
-                    if k == "image":
-                        if getattr(config, "bc_crop_height", 0) and getattr(config, "bc_crop_width", 0):
-                            obs_tensor = _center_crop(
-                                obs_tensor,
-                                int(getattr(config, "bc_crop_height", 0)),
-                                int(getattr(config, "bc_crop_width", 0)),
-                            )
-                        obs_tensor = obs_tensor / 255.0
-                    obs_list[k] = obs_tensor
-                acts = torch.as_tensor(np.asarray(act_list), device=config.device).float()
-                enc_in = {k: v for k, v in obs_list.items()}
-                embedding = encoder(enc_in)
+            for batch_obs, batch_acts in eval_loader:
+                batch_obs = {k: v.to(config.device, non_blocking=True) for k, v in batch_obs.items()}
+                batch_acts = batch_acts.to(config.device, non_blocking=True)
+                
+                embedding = encoder(batch_obs)
                 pred = action_mlp(embedding)
-                losses.append(torch.nn.functional.mse_loss(pred, acts).item())
+                losses.append(torch.nn.functional.mse_loss(pred, batch_acts).item())
 
         if eval_episodes_list:
             with torch.no_grad():
@@ -261,19 +236,15 @@ def BC_MLP_train(
     global_step = 0
     final_eval_loss = None
     for epoch in range(1, config.bc_epochs + 1):
-        if config.bc_shuffle:
-            np.random.shuffle(train_samples)
         epoch_losses = []
-        for _ in range(steps_per_epoch):
+        # --- NEW: Training Loop ---
+        for batch_obs, batch_actions in train_loader:
             if global_step >= total_steps:
                 break
-            batch_obs, batch_actions = _sample_batch(
-                train_samples,
-                config.bc_batch_size,
-                config.device,
-                getattr(config, "bc_crop_height", 0),
-                getattr(config, "bc_crop_width", 0),
-            )
+                
+            batch_obs = {k: v.to(config.device, non_blocking=True) for k, v in batch_obs.items()}
+            batch_actions = batch_actions.to(config.device, non_blocking=True)
+            
             if train_encoder:
                 embedding = encoder(batch_obs)
             else:
@@ -281,12 +252,15 @@ def BC_MLP_train(
                     embedding = encoder(batch_obs)
             pred_actions = action_mlp(embedding)
             loss = loss_fn(pred_actions, batch_actions)
+            
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, config.bc_grad_clip)
             optimizer.step()
+            
             epoch_losses.append(loss.item())
             global_step += 1
+            
         avg_train_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
         eval_loss = evaluate() if (epoch % config.bc_eval_every == 0) else None
         if (epoch in checkpoint_set) and eval_loss is None:
@@ -313,7 +287,7 @@ def BC_MLP_train(
 
 
 def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
-    """Parallel env eval with batched inference and optional top-K video keeping."""
+    """Roll out the trained policy in the real environment and log metrics."""
     log_fn = run.log if run else wandb.log
 
     size = tuple(getattr(config, "size", (84, 84)))
@@ -321,161 +295,39 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
     encoder.eval().to(device)
     policy.eval().to(device)
 
-    num_envs = max(1, int(getattr(env_cfg, "num_envs", 1)))
-    total_episodes = int(getattr(env_cfg, "episodes", 1))
-    video_top_k = int(getattr(env_cfg, "video_top_k", -1))
-    record_video = (not bool(getattr(env_cfg, "disable_video", False))) and video_top_k != 0
-    video_dir = pathlib.Path(getattr(env_cfg, "video_dir", "videos/bc_sweep")).expanduser()
+    env = _make_robomimic_env(env_cfg, size)
+    record_video = not bool(getattr(env_cfg, "disable_video", False))
+    video_recorder = (
+        EpisodeVideoRecorder(
+            directory=env_cfg.video_dir,
+            fps=env_cfg.video_fps,
+            camera_key=env_cfg.video_camera,
+            camera_keys=env_cfg.video_camera_keys,
+            flip_keys=env_cfg.flip_camera_keys,
+        )
+        if record_video
+        else None
+    )
 
-    class _EnvWorker:
-        def __init__(self, cfg, image_size):
-            self._cfg = cfg
-            self._image_size = image_size
-            self._env = None
-
-        def _ensure_env(self):
-            if self._env is None:
-                self._env = _make_robomimic_env(self._cfg, self._image_size)
-
-        def reset(self, seed=None):
-            self._ensure_env()
-            if seed is not None:
-                try:
-                    return self._env.reset(seed=seed)
-                except TypeError:
-                    try:
-                        self._env.seed(seed)
-                    except Exception:
-                        pass
-            return self._env.reset()
-
-        def step(self, action):
-            self._ensure_env()
-            obs, reward, done, info = self._env.step(action)
-            try:
-                env_success = bool(self._env._check_success())
-            except Exception:
-                env_success = False
-            return obs, reward, done, info, env_success
-
-        def close(self):
-            if self._env is None:
-                return
-            try:
-                self._env.close()
-            except Exception:
-                pass
-
-    def _batch_to_torch(obs_list):
-        keys = obs_list[0].keys()
-        batched = {}
-        for key in keys:
-            arrs = []
-            for obs in obs_list:
-                arr = np.asarray(obs[key])
-                if arr.ndim == 0:
-                    arr = arr[None]
-                arrs.append(arr)
-            stacked = np.stack(arrs, axis=0)
-            tensor = torch.as_tensor(stacked, device=device).float()
-            if key == "image":
-                tensor = tensor / 255.0
-            batched[key] = tensor
-        return batched
-
-    video_heap: list[tuple[float, pathlib.Path]] = []
+    rewards = []
+    successes = []
+    successes_env = []
     best_reward = -np.inf
-    best_video: pathlib.Path | None = None
+    best_video = None
 
-    def _maybe_keep_video(reward_value: float, path: pathlib.Path | None):
-        nonlocal best_reward, best_video
-        if path is None:
-            return
-        if reward_value >= best_reward:
-            best_reward = reward_value
-            best_video = path
-        if video_top_k < 0:
-            return
-        heapq.heappush(video_heap, (reward_value, path))
-        if len(video_heap) > video_top_k:
-            drop_reward, drop_path = heapq.heappop(video_heap)
-            try:
-                drop_path.unlink()
-            except FileNotFoundError:
-                pass
-
-    rewards: list[float] = []
-    successes: list[bool] = []
-    successes_env: list[bool] = []
-    env_states = []
-    completed = 0
-    global_episode = 0
-    max_envs = min(num_envs, total_episodes) if total_episodes > 0 else num_envs
-
-    # Spin up env processes.
-    for env_id in range(max_envs):
-        cfg_copy = copy.deepcopy(env_cfg)
-        worker_env = _EnvWorker(cfg_copy, size)
-        env = Parallel(worker_env, "process")
-        recorder = None
-        if record_video:
-            recorder = EpisodeVideoRecorder(
-                directory=video_dir,
-                fps=env_cfg.video_fps,
-                camera_key=env_cfg.video_camera,
-                camera_keys=env_cfg.video_camera_keys,
-                flip_keys=env_cfg.flip_camera_keys,
-            )
-        env_states.append(
-            {
-                "env": env,
-                "env_id": env_id,
-                "recorder": recorder,
-                "raw_obs": None,
-                "reward": 0.0,
-                "steps": 0,
-                "done": False,
-                "env_success": False,
-                "episode_id": None,
-                "actions": [],
-            }
-        )
-
-    def _start_episode(state) -> bool:
-        nonlocal global_episode
-        if global_episode >= total_episodes:
-            state["done"] = True
-            return False
-        episode_id = global_episode
-        global_episode += 1
-        seed = int(getattr(env_cfg, "seed", 0) or 0) + episode_id
-        obs = state["env"].reset(seed=seed)()
-        state.update(
-            {
-                "episode_id": episode_id,
-                "raw_obs": obs,
-                "reward": 0.0,
-                "steps": 0,
-                "done": False,
-                "env_success": False,
-                "actions": [],
-            }
-        )
-        if state["recorder"]:
-            filename = f"ep_{episode_id:05d}_env_{state['env_id']:02d}.mp4"
-            state["recorder"].start_episode(episode_id, filename=filename)
-        return True
-
-    # Initialize first episodes for each env.
-    for state in env_states:
-        _start_episode(state)
-
-    while completed < total_episodes and any(not s["done"] for s in env_states):
-        active_states = [s for s in env_states if not s["done"]]
-        obs_list = []
-        for state in active_states:
+    for episode in range(env_cfg.episodes):
+        raw_obs = env.reset()
+        done = False
+        total_reward = 0.0
+        steps = 0
+        info = {}
+        env_success = False
+        if video_recorder:
+            video_recorder.start_episode(episode)
+        episode_actions: list = []
+        while not done and steps < env_cfg.max_env_steps:
             step_obs = _prepare_obs(
-                state["raw_obs"],
+                raw_obs,
                 cnn_keys_order=env_cfg.bc_cnn_keys_order,
                 mlp_keys_order=env_cfg.bc_mlp_keys_order,
                 camera_keys=env_cfg.camera_obs_keys,
@@ -483,96 +335,77 @@ def evaluate_in_environment(config, encoder, policy, env_cfg, run=None):
                 crop_height=getattr(env_cfg, "bc_crop_height", None),
                 crop_width=getattr(env_cfg, "bc_crop_width", None),
             )
-            obs_list.append(step_obs)
-        if not obs_list:
-            break
-        batch_obs = _batch_to_torch(obs_list)
-        with torch.no_grad():
-            embedding = encoder(batch_obs)
-            actions = policy(embedding)
-        actions_np = actions.detach().cpu().numpy()
-
-        # Dispatch steps.
-        futures = []
-        for idx, state in enumerate(active_states):
-            action_np = actions_np[idx]
-            state["actions"].append(action_np.copy())
+            tensor_obs = _obs_to_torch(step_obs, device)
+            with torch.no_grad():
+                embedding = encoder(tensor_obs)
+                action = policy(embedding)
+            action_np = action.squeeze(0).cpu().numpy()
+            episode_actions.append(action_np.copy())
             if env_cfg.clip_actions:
                 action_np = np.clip(action_np, -1.0, 1.0)
-            futures.append(state["env"].step(action_np))
-        results = [f() for f in futures]
-
-        for state, result in zip(active_states, results):
-            raw_obs, reward, done, info, env_success_step = result
-            if state["recorder"]:
-                state["recorder"].add_frame(raw_obs)
-            state["reward"] += float(reward)
-            state["steps"] += 1
-            state["raw_obs"] = raw_obs
-            state["env_success"] = state["env_success"] or bool(env_success_step)
-            if state["steps"] >= env_cfg.max_env_steps:
+            raw_obs, reward, done, info = env.step(action_np)
+            if video_recorder:
+                video_recorder.add_frame(raw_obs)
+            total_reward += float(reward)
+            steps += 1
+            env_success = env_success or env._check_success()
+            if env_success:
                 done = True
-            if state["env_success"]:
-                done = True
-
             if done:
-                completed += 1
-                success = state["reward"] > 0.0
-                rewards.append(state["reward"])
-                successes.append(success)
-                successes_env.append(state["env_success"])
-                saved_video = state["recorder"].finish_episode() if state["recorder"] else None
-                _maybe_keep_video(state["reward"], saved_video)
-                if state["actions"]:
-                    acts = np.stack(state["actions"])
-                    action_dim = acts.shape[1]
-                    steps_arr = np.arange(acts.shape[0])
-                    fig, axes = plt.subplots(action_dim, 1, figsize=(10, 2 * action_dim), sharex=True)
-                    if action_dim == 1:
-                        axes = [axes]
-                    for i in range(action_dim):
-                        axes[i].plot(steps_arr, acts[:, i], label="policy_action")
-                        axes[i].set_ylabel(f"Dim {i}")
-                        if i == 0:
-                            axes[i].legend()
-                    axes[-1].set_xlabel("Step")
-                    plt.tight_layout()
-                    log_fn({f"env/episode_{state['episode_id']}/actions_image": wandb.Image(fig)}, commit=False)
-                    plt.close(fig)
-                log_fn(
-                    {
-                        "env/episode_reward": state["reward"],
-                        "env/episode_success": success,
-                        "env/episode_env_success": state["env_success"],
-                        "env/episode_steps": state["steps"],
-                    },
-                    commit=False,
-                )
-                print(
-                    f"[env eval] episode {state['episode_id']+1}/{total_episodes} reward={state['reward']:.3f} "
-                    f"success={success} env_success={state['env_success']} steps={state['steps']} env={state['env_id']}"
-                )
-                if completed < total_episodes:
-                    _start_episode(state)
-                else:
-                    state["done"] = True
+                break
 
-    # Cleanup workers
-    for state in env_states:
+        env_success = env_success or env._check_success()
+        successes_env.append(env_success)
+        success = total_reward > 0.0
+        rewards.append(total_reward)
+        successes.append(success)
+        if episode_actions:
+            acts = np.stack(episode_actions)
+            action_dim = acts.shape[1]
+            steps_arr = np.arange(acts.shape[0])
+            fig, axes = plt.subplots(action_dim, 1, figsize=(10, 2 * action_dim), sharex=True)
+            if action_dim == 1:
+                axes = [axes]
+            for i in range(action_dim):
+                axes[i].plot(steps_arr, acts[:, i], label="policy_action")
+                axes[i].set_ylabel(f"Dim {i}")
+                if i == 0:
+                    axes[i].legend()
+            axes[-1].set_xlabel("Step")
+            plt.tight_layout()
+            log_fn({f"env/episode_{episode}/actions_image": wandb.Image(fig)}, commit=False)
+            plt.close(fig)
+        saved_video = video_recorder.finish_episode() if video_recorder else None
+        log_fn(
+            {
+                "env/episode_reward": total_reward,
+                "env/episode_success": success,
+                "env/episode_env_success": env_success,
+                "env/episode_steps": steps,
+            },
+            commit=False,
+        )
+        print(f"[env eval] episode {episode+1}/{env_cfg.episodes} reward={total_reward:.3f} success={success} env_success={env_success} steps={steps}")
+        if saved_video and total_reward >= best_reward:
+            best_reward = total_reward
+            best_video = saved_video
+
+        # Debug: print env info and is_success for troubleshooting success detection.
         try:
-            state["env"].close()
+            success_state = env.is_success() if hasattr(env, "is_success") else None
         except Exception:
-            pass
+            success_state = None
+        print(f"[env eval] episode {episode+1} info={info} is_success={success_state}")
 
     mean_reward = float(np.mean(rewards)) if rewards else float("nan")
-    env_success_rate = float(np.mean(successes_env)) if successes_env else 0.0
+    env_successes = [s for s in successes_env] if 'successes_env' in locals() else []
+    env_success_rate = float(np.mean(env_successes)) if env_successes else 0.0
     reward_success_rate = float(np.mean(successes)) if successes else 0.0
-    best_reward_metric = best_reward if best_reward > -np.inf else (max(rewards) if rewards else float("nan"))
     metrics = {
         "env/mean_reward": mean_reward,
         "env/success_rate": env_success_rate,
         "env/reward_success_rate": reward_success_rate,
-        "env/best_reward": best_reward_metric,
+        "env/best_reward": best_reward,
     }
     log_fn(metrics)
     if best_video:
@@ -590,11 +423,9 @@ def _parse_args():
     sweep_parser.add_argument("--sweep_name", type=str, default="", help="Optional name for a newly created sweep")
     sweep_parser.add_argument("--agent_count", type=int, default=0, help="Number of sweep runs to execute (0 = all grid combos)")
     sweep_parser.add_argument("--env_episodes", type=int, default=3)
-    sweep_parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel envs to use during eval")
     sweep_parser.add_argument("--env_max_steps", type=int, default=500)
     sweep_parser.add_argument("--video_dir", type=str, default="videos/bc_sweep")
     sweep_parser.add_argument("--video_fps", type=int, default=20)
-    sweep_parser.add_argument("--video_top_k", type=int, default=-1, help="Keep only top-K reward episode videos (-1 keeps all, 0 disables video)")
     sweep_parser.add_argument("--video_camera", type=str, default=None)
     sweep_parser.add_argument("--video_camera_keys", nargs="+", default=None)
     sweep_parser.add_argument("--camera_obs_keys", nargs="+", default=list(DEFAULT_CAMERA_KEYS))
@@ -653,7 +484,7 @@ def main():
     lr_grid = args.lr_grid or [base_config.bc_lr]
     wd_grid = args.weight_decay_grid or [base_config.bc_weight_decay]
     # Preload data once; reused across sweep runs.
-    data_bundle = _prepare_datasets(base_config)
+    train_dataset, eval_dataset, eval_episodes_list = _prepare_datasets(base_config) # <--- UPDATED UNPACKING
 
     sweep_parameters = {
         "bc_lr": {"values": lr_grid},
@@ -719,7 +550,6 @@ def main():
             run.name = run_name
             wandb.watch([encoder, action_mlp], log="all", log_freq=100)
 
-            train_samples, eval_samples, eval_episodes_list = data_bundle
             checkpoint_epochs = sorted(set(args.eval_epochs or [run_config.bc_epochs]))
 
             def on_checkpoint(epoch, enc, mlp, eval_loss):
@@ -755,11 +585,9 @@ def main():
                     bc_mlp_keys_order=run_config.bc_mlp_keys_order,
                     clip_actions=run_config.clip_actions,
                     episodes=args.env_episodes,
-                    num_envs=args.num_envs,
                     seed=run_config.seed,
                     video_dir=pathlib.Path(args.video_dir) / f"{run_name}_epoch{epoch}",
                     video_fps=args.video_fps,
-                    video_top_k=args.video_top_k,
                     video_camera=args.video_camera or (args.video_camera_keys[0] if args.video_camera_keys else args.camera_obs_keys[0]),
                     video_camera_keys=tuple(args.video_camera_keys) if args.video_camera_keys else tuple(args.camera_obs_keys),
                     controller_configs=getattr(run_config, "controller_configs", None),
@@ -780,8 +608,8 @@ def main():
                 run_config,
                 encoder,
                 action_mlp,
-                train_samples,
-                eval_samples,
+                train_dataset,
+                eval_dataset,
                 eval_episodes_list,
                 train_encoder=bool(args.scratch_encoder),
                 run=run,

@@ -10,13 +10,13 @@ import matplotlib.pyplot as plt
 import ruamel.yaml as yaml
 import torch
 import wandb
+from torch.utils.data import DataLoader 
 
 import tools
 from bc_mlp.BC_MLP_train import (
     _load_config,
     BC_MLP,
-    _flatten_episodes,
-    _sample_batch,
+    BehaviorCloningDataset,
     _build_ordered_obs_space,
     _build_encoder,
     build_action_mlp,
@@ -106,19 +106,19 @@ def _prepare_datasets(config):
         eval_eps = dict(episode_items[:eval_cut]) if eval_cut > 0 else {}
         train_eps = dict(episode_items[eval_cut:])
 
-    train_samples = _flatten_episodes(train_eps)
-    eval_samples = _flatten_episodes(eval_eps) if eval_eps else []
+    train_dataset = BehaviorCloningDataset(train_eps, config, mode='train')
+    eval_dataset = BehaviorCloningDataset(eval_eps, config, mode='eval') if eval_eps else None
     eval_episodes_list = list(eval_eps.values()) if eval_eps else []
-    print(f"Loaded {len(train_samples)} train samples and {len(eval_samples)} eval samples.")
-    return train_samples, eval_samples, eval_episodes_list
+    print(f"Prepared {len(train_dataset)} train samples and {len(eval_dataset) if eval_dataset else 0} eval samples.")
+    return train_dataset, eval_dataset, eval_episodes_list
 
 
 def BC_MLP_train(
     config,
     encoder,
     action_mlp,
-    train_samples,
-    eval_samples,
+    train_dataset,
+    eval_dataset,
     eval_episodes_list,
     train_encoder=True,
     run=None,
@@ -143,45 +143,42 @@ def BC_MLP_train(
     )
     loss_fn = torch.nn.MSELoss()
 
-    steps_per_epoch = max(1, len(train_samples) // config.bc_batch_size)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.bc_batch_size,
+        shuffle=True,
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True,
+        drop_last=True
+    )
+    
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=config.bc_batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    ) if eval_dataset else None
+
+    steps_per_epoch = len(train_loader)
     total_steps = config.bc_epochs * steps_per_epoch if config.bc_max_steps < 0 else config.bc_max_steps
     print(f"BC training: epochs={config.bc_epochs}, steps_per_epoch={steps_per_epoch}, total_steps={total_steps}")
 
     def evaluate():
-        if not eval_samples:
+        if not eval_loader:
             return None
         encoder.eval()
         action_mlp.eval()
         losses = []
         with torch.no_grad():
-            batch_size = min(config.bc_batch_size, len(eval_samples))
-            for start in range(0, len(eval_samples), batch_size):
-                chunk = eval_samples[start : start + batch_size]
-                obs_list = {k: [] for k in chunk[0][0].keys()}
-                act_list = []
-                for obs, act in chunk:
-                    for k, v in obs.items():
-                        obs_list[k].append(v)
-                    act_list.append(act)
-                for k in obs_list:
-                    arr = np.asarray(obs_list[k])
-                    if arr.ndim == 1:
-                        arr = arr[:, None]
-                    obs_tensor = torch.as_tensor(arr, device=config.device).float()
-                    if k == "image":
-                        if getattr(config, "bc_crop_height", 0) and getattr(config, "bc_crop_width", 0):
-                            obs_tensor = _center_crop(
-                                obs_tensor,
-                                int(getattr(config, "bc_crop_height", 0)),
-                                int(getattr(config, "bc_crop_width", 0)),
-                            )
-                        obs_tensor = obs_tensor / 255.0
-                    obs_list[k] = obs_tensor
-                acts = torch.as_tensor(np.asarray(act_list), device=config.device).float()
-                enc_in = {k: v for k, v in obs_list.items()}
-                embedding = encoder(enc_in)
+            for batch_obs, batch_acts in eval_loader:
+                batch_obs = {k: v.to(config.device, non_blocking=True) for k, v in batch_obs.items()}
+                batch_acts = batch_acts.to(config.device, non_blocking=True)
+                
+                embedding = encoder(batch_obs)
                 pred = action_mlp(embedding)
-                losses.append(torch.nn.functional.mse_loss(pred, acts).item())
+                losses.append(torch.nn.functional.mse_loss(pred, batch_acts).item())
 
         if eval_episodes_list:
             with torch.no_grad():
@@ -239,19 +236,15 @@ def BC_MLP_train(
     global_step = 0
     final_eval_loss = None
     for epoch in range(1, config.bc_epochs + 1):
-        if config.bc_shuffle:
-            np.random.shuffle(train_samples)
         epoch_losses = []
-        for _ in range(steps_per_epoch):
+        # --- NEW: Training Loop ---
+        for batch_obs, batch_actions in train_loader:
             if global_step >= total_steps:
                 break
-            batch_obs, batch_actions = _sample_batch(
-                train_samples,
-                config.bc_batch_size,
-                config.device,
-                getattr(config, "bc_crop_height", 0),
-                getattr(config, "bc_crop_width", 0),
-            )
+                
+            batch_obs = {k: v.to(config.device, non_blocking=True) for k, v in batch_obs.items()}
+            batch_actions = batch_actions.to(config.device, non_blocking=True)
+            
             if train_encoder:
                 embedding = encoder(batch_obs)
             else:
@@ -259,12 +252,15 @@ def BC_MLP_train(
                     embedding = encoder(batch_obs)
             pred_actions = action_mlp(embedding)
             loss = loss_fn(pred_actions, batch_actions)
+            
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, config.bc_grad_clip)
             optimizer.step()
+            
             epoch_losses.append(loss.item())
             global_step += 1
+            
         avg_train_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
         eval_loss = evaluate() if (epoch % config.bc_eval_every == 0) else None
         if (epoch in checkpoint_set) and eval_loss is None:
@@ -488,7 +484,7 @@ def main():
     lr_grid = args.lr_grid or [base_config.bc_lr]
     wd_grid = args.weight_decay_grid or [base_config.bc_weight_decay]
     # Preload data once; reused across sweep runs.
-    data_bundle = _prepare_datasets(base_config)
+    train_dataset, eval_dataset, eval_episodes_list = _prepare_datasets(base_config) # <--- UPDATED UNPACKING
 
     sweep_parameters = {
         "bc_lr": {"values": lr_grid},
@@ -554,7 +550,6 @@ def main():
             run.name = run_name
             wandb.watch([encoder, action_mlp], log="all", log_freq=100)
 
-            train_samples, eval_samples, eval_episodes_list = data_bundle
             checkpoint_epochs = sorted(set(args.eval_epochs or [run_config.bc_epochs]))
 
             def on_checkpoint(epoch, enc, mlp, eval_loss):
@@ -613,8 +608,8 @@ def main():
                 run_config,
                 encoder,
                 action_mlp,
-                train_samples,
-                eval_samples,
+                train_dataset,
+                eval_dataset,
                 eval_episodes_list,
                 train_encoder=bool(args.scratch_encoder),
                 run=run,
