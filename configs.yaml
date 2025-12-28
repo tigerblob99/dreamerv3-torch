@@ -393,8 +393,9 @@ joint_train:
   # --- Evaluation Settings ---
   eval_every: 10000         # Frequency of evaluation (steps)
   offline_eval_batches: 10  # Number of batches to calculate validation loss on
-  eval_episodes: 5          # Number of online episodes to run in Robosuite
+  eval_episodes: 25          # Number of online episodes to run in Robosuite
   max_env_steps: 500        # Max steps per online episode
+  num_envs: 25
   
   # --- Observation Handling (Robosuite Defaults) ---
   # These ensure the environment matches the encoder input structure
