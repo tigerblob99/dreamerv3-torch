@@ -325,7 +325,7 @@ def evaluate_online(wm, policy, config, step, run):
     obs_batch = [None] * num_envs
     rssm_state = None 
     prev_action = torch.zeros((num_envs, config.num_actions), device=config.device)
-    is_first = torch.ones((num_envs, 1), device=config.device)
+    is_first = torch.ones(num_envs, device=config.device)
     
     episode_rewards = [0.0] * num_envs
     episode_steps = [0] * num_envs
