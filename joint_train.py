@@ -8,8 +8,8 @@ import numpy as np
 import ruamel.yaml as yaml
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
-from parallel import Parallel
 import gym
 from collections import defaultdict, OrderedDict
 
@@ -18,10 +18,11 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 
 import tools
 from models import WorldModel
-from networks import MLP
+# from networks import MLP # Removed to avoid confusion, we define ActionMLP below
 import wandb
 
 # Import Eval helpers
+from parallel import Parallel
 from bc_mlp.BC_MLP_eval import (
     _make_robomimic_env, 
     _prepare_obs, 
@@ -34,6 +35,32 @@ _EXCLUDE_KEYS = {"action", "reward", "discount", "is_first", "is_terminal", "pol
 
 def to_np(tensor):
     return tensor.detach().cpu().numpy()
+
+# --- Custom Action MLP (Raw Output) ---
+class ActionMLP(nn.Module):
+    def __init__(self, inp_dim, shape, layers=4, units=1024, act="SiLU", norm=False):
+        super().__init__()
+        act_cls = getattr(torch.nn, act)
+        out_dim = shape[0]
+        
+        net_layers = []
+        last_dim = inp_dim
+        
+        for _ in range(layers):
+            net_layers.append(nn.Linear(last_dim, units, bias=False))
+            if norm:
+                net_layers.append(nn.LayerNorm(units, eps=1e-03))
+            net_layers.append(act_cls())
+            last_dim = units
+            
+        net_layers.append(nn.Linear(last_dim, out_dim))
+        self.net = nn.Sequential(*net_layers)
+        
+        # Weight Init
+        self.apply(tools.weight_init)
+
+    def forward(self, features):
+        return self.net(features)
 
 # --- Config & Space Utilities ---
 
@@ -91,9 +118,8 @@ class JointDataset(Dataset):
         self.orig_w = 84
 
         if not self.directory.exists():
-            # If eval dir doesn't exist, we handle it gracefully later, but here warn
             print(f"Warning: Dataset directory {self.directory} does not exist.")
-            self.files = []
+            self.episodes = {}
             self.episode_list = []
         else:
             self.episodes = tools.load_episodes(self.directory, limit=config.dataset_size)
@@ -139,41 +165,30 @@ class JointDataset(Dataset):
             valid_pairs = total_ep_len - 1
             if valid_pairs < 1: continue
 
-            if self.mode == 'train':
-                start_idx = np.random.randint(0, valid_pairs)
-            else:
-                # Sequential-ish sampling for eval (or random, doesnt matter much for batch stats)
-                # Random is statistically safer for 'epoch' estimates
-                start_idx = np.random.randint(0, valid_pairs)
-
+            start_idx = np.random.randint(0, valid_pairs)
             take = min(needed, valid_pairs - start_idx)
             if take <= 0: continue
 
             input_slice = slice(start_idx, start_idx + take)
             target_slice = slice(start_idx + 1, start_idx + take + 1)
 
-            # Crops
             raw_imgs = episode['image'][input_slice]
             
-            # WM Crop
             t_wm, l_wm = self._get_crop_coords(getattr(self.config, 'wm_random_crop', False))
             collected['image_wm'].append(self._crop(raw_imgs, t_wm, l_wm))
 
-            # BC Crop
             t_bc, l_bc = self._get_crop_coords(getattr(self.config, 'bc_random_crop', False))
             collected['image_bc'].append(self._crop(raw_imgs, t_bc, l_bc))
 
-            # Flags
             first_chunk = episode['is_first'][input_slice].copy()
-            if current_len == 0: first_chunk[0] = True # Start of batch
-            else: first_chunk[0] = True # Start of appended segment (reset RNN)
+            if current_len == 0: first_chunk[0] = True 
+            else: first_chunk[0] = True 
 
             collected['action'].append(episode['action'][input_slice])
             collected['policy_target'].append(episode['action'][target_slice])
             collected['is_first'].append(first_chunk)
             collected['is_terminal'].append(episode['is_terminal'][input_slice])
 
-            # Other Keys (Proprio)
             skip_keys = ['image', 'action', 'is_first', 'is_terminal', 'log_']
             for k, v in episode.items():
                 if any(x in k for x in skip_keys): continue
@@ -193,7 +208,6 @@ def collate_episodes(batch):
 # --- Evaluation Functions ---
 
 def evaluate_offline(wm, policy, eval_loader, config, step):
-    """Computes losses on the evaluation dataset (Batch Mode)."""
     wm.eval()
     policy.eval()
     metrics = defaultdict(list)
@@ -202,24 +216,19 @@ def evaluate_offline(wm, policy, eval_loader, config, step):
         for i, raw_batch in enumerate(eval_loader):
             if i >= config.offline_eval_batches: break
             
-            # 1. WM Prep
             data_wm = raw_batch.copy()
             data_wm['image'] = data_wm.pop('image_wm')
             data_wm = wm.preprocess(data_wm)
             
-            # 2. WM Forward
             embed = wm.encoder(data_wm)
             post, prior = wm.dynamics.observe(embed, data_wm['action'], data_wm['is_first'])
             feat = wm.dynamics.get_feat(post)
             
-            # 3. WM Losses
-            # KL
             kl_loss, kl_value, _, _ = wm.dynamics.kl_loss(
                 post, prior, config.kl_free, config.dyn_scale, config.rep_scale
             )
             metrics['eval/kl'].append(kl_value.mean().item())
             
-            # Heads (Recon, Reward)
             for name, head in wm.heads.items():
                 pred = head(feat)
                 if isinstance(pred, dict):
@@ -230,63 +239,46 @@ def evaluate_offline(wm, policy, eval_loader, config, step):
                     loss = -pred.log_prob(data_wm[name])
                     metrics[f'eval/{name}_loss'].append(loss.mean().item())
 
-            # 4. BC Forward (Using BC crop)
             img_bc = torch.tensor(raw_batch['image_bc'], device=config.device, dtype=torch.float32) / 255.0
             if config.image_standardize and 'image_mean' in data_wm:
                  img_bc = (img_bc - data_wm['image_mean']) / data_wm['image_std']
             
-            # Re-encode for BC to be strictly correct with crop
             data_bc = data_wm.copy()
             data_bc['image'] = img_bc
             embed_bc = wm.encoder(data_bc)
             post_bc, _ = wm.dynamics.observe(embed_bc, data_bc['action'], data_bc['is_first'])
             feat_bc = wm.dynamics.get_feat(post_bc)
             
-            # BC Loss
+            # --- BC Loss (MSE) ---
             target = torch.tensor(raw_batch['policy_target'], device=config.device, dtype=torch.float32)
-            pred_dist = policy(feat_bc)
-            bc_loss = -pred_dist.log_prob(target).mean()
+            pred_action = policy(feat_bc)
+            bc_loss = F.mse_loss(pred_action, target)
             metrics['eval/bc_loss'].append(bc_loss.item())
 
-    # Aggregate
     agg_metrics = {k: np.mean(v) for k, v in metrics.items()}
     return agg_metrics
 
 def evaluate_online(wm, policy, config, step, run):
-    """Rolls out policy in parallel Robosuite environments (Closed Loop with RSSM)."""
     wm.eval()
     policy.eval()
     
-    # --- 1. Construct Environment Config ---
-    # We create a specific namespace for the environment to ensure all 
-    # required keys exist, matching the format expected by _make_robomimic_env.
-    
-    # Determine image size (handle 0/0 crop case)
     crop_h = config.image_crop_height
     crop_w = config.image_crop_width
     image_hw = (crop_h, crop_w) if (crop_h > 0 and crop_w > 0) else (84, 84)
 
-    # Build the Env Config object (Duck-typing for EvalConfig)
     env_config = SimpleNamespace(
-        # Task & Robot
-        robosuite_task=getattr(config, "robosuite_task", "PickPlaceCan"),
+        robosuite_task=getattr(config, "robosuite_task", "Lift"),
         robosuite_robots=getattr(config, "robosuite_robots", ["Panda"]),
         robosuite_controller=getattr(config, "robosuite_controller", "OSC_POSE"),
-        
-        # Simulation settings
         robosuite_reward_shaping=getattr(config, "robosuite_reward_shaping", False),
         robosuite_control_freq=getattr(config, "robosuite_control_freq", 20),
         max_env_steps=getattr(config, "max_env_steps", 500),
         ignore_done=getattr(config, "ignore_done", False),
-        
-        # Rendering & Observation
         has_renderer=getattr(config, "has_renderer", False),
         has_offscreen_renderer=getattr(config, "has_offscreen_renderer", True),
         use_camera_obs=getattr(config, "use_camera_obs", True),
         camera_depths=getattr(config, "camera_depths", False),
-        camera_obs_keys=tuple(config.camera_obs_keys), # Expected as tuple/list
-        
-        # Seeding
+        camera_obs_keys=tuple(config.camera_obs_keys),
         seed=config.seed
     )
 
@@ -294,7 +286,6 @@ def evaluate_online(wm, policy, config, step, run):
     total_episodes = config.eval_episodes
     video_dir = pathlib.Path(config.logdir) / "eval_videos" / f"step_{step}"
     
-    # --- 2. Worker Class ---
     class _EnvWorker:
         def __init__(self, env_cfg, img_size):
             self._cfg = env_cfg
@@ -303,7 +294,6 @@ def evaluate_online(wm, policy, config, step, run):
 
         def _ensure_env(self):
             if self._env is None:
-                # This function expects the config object we just built
                 self._env = _make_robomimic_env(self._cfg, self._image_size)
 
         def reset(self, seed=None):
@@ -319,24 +309,18 @@ def evaluate_online(wm, policy, config, step, run):
         def step(self, action):
             self._ensure_env()
             obs, reward, done, info = self._env.step(action)
-            # Use helper to check success safely
             return obs, reward, done, info, _extract_success(info, self._env)
 
         def close(self):
             if self._env: self._env.close()
 
-    # --- 3. Initialize Parallel Environments ---
     print(f"Starting Online Eval: {env_config.robosuite_task} ({total_episodes} eps) on {num_envs} envs...")
     envs = []
     for i in range(num_envs):
-        # Pass the constructed env_config, not the huge global config
         worker = _EnvWorker(env_config, image_hw)
         envs.append(Parallel(worker, "process"))
 
-    # --- 4. State Tracking & Batch Init ---
     obs_batch = [None] * num_envs
-    
-    # RSSM State (Batch, State_Dim) - None means reset
     rssm_state = None 
     prev_action = torch.zeros((num_envs, config.num_actions), device=config.device)
     is_first = torch.ones((num_envs, 1), device=config.device)
@@ -349,7 +333,6 @@ def evaluate_online(wm, policy, config, step, run):
     final_rewards = []
     final_successes = []
     
-    # Video Recorders
     recorders = [
         EpisodeVideoRecorder(
             directory=video_dir,
@@ -360,13 +343,12 @@ def evaluate_online(wm, policy, config, step, run):
         ) for _ in range(num_envs)
     ]
 
-    # --- 5. Initial Reset ---
     global_ep_idx = 0
     env_episode_ids = [0] * num_envs
 
     for i in range(num_envs):
         if global_ep_idx < total_episodes:
-            obs_batch[i] = envs[i].reset()() # Blocking reset
+            obs_batch[i] = envs[i].reset()() 
             recorders[i].start_episode(global_ep_idx)
             recorders[i].add_frame(obs_batch[i])
             env_episode_ids[i] = global_ep_idx
@@ -374,15 +356,11 @@ def evaluate_online(wm, policy, config, step, run):
         else:
             obs_batch[i] = None
 
-    # --- 6. Rollout Loop ---
     while completed_episodes < total_episodes:
         active_indices = [i for i, obs in enumerate(obs_batch) if obs is not None]
         if not active_indices: break
 
-        # Prepare Batch (Padding idle envs with dummy data to keep batch size constant for RSSM)
         full_batch_lists = defaultdict(list)
-        
-        # Use first active obs as template for shapes
         template_idx = active_indices[0]
         template_processed = _prepare_obs(
             obs_batch[template_idx],
@@ -396,11 +374,9 @@ def evaluate_online(wm, policy, config, step, run):
 
         for i in range(num_envs):
             if obs_batch[i] is None:
-                # Idle: append zeros matching template
                 for k, v in template_processed.items():
                     full_batch_lists[k].append(np.zeros_like(v))
             else:
-                # Active: process and append
                 processed = _prepare_obs(
                     obs_batch[i],
                     cnn_keys_order=config.bc_cnn_keys_order,
@@ -413,10 +389,9 @@ def evaluate_online(wm, policy, config, step, run):
                 for k, v in processed.items():
                     full_batch_lists[k].append(v)
 
-        # To Tensor
         data = {}
         for k, v_list in full_batch_lists.items():
-            arr = np.stack(v_list) # (Batch, ...)
+            arr = np.stack(v_list)
             tensor = torch.as_tensor(arr, device=config.device).float()
             if k == 'image':
                 tensor = tensor / 255.0
@@ -424,26 +399,20 @@ def evaluate_online(wm, policy, config, step, run):
                     tensor = (tensor - wm._dataset_image_mean) / wm._dataset_image_std
             data[k] = tensor
 
-        # Forward Model
         with torch.no_grad():
             embed = wm.encoder(data) 
             post, _ = wm.dynamics.obs_step(rssm_state, prev_action, embed, is_first)
             rssm_state = post
-            
             feat = wm.dynamics.get_feat(post)
-            pred_dist = policy(feat)
-            if config.actor['dist'] == 'onehot':
-                action_tensor = pred_dist.mode()
-            else:
-                action_tensor = pred_dist.mode()
+            
+            # --- Policy Prediction (Raw) ---
+            action_tensor = policy(feat)
+            if config.clip_actions:
+                action_tensor = torch.clamp(action_tensor, -1.0, 1.0)
             
             prev_action = action_tensor
 
-        # Step Environment
         action_np = action_tensor.cpu().numpy()
-        if config.clip_actions:
-            action_np = np.clip(action_np, -1.0, 1.0)
-
         promises = []
         for i in range(num_envs):
             if obs_batch[i] is not None:
@@ -469,23 +438,19 @@ def evaluate_online(wm, policy, config, step, run):
                 final_successes.append(episode_success[i])
                 
                 vid_path = recorders[i].finish_episode()
-                # Log first few videos to wandb
                 if vid_path and env_episode_ids[i] < 3:
                     if run: 
                         run.log({f"eval_online/video_{env_episode_ids[i]}": wandb.Video(str(vid_path), fps=20, format="mp4")}, commit=False)
                 
-                # Reset
                 if global_ep_idx < total_episodes:
                     obs_batch[i] = envs[i].reset()()
                     recorders[i].start_episode(global_ep_idx)
                     recorders[i].add_frame(obs_batch[i])
-                    
                     episode_rewards[i] = 0.0
                     episode_steps[i] = 0
                     episode_success[i] = False
                     env_episode_ids[i] = global_ep_idx
                     global_ep_idx += 1
-                    
                     is_first[i] = 1.0
                     prev_action[i] = 0.0
                 else:
@@ -504,12 +469,12 @@ def evaluate_online(wm, policy, config, step, run):
         "eval_online/mean_return": np.mean(final_rewards) if final_rewards else 0.0
     }
     return metrics
+
 # --- Main ---
 
 def joint_train(config):
     tools.set_seed_everywhere(config.seed)
     
-    # 1. WandB & Dirs
     logdir = pathlib.Path(config.logdir).expanduser()
     logdir.mkdir(parents=True, exist_ok=True)
     
@@ -522,7 +487,6 @@ def joint_train(config):
     )
     print(f"Logging to {logdir}")
 
-    # 2. Data
     train_dataset = JointDataset(config.offline_traindir, config, mode='train')
     train_loader = DataLoader(
         train_dataset, batch_size=config.batch_size, shuffle=True, 
@@ -536,14 +500,11 @@ def joint_train(config):
         num_workers=0, collate_fn=collate_episodes, pin_memory=True
     )
     
-    train_iter = iter(train_loader) 
-    # Helper to cycle infinite
     def cycle(loader):
         while True:
             for b in loader: yield b
     train_iter = cycle(train_loader)
 
-    # 3. Model Init
     print("Inferring Observation Space...")
     sample_ep = train_dataset.episode_list[0]
     obs_space, act_space = _define_spaces(sample_ep, config)
@@ -551,17 +512,16 @@ def joint_train(config):
     
     wm = WorldModel(obs_space, act_space, 0, config).to(config.device)
     
-    # Policy (MLP on RSSM Features)
+    # --- Initialize ActionMLP (Raw Policy) ---
     if config.dyn_discrete:
         feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
     else:
         feat_size = config.dyn_stoch + config.dyn_deter
         
-    policy = MLP(
+    policy = ActionMLP(
         inp_dim=feat_size,
         shape=(config.num_actions,),
-        layers=4, units=1024, act=config.act, norm=config.norm,
-        dist='mse', outscale=1.0, device=config.device, name='Policy'
+        layers=4, units=1024, act=config.act, norm=config.norm
     ).to(config.device)
 
     optimizer = torch.optim.Adam(
@@ -569,7 +529,6 @@ def joint_train(config):
         lr=config.model_lr, weight_decay=config.weight_decay
     )
 
-    # 4. Training Loop
     print("Starting Joint Training...")
     step = 0
     
@@ -577,20 +536,17 @@ def joint_train(config):
         wm.train()
         policy.train()
         
-        # --- Data Prep ---
         raw_batch = next(train_iter)
         
-        # WM Data
+        # 1. WM Branch
         data_wm = raw_batch.copy()
         data_wm['image'] = data_wm.pop('image_wm')
         data_wm = wm.preprocess(data_wm)
         
-        # BC Data
         img_bc = torch.tensor(raw_batch['image_bc'], device=config.device, dtype=torch.float32) / 255.0
         if config.image_standardize and 'image_mean' in data_wm:
              img_bc = (img_bc - data_wm['image_mean']) / data_wm['image_std']
         
-        # --- 1. WM Branch ---
         embed_wm = wm.encoder(data_wm) 
         post_wm, prior_wm = wm.dynamics.observe(embed_wm, data_wm['action'], data_wm['is_first'])
         kl_loss, kl_val, _, _ = wm.dynamics.kl_loss(
@@ -608,18 +564,18 @@ def joint_train(config):
         
         wm_loss = recon_losses.mean() + kl_loss
         
-        # --- 2. BC Branch ---
+        # 2. BC Branch
         data_bc = data_wm.copy()
         data_bc['image'] = img_bc
         embed_bc = wm.encoder(data_bc)
         post_bc, _ = wm.dynamics.observe(embed_bc, data_bc['action'], data_bc['is_first'])
         feat_bc = wm.dynamics.get_feat(post_bc)
         
-        pred_dist = policy(feat_bc)
+        # --- BC Loss (Raw MSE) ---
         target = torch.tensor(raw_batch['policy_target'], device=config.device, dtype=torch.float32)
-        bc_loss = -pred_dist.log_prob(target).mean()
+        pred_action = policy(feat_bc)
+        bc_loss = F.mse_loss(pred_action, target)
         
-        # Optimization
         total_loss = (config.wm_loss_scale * wm_loss) + (config.bc_loss_scale * bc_loss)
         
         optimizer.zero_grad()
@@ -629,7 +585,6 @@ def joint_train(config):
         
         step += 1
         
-        # --- Logging ---
         if step % config.log_every == 0:
             wandb.log({
                 "train/total_loss": total_loss.item(),
@@ -638,19 +593,12 @@ def joint_train(config):
                 "train/kl": kl_val.mean().item()
             }, step=step)
             
-        # --- Evaluation ---
         if step % config.eval_every == 0:
             print(f"Evaluating at step {step}...")
-            
-            # Offline
             off_metrics = evaluate_offline(wm, policy, eval_loader, config, step)
             wandb.log(off_metrics, step=step)
-            
-            # Online
             on_metrics = evaluate_online(wm, policy, config, step, run)
             wandb.log(on_metrics, step=step)
-            
-            # Checkpoint
             torch.save({
                 'wm': wm.state_dict(),
                 'policy': policy.state_dict()
@@ -677,7 +625,6 @@ if __name__ == "__main__":
     for name in name_list:
         recursive_update(defaults, configs[name])
         
-    # Inject Defaults
     defaults.setdefault('num_workers', 0)
     defaults.setdefault('bc_loss_scale', 1.0)
     defaults.setdefault('wm_loss_scale', 1.0)
@@ -687,6 +634,21 @@ if __name__ == "__main__":
     defaults.setdefault('image_crop_width', 0)
     defaults.setdefault('wm_random_crop', True)
     defaults.setdefault('bc_random_crop', True)
+    
+    defaults.setdefault('eval_episodes', 20)
+    defaults.setdefault('num_envs', 1)
+    defaults.setdefault('max_env_steps', 500)
+    defaults.setdefault('offline_eval_batches', 10)
+    
+    defaults.setdefault('bc_cnn_keys_order', ['image'])
+    defaults.setdefault('bc_mlp_keys_order', [
+        "robot0_joint_pos", "robot0_joint_vel", "robot0_gripper_qpos", "robot0_gripper_qvel",
+        "aux_robot0_joint_pos_sin", "aux_robot0_joint_pos_cos"
+    ])
+    defaults.setdefault('camera_obs_keys', ['agentview_image', 'robot0_eye_in_hand_image'])
+    defaults.setdefault('flip_camera_keys', ['agentview_image', 'robot0_eye_in_hand_image'])
+    
+    # Robosuite / Env Defaults
     defaults.setdefault('robosuite_task', 'Lift')
     defaults.setdefault('robosuite_robots', ['Panda'])
     defaults.setdefault('robosuite_controller', 'OSC_POSE')
@@ -697,22 +659,7 @@ if __name__ == "__main__":
     defaults.setdefault('use_camera_obs', True)
     defaults.setdefault('camera_depths', False)
     defaults.setdefault('ignore_done', False)
-    defaults.setdefault('clip_actions', False) # Important for BC stability
-    
-    # Eval Loop Defaults
-    defaults.setdefault('num_envs', 1)
-    defaults.setdefault('eval_episodes', 5)
-    defaults.setdefault('max_env_steps', 500)
-    defaults.setdefault('offline_eval_batches', 10)
-    
-    # Fill in required list keys if missing (for _prepare_obs)
-    defaults.setdefault('bc_cnn_keys_order', ['image'])
-    defaults.setdefault('bc_mlp_keys_order', [
-        "robot0_joint_pos", "robot0_joint_vel", "robot0_gripper_qpos", "robot0_gripper_qvel",
-        "aux_robot0_joint_pos_sin", "aux_robot0_joint_pos_cos"
-    ])
-    defaults.setdefault('camera_obs_keys', ['agentview_image', 'robot0_eye_in_hand_image'])
-    defaults.setdefault('flip_camera_keys', ['agentview_image', 'robot0_eye_in_hand_image'])
+    defaults.setdefault('clip_actions', False)
 
     parser = argparse.ArgumentParser()
     for key, value in sorted(defaults.items(), key=lambda x: x[0]):
