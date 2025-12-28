@@ -66,7 +66,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from collections import OrderedDict
-from torch.util.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
 
 os.environ.setdefault("MUJOCO_GL", "osmesa")
 

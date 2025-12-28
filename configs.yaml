@@ -371,3 +371,44 @@ can_env_eval:
         input_ref_frame: world
         gripper:
           type: GRIP
+
+joint_train:
+  # --- Training Loop ---
+  steps: 500000             # Total training steps
+  model_lr: 3e-4            # Learning rate for joint optimizer
+  batch_size: 16            # Batch size
+  batch_length: 64          # Sequence length
+  grad_clip: 100.0          # Gradient clipping norm
+  
+  # --- Loss Scales ---
+  wm_loss_scale: 1.0        # Scale for World Model loss (Recon + KL + Reward)
+  bc_loss_scale: 1.0        # Scale for Behavior Cloning loss
+  
+  # --- Data Augmentation (Dual Cropping) ---
+  image_crop_height: 78     # Target crop height (from 84x84 source)
+  image_crop_width: 78      # Target crop width
+  wm_random_crop: True      # Random crop for World Model (Reconstruction)
+  bc_random_crop: True      # Random crop for Policy (BC) - Independent of WM crop
+  
+  # --- Evaluation Settings ---
+  eval_every: 10000         # Frequency of evaluation (steps)
+  offline_eval_batches: 10  # Number of batches to calculate validation loss on
+  eval_episodes: 5          # Number of online episodes to run in Robosuite
+  max_env_steps: 500        # Max steps per online episode
+  
+  # --- Observation Handling (Robosuite Defaults) ---
+  # These ensure the environment matches the encoder input structure
+  camera_obs_keys: [agentview_image, robot0_eye_in_hand_image]
+  flip_camera_keys: [agentview_image, robot0_eye_in_hand_image]
+  bc_cnn_keys_order: [image]
+  bc_mlp_keys_order: 
+    - robot0_joint_pos
+    - robot0_joint_vel
+    - robot0_gripper_qpos
+    - robot0_gripper_qvel
+    - aux_robot0_joint_pos_sin
+    - aux_robot0_joint_pos_cos
+    
+  # --- System ---
+  num_workers: 0            # Keep at 0 for efficient in-memory dataset usage
+  video_pred_log: True      # Log reconstruction and rollout videos to WandB
