@@ -257,24 +257,53 @@ def evaluate_online(wm, policy, config, step, run):
     wm.eval()
     policy.eval()
     
-    # 1. Configuration & Setup
-    # Determine image size from config (handle crop vs no-crop)
-    image_hw = (config.image_crop_height, config.image_crop_width)
-    if image_hw[0] == 0: image_hw = (84, 84)
+    # --- 1. Construct Environment Config ---
+    # We create a specific namespace for the environment to ensure all 
+    # required keys exist, matching the format expected by _make_robomimic_env.
+    
+    # Determine image size (handle 0/0 crop case)
+    crop_h = config.image_crop_height
+    crop_w = config.image_crop_width
+    image_hw = (crop_h, crop_w) if (crop_h > 0 and crop_w > 0) else (84, 84)
 
-    num_envs = config.num_envs if hasattr(config, 'num_envs') else 1
+    # Build the Env Config object (Duck-typing for EvalConfig)
+    env_config = SimpleNamespace(
+        # Task & Robot
+        robosuite_task=getattr(config, "robosuite_task", "PickPlaceCan"),
+        robosuite_robots=getattr(config, "robosuite_robots", ["Panda"]),
+        robosuite_controller=getattr(config, "robosuite_controller", "OSC_POSE"),
+        
+        # Simulation settings
+        robosuite_reward_shaping=getattr(config, "robosuite_reward_shaping", False),
+        robosuite_control_freq=getattr(config, "robosuite_control_freq", 20),
+        max_env_steps=getattr(config, "max_env_steps", 500),
+        ignore_done=getattr(config, "ignore_done", False),
+        
+        # Rendering & Observation
+        has_renderer=getattr(config, "has_renderer", False),
+        has_offscreen_renderer=getattr(config, "has_offscreen_renderer", True),
+        use_camera_obs=getattr(config, "use_camera_obs", True),
+        camera_depths=getattr(config, "camera_depths", False),
+        camera_obs_keys=tuple(config.camera_obs_keys), # Expected as tuple/list
+        
+        # Seeding
+        seed=config.seed
+    )
+
+    num_envs = getattr(config, 'num_envs', 1)
     total_episodes = config.eval_episodes
     video_dir = pathlib.Path(config.logdir) / "eval_videos" / f"step_{step}"
     
-    # Helper class to create envs in subprocesses (from BC_Sweep.py)
+    # --- 2. Worker Class ---
     class _EnvWorker:
-        def __init__(self, cfg, image_size):
-            self._cfg = cfg
-            self._image_size = image_size
+        def __init__(self, env_cfg, img_size):
+            self._cfg = env_cfg
+            self._image_size = img_size
             self._env = None
 
         def _ensure_env(self):
             if self._env is None:
+                # This function expects the config object we just built
                 self._env = _make_robomimic_env(self._cfg, self._image_size)
 
         def reset(self, seed=None):
@@ -290,37 +319,33 @@ def evaluate_online(wm, policy, config, step, run):
         def step(self, action):
             self._ensure_env()
             obs, reward, done, info = self._env.step(action)
+            # Use helper to check success safely
             return obs, reward, done, info, _extract_success(info, self._env)
 
         def close(self):
             if self._env: self._env.close()
 
-    # 2. Initialize Parallel Environments
-    print(f"Starting Online Eval ({total_episodes} episodes) with {num_envs} parallel envs...")
+    # --- 3. Initialize Parallel Environments ---
+    print(f"Starting Online Eval: {env_config.robosuite_task} ({total_episodes} eps) on {num_envs} envs...")
     envs = []
     for i in range(num_envs):
-        # We pass a copy of config to avoid pickling issues or shared state modification
-        worker = _EnvWorker(config, image_hw)
+        # Pass the constructed env_config, not the huge global config
+        worker = _EnvWorker(env_config, image_hw)
         envs.append(Parallel(worker, "process"))
 
-    # 3. State Tracking
-    # We maintain persistent state for the batch of environments
+    # --- 4. State Tracking & Batch Init ---
     obs_batch = [None] * num_envs
     
-    # RSSM State (Batch, State_Dim) - initialized to None (reset)
+    # RSSM State (Batch, State_Dim) - None means reset
     rssm_state = None 
-    # Previous Action (Batch, Act_Dim)
     prev_action = torch.zeros((num_envs, config.num_actions), device=config.device)
-    # Is First Flag (Batch, 1)
     is_first = torch.ones((num_envs, 1), device=config.device)
     
-    # Episode tracking
     episode_rewards = [0.0] * num_envs
     episode_steps = [0] * num_envs
     episode_success = [False] * num_envs
     completed_episodes = 0
     
-    # Results
     final_rewards = []
     final_successes = []
     
@@ -335,11 +360,9 @@ def evaluate_online(wm, policy, config, step, run):
         ) for _ in range(num_envs)
     ]
 
-    # 4. Initial Reset
-    # We assign a global episode ID to each slot to track total progress
-    # global_ep_idx tracks the next available episode ID to assign
+    # --- 5. Initial Reset ---
     global_ep_idx = 0
-    env_episode_ids = [0] * num_envs # ID of the episode currently running in env i
+    env_episode_ids = [0] * num_envs
 
     for i in range(num_envs):
         if global_ep_idx < total_episodes:
@@ -349,78 +372,35 @@ def evaluate_online(wm, policy, config, step, run):
             env_episode_ids[i] = global_ep_idx
             global_ep_idx += 1
         else:
-            # If we have more envs than episodes (unlikely but possible), idle them
             obs_batch[i] = None
 
-    # 5. Rollout Loop
+    # --- 6. Rollout Loop ---
     while completed_episodes < total_episodes:
-        # A. Filter active environments
         active_indices = [i for i, obs in enumerate(obs_batch) if obs is not None]
         if not active_indices: break
 
-        # B. Prepare Batch Data
-        # We need to construct a batch containing ONLY the active indices to pass to the model,
-        # OR we pass the full batch and mask operations. 
-        # Standard Dreamer approach: Pass full batch, but only update active slots.
-        # However, since 'rssm_state' is a complex dict/tuple, slicing it is tricky without helpers.
-        # We will assume we run all 'num_envs' and just ignore outputs for idle ones, 
-        # OR we reconstruct the batch every step. 
-        # Reconstructing is safer for 'rssm_state' correctness if indices shift.
-        # BUT 'rssm_state' relies on temporal continuity. Index 'i' must always correspond to env 'i'.
-        # So we MUST run the full batch size 'num_envs' through the model every step, 
-        # even if some envs are idle (we can just feed zeros/dummy data for idle ones).
-        
-        # 1. Process Observations
-        batch_obs_dict = defaultdict(list)
-        
-        for i in range(num_envs):
-            if obs_batch[i] is None:
-                # Dummy observation for idle envs (zeros)
-                # We need valid shapes. Let's use the shape from a valid one or config
-                # Fallback shapes from config if all are None (loop would break anyway)
-                # Just reuse the last valid obs or zeros.
-                # Simplest: Just use zeros matching expected shapes
-                pass # Handled below by _obs_to_torch padding logic if we wanted, 
-                     # but actually let's just make sure we don't crash.
-            else:
-                # Prepare single obs
-                processed = _prepare_obs(
-                    obs_batch[i],
-                    cnn_keys_order=config.bc_cnn_keys_order,
-                    mlp_keys_order=config.bc_mlp_keys_order,
-                    camera_keys=config.camera_obs_keys,
-                    flip_keys=config.flip_camera_keys,
-                    crop_height=config.image_crop_height if config.image_crop_height > 0 else None,
-                    crop_width=config.image_crop_width if config.image_crop_width > 0 else None
-                )
-                for k, v in processed.items():
-                    batch_obs_dict[k].append(v)
-
-        # If an env is idle, we must still provide data to maintain batch size for RSSM
-        # We duplicate the first valid obs for idle slots to keep shapes valid
-        first_valid_idx = active_indices[0]
-        for k in list(batch_obs_dict.keys()): # get keys from the valid entries
-            # We have len(active_indices) items. We need num_envs items.
-            # This logic is tricky. Let's build the list fully initialized.
-            pass
-        
-        # Better approach: Build list of size num_envs directly
+        # Prepare Batch (Padding idle envs with dummy data to keep batch size constant for RSSM)
         full_batch_lists = defaultdict(list)
-        valid_template = _prepare_obs(obs_batch[first_valid_idx], **{
-            'cnn_keys_order': config.bc_cnn_keys_order, 
-            'mlp_keys_order': config.bc_mlp_keys_order,
-            'camera_keys': config.camera_obs_keys,
-            'flip_keys': config.flip_camera_keys,
-            'crop_height': config.image_crop_height if config.image_crop_height > 0 else None,
-            'crop_width': config.image_crop_width if config.image_crop_width > 0 else None
-        }) # Template for shapes
+        
+        # Use first active obs as template for shapes
+        template_idx = active_indices[0]
+        template_processed = _prepare_obs(
+            obs_batch[template_idx],
+            cnn_keys_order=config.bc_cnn_keys_order,
+            mlp_keys_order=config.bc_mlp_keys_order,
+            camera_keys=config.camera_obs_keys,
+            flip_keys=config.flip_camera_keys,
+            crop_height=config.image_crop_height if config.image_crop_height > 0 else None,
+            crop_width=config.image_crop_width if config.image_crop_width > 0 else None
+        )
 
         for i in range(num_envs):
             if obs_batch[i] is None:
-                # Use zero arrays matching template shapes
-                for k, v in valid_template.items():
+                # Idle: append zeros matching template
+                for k, v in template_processed.items():
                     full_batch_lists[k].append(np.zeros_like(v))
             else:
+                # Active: process and append
                 processed = _prepare_obs(
                     obs_batch[i],
                     cnn_keys_order=config.bc_cnn_keys_order,
@@ -433,11 +413,10 @@ def evaluate_online(wm, policy, config, step, run):
                 for k, v in processed.items():
                     full_batch_lists[k].append(v)
 
-        # Convert to Tensor Batch
+        # To Tensor
         data = {}
         for k, v_list in full_batch_lists.items():
-            # stack -> (Batch, ...)
-            arr = np.stack(v_list)
+            arr = np.stack(v_list) # (Batch, ...)
             tensor = torch.as_tensor(arr, device=config.device).float()
             if k == 'image':
                 tensor = tensor / 255.0
@@ -445,20 +424,12 @@ def evaluate_online(wm, policy, config, step, run):
                     tensor = (tensor - wm._dataset_image_mean) / wm._dataset_image_std
             data[k] = tensor
 
-        # C. Forward Model
+        # Forward Model
         with torch.no_grad():
-            # Encoder
-            embed = wm.encoder(data) # (B, E)
+            embed = wm.encoder(data) 
+            post, _ = wm.dynamics.obs_step(rssm_state, prev_action, embed, is_first)
+            rssm_state = post
             
-            # RSSM Step
-            # obs_step handles the temporal step for the batch
-            # prev_action, is_first must match batch size
-            post, _ = wm.dynamics.obs_step(
-                rssm_state, prev_action, embed, is_first
-            )
-            rssm_state = post # Update state for next step
-            
-            # Policy
             feat = wm.dynamics.get_feat(post)
             pred_dist = policy(feat)
             if config.actor['dist'] == 'onehot':
@@ -466,15 +437,13 @@ def evaluate_online(wm, policy, config, step, run):
             else:
                 action_tensor = pred_dist.mode()
             
-            # Update prev_action for next step
             prev_action = action_tensor
 
-        # D. Step Environment
+        # Step Environment
         action_np = action_tensor.cpu().numpy()
         if config.clip_actions:
             action_np = np.clip(action_np, -1.0, 1.0)
 
-        # Dispatch async steps
         promises = []
         for i in range(num_envs):
             if obs_batch[i] is not None:
@@ -482,67 +451,54 @@ def evaluate_online(wm, policy, config, step, run):
             else:
                 promises.append(None)
 
-        # Collect results
         for i, promise in enumerate(promises):
             if promise is None: continue
             
             obs, reward, done, info, success = promise()
             
-            # Track
             episode_rewards[i] += reward
             episode_steps[i] += 1
             episode_success[i] = (episode_success[i] or success)
-            
-            # Update recorder
             recorders[i].add_frame(obs)
             
-            # Check Termination
-            env_done = done or (episode_steps[i] >= config.max_env_steps) or success
+            env_done = done or (episode_steps[i] >= env_config.max_env_steps) or success
             
             if env_done:
-                # Episode Finished
                 completed_episodes += 1
                 final_rewards.append(episode_rewards[i])
                 final_successes.append(episode_success[i])
                 
-                # Save video (if first few episodes)
                 vid_path = recorders[i].finish_episode()
-                if vid_path and env_episode_ids[i] == 0:
-                    run.log({"eval_online/video": wandb.Video(str(vid_path), fps=20, format="mp4")}, commit=False)
+                # Log first few videos to wandb
+                if vid_path and env_episode_ids[i] < 3:
+                    if run: 
+                        run.log({f"eval_online/video_{env_episode_ids[i]}": wandb.Video(str(vid_path), fps=20, format="mp4")}, commit=False)
                 
-                # Reset for next episode if available
+                # Reset
                 if global_ep_idx < total_episodes:
                     obs_batch[i] = envs[i].reset()()
                     recorders[i].start_episode(global_ep_idx)
                     recorders[i].add_frame(obs_batch[i])
                     
-                    # Reset Tracking
                     episode_rewards[i] = 0.0
                     episode_steps[i] = 0
                     episode_success[i] = False
                     env_episode_ids[i] = global_ep_idx
                     global_ep_idx += 1
                     
-                    # Reset RSSM logic for this slot
                     is_first[i] = 1.0
                     prev_action[i] = 0.0
-                    # Note: We don't manually reset rssm_state[i] because obs_step handles 
-                    # state reset internally when is_first=1 is passed.
                 else:
-                    # No more episodes, mark idle
                     obs_batch[i] = None
-                    is_first[i] = 0.0 # Don't care
+                    is_first[i] = 0.0 
             else:
-                # Continue Episode
                 obs_batch[i] = obs
-                is_first[i] = 0.0 # Next step is not first
+                is_first[i] = 0.0 
 
-    # Cleanup
     for env in envs:
         try: env.close()
         except: pass
 
-    # Metrics
     metrics = {
         "eval_online/success_rate": np.mean(final_successes) if final_successes else 0.0,
         "eval_online/mean_return": np.mean(final_rewards) if final_rewards else 0.0
