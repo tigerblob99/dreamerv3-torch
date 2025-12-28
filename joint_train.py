@@ -12,6 +12,7 @@ from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
 import gym
 from collections import defaultdict, OrderedDict
+from types import SimpleNamespace
 
 # Ensure the folder containing this script is in python path
 sys.path.append(str(pathlib.Path(__file__).parent))
