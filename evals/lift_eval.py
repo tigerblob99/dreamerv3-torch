@@ -93,7 +93,7 @@ def _load_policy_from_checkpoint(checkpoint_path: pathlib.Path, *, device: str |
         raise RuntimeError(f"No episodes found in offline_traindir={config.offline_traindir} to infer shapes.")
     first_episode = next(iter(dataset.values()))
     obs_space = _build_ordered_obs_space(config, first_episode)
-    _, act_space = _infer_spaces(first_episode)
+    _, act_space = _infer_spaces(first_episode, config)
 
     encoder = _build_encoder(config, obs_space)
     policy = build_action_mlp(
