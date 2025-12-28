@@ -268,7 +268,7 @@ def evaluate_online(wm, policy, config, step, run):
     image_hw = (crop_h, crop_w) if (crop_h > 0 and crop_w > 0) else (84, 84)
 
     env_config = SimpleNamespace(
-        robosuite_task=getattr(config, "robosuite_task", "Lift"),
+        robosuite_task=getattr(config, "robosuite_task", "PickPlaceCan"),
         robosuite_robots=getattr(config, "robosuite_robots", ["Panda"]),
         robosuite_controller=getattr(config, "robosuite_controller", "OSC_POSE"),
         robosuite_reward_shaping=getattr(config, "robosuite_reward_shaping", False),
