@@ -543,28 +543,36 @@ def joint_train(config):
         data_wm['image'] = data_wm.pop('image_wm')
         data_wm = wm.preprocess(data_wm)
         
+        # 2. BC Data Preparation
         img_bc = torch.tensor(raw_batch['image_bc'], device=config.device, dtype=torch.float32) / 255.0
         if config.image_standardize and 'image_mean' in data_wm:
              img_bc = (img_bc - data_wm['image_mean']) / data_wm['image_std']
         
+        # 3. Forward World Model
         embed_wm = wm.encoder(data_wm) 
         post_wm, prior_wm = wm.dynamics.observe(embed_wm, data_wm['action'], data_wm['is_first'])
+        
+        # Calculate KL Loss
         kl_loss, kl_val, _, _ = wm.dynamics.kl_loss(
             post_wm, prior_wm, config.kl_free, config.dyn_scale, config.rep_scale
         )
         
+        # Calculate Reconstruction Losses
         feat_wm = wm.dynamics.get_feat(post_wm)
         recon_losses = 0
         for name, head in wm.heads.items():
             pred = head(feat_wm)
             if isinstance(pred, dict):
-                for k, v in pred.items(): recon_losses -= v.log_prob(data_wm[k])
+                for k, v in pred.items(): 
+                    recon_losses -= v.log_prob(data_wm[k])
             else:
                 recon_losses -= pred.log_prob(data_wm[name])
         
-        wm_loss = recon_losses.mean() + kl_loss
+        # FIX: Ensure we take the mean of the SUM of losses, or mean of both components
+        # (recon_losses + kl_loss) is (B, T). .mean() makes it scalar.
+        wm_loss = (recon_losses + kl_loss).mean()
         
-        # 2. BC Branch
+        # 4. Forward BC Branch
         data_bc = data_wm.copy()
         data_bc['image'] = img_bc
         embed_bc = wm.encoder(data_bc)
@@ -574,12 +582,13 @@ def joint_train(config):
         # --- BC Loss (Raw MSE) ---
         target = torch.tensor(raw_batch['policy_target'], device=config.device, dtype=torch.float32)
         pred_action = policy(feat_bc)
-        bc_loss = F.mse_loss(pred_action, target)
+        bc_loss = F.mse_loss(pred_action, target) # Returns scalar by default
         
+        # 5. Optimization
         total_loss = (config.wm_loss_scale * wm_loss) + (config.bc_loss_scale * bc_loss)
         
         optimizer.zero_grad()
-        total_loss.backward()
+        total_loss.backward() # Now total_loss is a scalar, so this works
         nn.utils.clip_grad_norm_(list(wm.parameters()) + list(policy.parameters()), config.grad_clip)
         optimizer.step()
         
@@ -594,6 +603,7 @@ def joint_train(config):
             }, step=step)
             
         if step % config.eval_every == 0:
+            # ... (Evaluation code remains the same) ...
             print(f"Evaluating at step {step}...")
             off_metrics = evaluate_offline(wm, policy, eval_loader, config, step)
             wandb.log(off_metrics, step=step)
@@ -603,7 +613,6 @@ def joint_train(config):
                 'wm': wm.state_dict(),
                 'policy': policy.state_dict()
             }, logdir / "latest.pt")
-
     print("Training Finished.")
 
 if __name__ == "__main__":
