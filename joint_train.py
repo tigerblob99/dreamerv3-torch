@@ -280,7 +280,8 @@ def evaluate_online(wm, policy, config, step, run):
         use_camera_obs=getattr(config, "use_camera_obs", True),
         camera_depths=getattr(config, "camera_depths", False),
         camera_obs_keys=tuple(config.camera_obs_keys),
-        seed=config.seed
+        seed=config.seed,
+        render=getattr(config, "render", False)
     )
 
     num_envs = getattr(config, 'num_envs', 1)
