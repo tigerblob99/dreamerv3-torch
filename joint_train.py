@@ -687,8 +687,20 @@ if __name__ == "__main__":
     defaults.setdefault('image_crop_width', 0)
     defaults.setdefault('wm_random_crop', True)
     defaults.setdefault('bc_random_crop', True)
+    defaults.setdefault('robosuite_task', 'Lift')
+    defaults.setdefault('robosuite_robots', ['Panda'])
+    defaults.setdefault('robosuite_controller', 'OSC_POSE')
+    defaults.setdefault('robosuite_reward_shaping', False)
+    defaults.setdefault('robosuite_control_freq', 20)
+    defaults.setdefault('has_renderer', False)
+    defaults.setdefault('has_offscreen_renderer', True)
+    defaults.setdefault('use_camera_obs', True)
+    defaults.setdefault('camera_depths', False)
+    defaults.setdefault('ignore_done', False)
+    defaults.setdefault('clip_actions', False) # Important for BC stability
     
-    # Eval Defaults (robosuite)
+    # Eval Loop Defaults
+    defaults.setdefault('num_envs', 1)
     defaults.setdefault('eval_episodes', 5)
     defaults.setdefault('max_env_steps', 500)
     defaults.setdefault('offline_eval_batches', 10)
