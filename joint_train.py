@@ -19,7 +19,6 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 
 import tools
 from models import WorldModel
-# from networks import MLP # Removed to avoid confusion, we define ActionMLP below
 import wandb
 
 # Import Eval helpers
@@ -27,10 +26,10 @@ from parallel import Parallel
 from bc_mlp.BC_MLP_eval import (
     _make_robomimic_env, 
     _prepare_obs, 
-    _obs_to_torch, 
     EpisodeVideoRecorder, 
     _extract_success
 )
+from BC_Sweep import _load_env_block
 
 _EXCLUDE_KEYS = {"action", "reward", "discount", "is_first", "is_terminal", "policy_target"}
 
@@ -523,7 +522,7 @@ def joint_train(config):
     policy = ActionMLP(
         inp_dim=feat_size,
         shape=(config.num_actions,),
-        layers=4, units=1024, act=config.act, norm=config.norm
+        layers=2, units=1024, act=config.act, norm=config.norm
     ).to(config.device)
 
     optimizer = torch.optim.Adam(
@@ -618,12 +617,16 @@ def joint_train(config):
     print("Training Finished.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--configs", nargs="+")
-    args, remaining = parser.parse_known_args()
+    # 1. Pre-parse to get the env_config name
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--configs", nargs="+")
+    pre_parser.add_argument("--env_config", type=str, default=None, help="Name of env config block in configs.yaml")
+    args, remaining = pre_parser.parse_known_args()
     
-    configs = yaml.safe_load((pathlib.Path(sys.argv[0]).parent / "configs.yaml").read_text())
-    
+    # 2. Load Base Configs
+    cfg_path = pathlib.Path(sys.argv[0]).parent / "configs.yaml"
+    configs = yaml.safe_load(cfg_path.read_text())
+
     def recursive_update(base, update):
         for key, value in update.items():
             if isinstance(value, dict) and key in base:
@@ -635,29 +638,30 @@ if __name__ == "__main__":
     defaults = {}
     for name in name_list:
         recursive_update(defaults, configs[name])
+
+    # 3. Load and Merge Env Config using the imported helper
+    complex_defaults = {} 
+    
+    if args.env_config:
+        print(f"Loading env config block: {args.env_config}")
+        # Using the imported helper here
+        env_defaults = _load_env_block(args.env_config)
         
+        if env_defaults:
+            for k, v in env_defaults.items():
+                if isinstance(v, (dict, list)):
+                    # Store complex structures aside to inject later
+                    complex_defaults[k] = v
+                else:
+                    # Merge simple values into defaults so argparse can create flags
+                    defaults[k] = v
+
+    # 4. Standard Defaults setup
     defaults.setdefault('num_workers', 0)
     defaults.setdefault('bc_loss_scale', 1.0)
     defaults.setdefault('wm_loss_scale', 1.0)
     defaults.setdefault('batch_length', 64)
     defaults.setdefault('batch_size', 16)
-    defaults.setdefault('image_crop_height', 0)
-    defaults.setdefault('image_crop_width', 0)
-    defaults.setdefault('wm_random_crop', True)
-    defaults.setdefault('bc_random_crop', True)
-    
-    defaults.setdefault('eval_episodes', 20)
-    defaults.setdefault('num_envs', 1)
-    defaults.setdefault('max_env_steps', 500)
-    defaults.setdefault('offline_eval_batches', 10)
-    
-    defaults.setdefault('bc_cnn_keys_order', ['image'])
-    defaults.setdefault('bc_mlp_keys_order', [
-        "robot0_joint_pos", "robot0_joint_vel", "robot0_gripper_qpos", "robot0_gripper_qvel",
-        "aux_robot0_joint_pos_sin", "aux_robot0_joint_pos_cos"
-    ])
-    defaults.setdefault('camera_obs_keys', ['agentview_image', 'robot0_eye_in_hand_image'])
-    defaults.setdefault('flip_camera_keys', ['agentview_image', 'robot0_eye_in_hand_image'])
     
     # Robosuite / Env Defaults
     defaults.setdefault('robosuite_task', 'Lift')
@@ -672,10 +676,24 @@ if __name__ == "__main__":
     defaults.setdefault('ignore_done', False)
     defaults.setdefault('clip_actions', False)
 
+    # 5. Build Final Parser
     parser = argparse.ArgumentParser()
+    parser.add_argument("--configs", nargs="+")
+    parser.add_argument("--env_config", type=str, default=None)
+
     for key, value in sorted(defaults.items(), key=lambda x: x[0]):
+        # Skip keys that are already in complex_defaults
+        if key in complex_defaults:
+            continue
+            
         arg_type = tools.args_type(value)
         parser.add_argument(f"--{key}", type=arg_type, default=arg_type(value))
     
     config = parser.parse_args(remaining)
+
+    # 6. Inject Complex Defaults (e.g., controller_configs)
+    for k, v in complex_defaults.items():
+        setattr(config, k, v)
+        # print(f"Config: Injected complex key '{k}'")
+
     joint_train(config)

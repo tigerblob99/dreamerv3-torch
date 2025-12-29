@@ -46,8 +46,8 @@ defaults:
     {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
   decoder:
     {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
-  image_standardize: True
-  image_standardize_dataset: True
+  image_standardize: False
+  image_standardize_dataset: False
   image_std_min: 1e-3
   image_crop_height: 0
   image_crop_width: 0
@@ -374,8 +374,10 @@ can_env_eval:
 
 joint_train:
   # --- Training Loop ---
-  steps: 500000             # Total training steps
-  model_lr: 3e-5            # Learning rate for joint optimizer
+  steps: 50000             # Total training steps
+  model_lr: 3e-4            # Learning rate for joint optimizer
+  weight_decay: 1e-5        # Weight decay for joint optimizer
+
   batch_size: 64            # Batch size
   batch_length: 64          # Sequence length
   grad_clip: 100.0          # Gradient clipping norm
@@ -383,16 +385,16 @@ joint_train:
   
   # --- Loss Scales ---
   wm_loss_scale: 0.01        # Scale for World Model loss (Recon + KL + Reward)
-  bc_loss_scale: 100.0        # Scale for Behavior Cloning loss
+  bc_loss_scale: 1000.0        # Scale for Behavior Cloning loss
   
   # --- Data Augmentation (Dual Cropping) ---
   image_crop_height: 84     # Target crop height (from 84x84 source)
   image_crop_width: 84      # Target crop width
   wm_random_crop: False      # Random crop for World Model (Reconstruction)
-  bc_random_crop: True      # Random crop for Policy (BC) - Independent of WM crop
+  bc_random_crop: False      # Random crop for Policy (BC) - Independent of WM crop
   
   # --- Evaluation Settings ---
-  eval_every: 10000         # Frequency of evaluation (steps)
+  eval_every: 1000         # Frequency of evaluation (steps)
   offline_eval_batches: 10  # Number of batches to calculate validation loss on
   eval_episodes: 25          # Number of online episodes to run in Robosuite
   max_env_steps: 500        # Max steps per online episode
