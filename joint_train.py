@@ -29,7 +29,13 @@ from bc_mlp.BC_MLP_eval import (
     EpisodeVideoRecorder, 
     _extract_success
 )
-from bc_mlp.BC_Sweep import _load_env_block
+
+# Import helper from BC_Sweep
+try:
+    from BC_Sweep import _load_env_block
+except ImportError:
+    _load_env_block = None
+    print("Warning: Could not import _load_env_block from BC_Sweep.")
 
 _EXCLUDE_KEYS = {"action", "reward", "discount", "is_first", "is_terminal", "policy_target"}
 
@@ -258,69 +264,48 @@ def evaluate_offline(wm, policy, eval_loader, config, step):
     agg_metrics = {k: np.mean(v) for k, v in metrics.items()}
     return agg_metrics
 
-def evaluate_online(wm, policy, config, step, run):
+# --- GLOBAL WORKER CLASS (Moved outside evaluate_online to support pickling/reuse) ---
+class EnvWorker:
+    def __init__(self, env_cfg, img_size):
+        self._cfg = env_cfg
+        self._image_size = img_size
+        self._env = None
+
+    def _ensure_env(self):
+        if self._env is None:
+            self._env = _make_robomimic_env(self._cfg, self._image_size)
+
+    def reset(self, seed=None):
+        self._ensure_env()
+        if seed is not None:
+            try:
+                return self._env.reset(seed=seed)
+            except TypeError:
+                self._env.seed(seed)
+                return self._env.reset()
+        return self._env.reset()
+
+    def step(self, action):
+        self._ensure_env()
+        obs, reward, done, info = self._env.step(action)
+        return obs, reward, done, info, _extract_success(info, self._env)
+
+    def close(self):
+        if self._env: self._env.close()
+
+def evaluate_online(wm, policy, config, step, run, envs):
+    """
+    Evaluates policy online using persistent environments 'envs'.
+    """
     wm.eval()
     policy.eval()
     
-    crop_h = config.image_crop_height
-    crop_w = config.image_crop_width
-    image_hw = (crop_h, crop_w) if (crop_h > 0 and crop_w > 0) else (84, 84)
-
-    env_config = SimpleNamespace(
-        robosuite_task=getattr(config, "robosuite_task", "PickPlaceCan"),
-        robosuite_robots=getattr(config, "robosuite_robots", ["Panda"]),
-        robosuite_controller=getattr(config, "robosuite_controller", "OSC_POSE"),
-        robosuite_reward_shaping=getattr(config, "robosuite_reward_shaping", False),
-        robosuite_control_freq=getattr(config, "robosuite_control_freq", 20),
-        max_env_steps=getattr(config, "max_env_steps", 500),
-        ignore_done=getattr(config, "ignore_done", False),
-        has_renderer=getattr(config, "has_renderer", False),
-        has_offscreen_renderer=getattr(config, "has_offscreen_renderer", True),
-        use_camera_obs=getattr(config, "use_camera_obs", True),
-        camera_depths=getattr(config, "camera_depths", False),
-        camera_obs_keys=tuple(config.camera_obs_keys),
-        seed=config.seed,
-        render=getattr(config, "render", False)
-    )
-
-    num_envs = getattr(config, 'num_envs', 1)
+    num_envs = len(envs)
     total_episodes = config.eval_episodes
     video_dir = pathlib.Path(config.logdir) / "eval_videos" / f"step_{step}"
     
-    class _EnvWorker:
-        def __init__(self, env_cfg, img_size):
-            self._cfg = env_cfg
-            self._image_size = img_size
-            self._env = None
-
-        def _ensure_env(self):
-            if self._env is None:
-                self._env = _make_robomimic_env(self._cfg, self._image_size)
-
-        def reset(self, seed=None):
-            self._ensure_env()
-            if seed is not None:
-                try:
-                    return self._env.reset(seed=seed)
-                except TypeError:
-                    self._env.seed(seed)
-                    return self._env.reset()
-            return self._env.reset()
-
-        def step(self, action):
-            self._ensure_env()
-            obs, reward, done, info = self._env.step(action)
-            return obs, reward, done, info, _extract_success(info, self._env)
-
-        def close(self):
-            if self._env: self._env.close()
-
-    print(f"Starting Online Eval: {env_config.robosuite_task} ({total_episodes} eps) on {num_envs} envs...")
-    envs = []
-    for i in range(num_envs):
-        worker = _EnvWorker(env_config, image_hw)
-        envs.append(Parallel(worker, "process"))
-
+    # We use the envs passed in, we do NOT create/close them here.
+    
     obs_batch = [None] * num_envs
     rssm_state = None 
     prev_action = torch.zeros((num_envs, config.num_actions), device=config.device)
@@ -346,7 +331,9 @@ def evaluate_online(wm, policy, config, step, run):
 
     global_ep_idx = 0
     env_episode_ids = [0] * num_envs
-
+    
+    # Initial Reset
+    print(f"Starting Online Eval ({total_episodes} episodes)...")
     for i in range(num_envs):
         if global_ep_idx < total_episodes:
             obs_batch[i] = envs[i].reset()() 
@@ -431,7 +418,7 @@ def evaluate_online(wm, policy, config, step, run):
             episode_success[i] = (episode_success[i] or success)
             recorders[i].add_frame(obs)
             
-            env_done = done or (episode_steps[i] >= env_config.max_env_steps) or success
+            env_done = done or (episode_steps[i] >= getattr(config, "max_env_steps", 500)) or success
             
             if env_done:
                 completed_episodes += 1
@@ -460,10 +447,6 @@ def evaluate_online(wm, policy, config, step, run):
             else:
                 obs_batch[i] = obs
                 is_first[i] = 0.0 
-
-    for env in envs:
-        try: env.close()
-        except: pass
 
     metrics = {
         "eval_online/success_rate": np.mean(final_successes) if final_successes else 0.0,
@@ -522,99 +505,144 @@ def joint_train(config):
     policy = ActionMLP(
         inp_dim=feat_size,
         shape=(config.num_actions,),
-        layers=2, units=1024, act=config.act, norm=config.norm
+        layers=4,
+        units=1024, act=config.act, norm=config.norm
     ).to(config.device)
+    
+    # Print Param Count for Sanity Check
+    print(f"--- Parameter Check ---")
+    print(f"Policy Params:      {sum(p.numel() for p in policy.parameters()):,}")
+    print(f"World Model Params: {sum(p.numel() for p in wm.parameters()):,}")
+    print(f"-----------------------")
 
     optimizer = torch.optim.Adam(
         list(wm.parameters()) + list(policy.parameters()), 
         lr=config.model_lr, weight_decay=config.weight_decay
     )
 
-    print("Starting Joint Training...")
-    step = 0
-    
-    for _ in range(int(config.steps)):
-        wm.train()
-        policy.train()
+    # --- SETUP EVAL ENVS ONCE ---
+    print(f"Initializing {config.num_envs} persistent Eval Envs...")
+    crop_h = config.image_crop_height
+    crop_w = config.image_crop_width
+    image_hw = (crop_h, crop_w) if (crop_h > 0 and crop_w > 0) else (84, 84)
+
+    env_config = SimpleNamespace(
+        robosuite_task=getattr(config, "robosuite_task", "PickPlaceCan"),
+        robosuite_robots=getattr(config, "robosuite_robots", ["Panda"]),
+        robosuite_controller=getattr(config, "robosuite_controller", "OSC_POSE"),
+        robosuite_reward_shaping=getattr(config, "robosuite_reward_shaping", False),
+        robosuite_control_freq=getattr(config, "robosuite_control_freq", 20),
+        max_env_steps=getattr(config, "max_env_steps", 500),
+        ignore_done=getattr(config, "ignore_done", False),
+        has_renderer=getattr(config, "has_renderer", False),
+        has_offscreen_renderer=getattr(config, "has_offscreen_renderer", True),
+        use_camera_obs=getattr(config, "use_camera_obs", True),
+        camera_depths=getattr(config, "camera_depths", False),
+        camera_obs_keys=tuple(config.camera_obs_keys),
+        seed=config.seed,
+        render=getattr(config, "render", False)
+    )
+    if hasattr(config, "controller_configs"):
+        env_config.controller_configs = config.controller_configs
+
+    eval_envs = []
+    try:
+        # Create envs once
+        for _ in range(config.num_envs):
+            worker = EnvWorker(env_config, image_hw)
+            eval_envs.append(Parallel(worker, "process"))
+
+        print("Starting Joint Training...")
+        step = 0
         
-        raw_batch = next(train_iter)
-        
-        # 1. WM Branch
-        data_wm = raw_batch.copy()
-        data_wm['image'] = data_wm.pop('image_wm')
-        data_wm = wm.preprocess(data_wm)
-        
-        # 2. BC Data Preparation
-        img_bc = torch.tensor(raw_batch['image_bc'], device=config.device, dtype=torch.float32) / 255.0
-        if config.image_standardize and 'image_mean' in data_wm:
-             img_bc = (img_bc - data_wm['image_mean']) / data_wm['image_std']
-        
-        # 3. Forward World Model
-        embed_wm = wm.encoder(data_wm) 
-        post_wm, prior_wm = wm.dynamics.observe(embed_wm, data_wm['action'], data_wm['is_first'])
-        
-        # Calculate KL Loss
-        kl_loss, kl_val, _, _ = wm.dynamics.kl_loss(
-            post_wm, prior_wm, config.kl_free, config.dyn_scale, config.rep_scale
-        )
-        
-        # Calculate Reconstruction Losses
-        feat_wm = wm.dynamics.get_feat(post_wm)
-        recon_losses = 0
-        for name, head in wm.heads.items():
-            pred = head(feat_wm)
-            if isinstance(pred, dict):
-                for k, v in pred.items(): 
-                    recon_losses -= v.log_prob(data_wm[k])
-            else:
-                recon_losses -= pred.log_prob(data_wm[name])
-        
-        # FIX: Ensure we take the mean of the SUM of losses, or mean of both components
-        # (recon_losses + kl_loss) is (B, T). .mean() makes it scalar.
-        wm_loss = (recon_losses + kl_loss).mean()
-        
-        # 4. Forward BC Branch
-        data_bc = data_wm.copy()
-        data_bc['image'] = img_bc
-        embed_bc = wm.encoder(data_bc)
-        post_bc, _ = wm.dynamics.observe(embed_bc, data_bc['action'], data_bc['is_first'])
-        feat_bc = wm.dynamics.get_feat(post_bc)
-        
-        # --- BC Loss (Raw MSE) ---
-        target = torch.tensor(raw_batch['policy_target'], device=config.device, dtype=torch.float32)
-        pred_action = policy(feat_bc)
-        bc_loss = F.mse_loss(pred_action, target) # Returns scalar by default
-        
-        # 5. Optimization
-        total_loss = (config.wm_loss_scale * wm_loss) + (config.bc_loss_scale * bc_loss)
-        
-        optimizer.zero_grad()
-        total_loss.backward() # Now total_loss is a scalar, so this works
-        nn.utils.clip_grad_norm_(list(wm.parameters()) + list(policy.parameters()), config.grad_clip)
-        optimizer.step()
-        
-        step += 1
-        
-        if step % config.log_every == 0:
-            wandb.log({
-                "train/total_loss": total_loss.item(),
-                "train/wm_loss": wm_loss.item(),
-                "train/bc_loss": bc_loss.item(),
-                "train/kl": kl_val.mean().item()
-            }, step=step)
+        for _ in range(int(config.steps)):
+            wm.train()
+            policy.train()
             
-        if step % config.eval_every == 0:
-            # ... (Evaluation code remains the same) ...
-            print(f"Evaluating at step {step}...")
-            off_metrics = evaluate_offline(wm, policy, eval_loader, config, step)
-            wandb.log(off_metrics, step=step)
-            on_metrics = evaluate_online(wm, policy, config, step, run)
-            wandb.log(on_metrics, step=step)
-            torch.save({
-                'wm': wm.state_dict(),
-                'policy': policy.state_dict()
-            }, logdir / "latest.pt")
-    print("Training Finished.")
+            raw_batch = next(train_iter)
+            
+            # 1. WM Branch
+            data_wm = raw_batch.copy()
+            data_wm['image'] = data_wm.pop('image_wm')
+            data_wm = wm.preprocess(data_wm)
+            
+            # 2. BC Data Preparation
+            img_bc = torch.tensor(raw_batch['image_bc'], device=config.device, dtype=torch.float32) / 255.0
+            if config.image_standardize and 'image_mean' in data_wm:
+                 img_bc = (img_bc - data_wm['image_mean']) / data_wm['image_std']
+            
+            # 3. Forward World Model
+            embed_wm = wm.encoder(data_wm) 
+            post_wm, prior_wm = wm.dynamics.observe(embed_wm, data_wm['action'], data_wm['is_first'])
+            
+            # Calculate KL Loss
+            kl_loss, kl_val, _, _ = wm.dynamics.kl_loss(
+                post_wm, prior_wm, config.kl_free, config.dyn_scale, config.rep_scale
+            )
+            
+            # Calculate Reconstruction Losses
+            feat_wm = wm.dynamics.get_feat(post_wm)
+            recon_losses = 0
+            for name, head in wm.heads.items():
+                pred = head(feat_wm)
+                if isinstance(pred, dict):
+                    for k, v in pred.items(): 
+                        recon_losses -= v.log_prob(data_wm[k])
+                else:
+                    recon_losses -= pred.log_prob(data_wm[name])
+            
+            wm_loss = (recon_losses + kl_loss).mean()
+            
+            # 4. Forward BC Branch
+            data_bc = data_wm.copy()
+            data_bc['image'] = img_bc
+            embed_bc = wm.encoder(data_bc)
+            post_bc, _ = wm.dynamics.observe(embed_bc, data_bc['action'], data_bc['is_first'])
+            feat_bc = wm.dynamics.get_feat(post_bc)
+            
+            # --- BC Loss (Raw MSE) ---
+            target = torch.tensor(raw_batch['policy_target'], device=config.device, dtype=torch.float32)
+            pred_action = policy(feat_bc)
+            bc_loss = F.mse_loss(pred_action, target)
+            
+            # 5. Optimization
+            total_loss = (config.wm_loss_scale * wm_loss) + (config.bc_loss_scale * bc_loss)
+            
+            optimizer.zero_grad()
+            total_loss.backward()
+            nn.utils.clip_grad_norm_(list(wm.parameters()) + list(policy.parameters()), config.grad_clip)
+            optimizer.step()
+            
+            step += 1
+            
+            if step % config.log_every == 0:
+                wandb.log({
+                    "train/total_loss": total_loss.item(),
+                    "train/wm_loss": wm_loss.item(),
+                    "train/bc_loss": bc_loss.item(),
+                    "train/kl": kl_val.mean().item()
+                }, step=step)
+                
+            if step % config.eval_every == 0:
+                print(f"Evaluating at step {step}...")
+                off_metrics = evaluate_offline(wm, policy, eval_loader, config, step)
+                wandb.log(off_metrics, step=step)
+                
+                # Pass reused envs here
+                on_metrics = evaluate_online(wm, policy, config, step, run, eval_envs)
+                wandb.log(on_metrics, step=step)
+                
+                torch.save({
+                    'wm': wm.state_dict(),
+                    'policy': policy.state_dict()
+                }, logdir / "latest.pt")
+        print("Training Finished.")
+    
+    finally:
+        print("Closing Eval Envs...")
+        for env in eval_envs:
+            try: env.close()
+            except: pass
 
 if __name__ == "__main__":
     # 1. Pre-parse to get the env_config name
@@ -639,21 +667,31 @@ if __name__ == "__main__":
     for name in name_list:
         recursive_update(defaults, configs[name])
 
-    # 3. Load and Merge Env Config using the imported helper
+    # 3. Load and Merge Env Config (Using Import with Fallback)
     complex_defaults = {} 
     
     if args.env_config:
         print(f"Loading env config block: {args.env_config}")
-        # Using the imported helper here
-        env_defaults = _load_env_block(args.env_config)
+        env_defaults = {}
+        
+        # Use imported helper if available
+        if _load_env_block:
+            try:
+                env_defaults = _load_env_block(args.env_config)
+            except FileNotFoundError:
+                print("Warning: BC_Sweep._load_env_block failed to find configs.yaml (path mismatch). Using local fallback.")
+                env_defaults = configs.get(args.env_config, {})
+            except Exception as e:
+                print(f"Warning: Error in _load_env_block: {e}")
+                env_defaults = {}
+        else:
+            env_defaults = configs.get(args.env_config, {})
         
         if env_defaults:
             for k, v in env_defaults.items():
                 if isinstance(v, (dict, list)):
-                    # Store complex structures aside to inject later
                     complex_defaults[k] = v
                 else:
-                    # Merge simple values into defaults so argparse can create flags
                     defaults[k] = v
 
     # 4. Standard Defaults setup
@@ -663,7 +701,6 @@ if __name__ == "__main__":
     defaults.setdefault('batch_length', 64)
     defaults.setdefault('batch_size', 16)
     
-    # Robosuite / Env Defaults
     defaults.setdefault('robosuite_task', 'Lift')
     defaults.setdefault('robosuite_robots', ['Panda'])
     defaults.setdefault('robosuite_controller', 'OSC_POSE')
@@ -682,7 +719,6 @@ if __name__ == "__main__":
     parser.add_argument("--env_config", type=str, default=None)
 
     for key, value in sorted(defaults.items(), key=lambda x: x[0]):
-        # Skip keys that are already in complex_defaults
         if key in complex_defaults:
             continue
             
@@ -691,9 +727,8 @@ if __name__ == "__main__":
     
     config = parser.parse_args(remaining)
 
-    # 6. Inject Complex Defaults (e.g., controller_configs)
+    # 6. Inject Complex Defaults
     for k, v in complex_defaults.items():
         setattr(config, k, v)
-        # print(f"Config: Injected complex key '{k}'")
 
     joint_train(config)
