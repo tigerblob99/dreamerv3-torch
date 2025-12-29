@@ -29,7 +29,7 @@ from bc_mlp.BC_MLP_eval import (
     EpisodeVideoRecorder, 
     _extract_success
 )
-from BC_Sweep import _load_env_block
+from bc_mlp.BC_Sweep import _load_env_block
 
 _EXCLUDE_KEYS = {"action", "reward", "discount", "is_first", "is_terminal", "policy_target"}
 
