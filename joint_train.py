@@ -636,6 +636,13 @@ def joint_train(config):
                     'wm': wm.state_dict(),
                     'policy': policy.state_dict()
                 }, logdir / "latest.pt")
+
+            if step % config.save_every == 0:
+                torch.save({
+                    'wm': wm.state_dict(),
+                    'policy': policy.state_dict()
+                }, logdir / f"step_{step}.pt")
+
         print("Training Finished.")
     
     finally:
@@ -700,7 +707,7 @@ if __name__ == "__main__":
     defaults.setdefault('wm_loss_scale', 1.0)
     defaults.setdefault('batch_length', 64)
     defaults.setdefault('batch_size', 16)
-    
+    defaults.setdefault('save_every', 10000)
     defaults.setdefault('robosuite_task', 'Lift')
     defaults.setdefault('robosuite_robots', ['Panda'])
     defaults.setdefault('robosuite_controller', 'OSC_POSE')

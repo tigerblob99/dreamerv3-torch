@@ -375,13 +375,14 @@ can_env_eval:
 joint_train:
   # --- Training Loop ---
   steps: 50000             # Total training steps
-  model_lr: 3e-4            # Learning rate for joint optimizer
+  model_lr: 5e-4            # Learning rate for joint optimizer
   weight_decay: 1e-5        # Weight decay for joint optimizer
 
   batch_size: 64            # Batch size
   batch_length: 64          # Sequence length
   grad_clip: 100.0          # Gradient clipping norm
   log_every: 100          # Logging frequency (steps)
+  save_every: 10000
   
   # --- Loss Scales ---
   wm_loss_scale: 0.01        # Scale for World Model loss (Recon + KL + Reward)
@@ -395,8 +396,8 @@ joint_train:
   
   # --- Evaluation Settings ---
   eval_every: 1000         # Frequency of evaluation (steps)
-  offline_eval_batches: 10  # Number of batches to calculate validation loss on
-  eval_episodes: 25          # Number of online episodes to run in Robosuite
+  offline_eval_batches: 64  # Number of batches to calculate validation loss on
+  eval_episodes: 50          # Number of online episodes to run in Robosuite
   max_env_steps: 500        # Max steps per online episode
   num_envs: 25
   robosuite_task: 'PickPlaceCan'  # Robosuite task name
