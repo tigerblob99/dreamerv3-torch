@@ -640,9 +640,9 @@ def joint_train(config):
             if step % config.save_every == 0:
                 torch.save({
                     'wm': wm.state_dict(),
-                    'policy': policy.state_dict()
                     'policy': policy.state_dict(),
-                    'optimizer': optimizer.state_dict(),
+                    'policy': policy.state_dict(),
+                    'optimizer': optimizer.state_dict()
                 }, logdir / f"step_{step}.pt")
 
         print("Training Finished.")
