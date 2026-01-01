@@ -16,8 +16,8 @@ from types import SimpleNamespace
 import ruamel.yaml as yaml
 import torch
 
-# Ensure repository root is on the path for local imports (joint_train, BC_Sweep, etc.)
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+# Hardcode repository root: parent of this evals directory holds configs.yaml
+REPO_ROOT = pathlib.Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
@@ -51,7 +51,7 @@ def _parse_config():
     )
     pre_args, remaining = pre_parser.parse_known_args()
 
-    cfg_path = "configs.yaml"
+    cfg_path = REPO_ROOT / "configs.yaml"
     configs = yaml.safe_load(cfg_path.read_text())
 
     def recursive_update(base, update):
