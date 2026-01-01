@@ -17,7 +17,7 @@ import ruamel.yaml as yaml
 import torch
 
 # Hardcode repository root: parent of this evals directory holds configs.yaml
-REPO_ROOT = pathlib.Path(__file__).resolve().parent
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent 
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
