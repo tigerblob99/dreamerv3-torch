@@ -1,3 +1,13 @@
+"""
+python evals/joint_encoder_eval.py \
+  --configs joint_train \
+  --env_config can_env_eval \
+  --offline_traindir ./datasets/robomimic_data_MV/can_PH_train \
+  --checkpoint /workspace/dreamerv3-torch/dreamerv3-torch/logdir/joint_run_04/latest.pt \
+  --eval_episodes 500 \
+  --num_envs 20
+"""
+
 import argparse
 import pathlib
 import sys
@@ -41,7 +51,7 @@ def _parse_config():
     )
     pre_args, remaining = pre_parser.parse_known_args()
 
-    cfg_path = pathlib.Path(__file__).resolve().parent.parent / "configs.yaml"
+    cfg_path = "configs.yaml"
     configs = yaml.safe_load(cfg_path.read_text())
 
     def recursive_update(base, update):
@@ -109,13 +119,6 @@ def _parse_config():
         required=True,
         help="Path to checkpoint produced by joint_train (contains wm/policy)",
     )
-    parser.add_argument(
-        "--eval_episodes",
-        type=int,
-        default=defaults.get("eval_episodes", 10),
-        help="Number of evaluation episodes (tests) to run",
-    )
-
     for key, value in sorted(defaults.items(), key=lambda x: x[0]):
         if key in complex_defaults:
             continue
