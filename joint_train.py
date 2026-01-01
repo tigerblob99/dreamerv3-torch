@@ -302,7 +302,11 @@ def evaluate_online(wm, policy, config, step, run, envs):
     
     num_envs = len(envs)
     total_episodes = config.eval_episodes
-    video_dir = pathlib.Path(config.logdir) / "eval_videos" / f"step_{step}"
+    
+    # Handle optional video recording (skip if logdir is None)
+    video_dir = None
+    if config.logdir is not None:
+        video_dir = pathlib.Path(config.logdir) / "eval_videos" / f"step_{step}"
     
     # We use the envs passed in, we do NOT create/close them here.
     
@@ -327,7 +331,7 @@ def evaluate_online(wm, policy, config, step, run, envs):
             camera_keys=config.camera_obs_keys,
             flip_keys=config.flip_camera_keys
         ) for _ in range(num_envs)
-    ]
+    ] if video_dir else [None] * num_envs
 
     global_ep_idx = 0
     env_episode_ids = [0] * num_envs
@@ -337,8 +341,9 @@ def evaluate_online(wm, policy, config, step, run, envs):
     for i in range(num_envs):
         if global_ep_idx < total_episodes:
             obs_batch[i] = envs[i].reset()() 
-            recorders[i].start_episode(global_ep_idx)
-            recorders[i].add_frame(obs_batch[i])
+            if recorders[i]:
+                recorders[i].start_episode(global_ep_idx)
+                recorders[i].add_frame(obs_batch[i])
             env_episode_ids[i] = global_ep_idx
             global_ep_idx += 1
         else:
@@ -416,7 +421,8 @@ def evaluate_online(wm, policy, config, step, run, envs):
             episode_rewards[i] += reward
             episode_steps[i] += 1
             episode_success[i] = (episode_success[i] or success)
-            recorders[i].add_frame(obs)
+            if recorders[i]:
+                recorders[i].add_frame(obs)
             
             env_done = done or (episode_steps[i] >= getattr(config, "max_env_steps", 500)) or success
             
@@ -425,15 +431,16 @@ def evaluate_online(wm, policy, config, step, run, envs):
                 final_rewards.append(episode_rewards[i])
                 final_successes.append(episode_success[i])
                 
-                vid_path = recorders[i].finish_episode()
+                vid_path = recorders[i].finish_episode() if recorders[i] else None
                 if vid_path and env_episode_ids[i] < 3:
                     if run: 
                         run.log({f"eval_online/video_{env_episode_ids[i]}": wandb.Video(str(vid_path), fps=20, format="mp4")}, commit=False)
                 
                 if global_ep_idx < total_episodes:
                     obs_batch[i] = envs[i].reset()()
-                    recorders[i].start_episode(global_ep_idx)
-                    recorders[i].add_frame(obs_batch[i])
+                    if recorders[i]:
+                        recorders[i].start_episode(global_ep_idx)
+                        recorders[i].add_frame(obs_batch[i])
                     episode_rewards[i] = 0.0
                     episode_steps[i] = 0
                     episode_success[i] = False
