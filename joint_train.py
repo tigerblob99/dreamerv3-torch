@@ -394,7 +394,7 @@ def evaluate_online(wm, policy, config, step, run, envs):
 
         with torch.no_grad():
             embed = wm.encoder(data) 
-            post, _ = wm.dynamics.obs_step(rssm_state, prev_action, embed, is_first)
+            post, _ = wm.dynamics.obs_step(rssm_state, prev_action, embed, is_first, sample=False)
             rssm_state = post
             feat = wm.dynamics.get_feat(post)
             
