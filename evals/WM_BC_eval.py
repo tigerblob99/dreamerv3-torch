@@ -14,7 +14,7 @@ sys.path.append(str(pathlib.Path(__file__).parent.parent))
 import tools  #
 
 # Define REPO_ROOT for config loading
-REPO_ROOT = pathlib.Path(__file__).resolve().parent
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 class EvalDataset(Dataset):
     def __init__(self, hdf5_path, config, eval_dir, warmup_len=5, horizon=10):
