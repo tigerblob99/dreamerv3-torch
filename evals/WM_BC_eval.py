@@ -10,7 +10,7 @@ import yaml
 import sys
 
 # Ensure parent directory is in path to import 'tools'
-sys.path.append(str(pathlib.Path(__file__).parent))
+sys.path.append(str(pathlib.Path(__file__).parent.parent))
 import tools  #
 
 # Define REPO_ROOT for config loading
