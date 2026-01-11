@@ -301,8 +301,8 @@ def eval_closed_loop_bc_real_env(jm, Loader, envs, config):
             policy_images = np.stack([np.stack(traj) for traj in batch_policy_trajectory_obs])
             target_images = batch['target_image'].numpy()
             
-            policy_images_scaled = policy_images / 255.0 - 0.5
-            target_images_scaled = target_images / 255.0 - 0.5
+            policy_images_scaled = policy_images / 255.0
+            target_images_scaled = target_images / 255.0
             
             # Calculate MSE for each episode in the batch
             mse = ((policy_images_scaled - target_images_scaled) ** 2).mean(axis=(1, 2, 3, 4))
@@ -398,9 +398,9 @@ def eval_closed_loop_bc_wm(jm, Loader, config):
             # 4. Calculate error
             wm_images = reconstructed_images.cpu().numpy()
             target_images = batch['target_image'].numpy()
-            target_images_scaled = target_images / 255.0 - 0.5
+            target_images_scaled = target_images / 255.0
             
-            # Assuming wm_images are in [-0.5, 0.5] range from the model
+            # Assuming wm_images are in [0, 1] range from the model
             mse = ((wm_images - target_images_scaled) ** 2).mean(axis=(1, 2, 3, 4))
             errors.extend(mse.tolist())
             

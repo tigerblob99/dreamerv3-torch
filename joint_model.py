@@ -108,12 +108,12 @@ class joint_model(torch.nn.Module):
         """
         dynamics = self.wm.dynamics
         
-        # Handle start_state shape (B, T, D) -> (B, D) if needed
-        first_key = next(iter(start_state.keys()))
-        if start_state[first_key].ndim == 3:
-             start = {k: v[:, -1] for k, v in start_state.items()}
+        # Handle time dimension only when RSSM state includes time (deter is (B, T, D)).
+        deter = start_state.get("deter")
+        if deter is not None and deter.ndim == 3:
+            start = {k: v[:, -1] for k, v in start_state.items()}
         else:
-             start = start_state
+            start = start_state
 
         def step(prev, _):
             state, _, _ = prev
