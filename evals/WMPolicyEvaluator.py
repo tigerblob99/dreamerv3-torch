@@ -2,7 +2,7 @@
 "Closed-loop BC reconstruction error vs. open-loop WM reconstruction error"
 
 # Example:
-# python evals/WMPolicyEvaluator.py --configs joint_train --env_config can_env_eval_WMPolicy --offline_traindir ./datasets/robomimic_data_MV/can_PH_train --checkpoint /workspace/dreamerv3-torch/dreamerv3-torch/logdir/joint_run_04/latest.pt
+# python evals/WMPolicyEvaluator.py --configs joint_train --env_config can_env_eval_WMPolicy --offline_evaldir ./datasets/robomimic_data_MV/can_PH_eval --checkpoint /workspace/dreamerv3-torch/dreamerv3-torch/logdir/joint_run_04/latest.pt  --hdf5_path ./datasets/imagecanPH_v15.hdf5
 """
 
 import argparse
@@ -151,9 +151,9 @@ def _parse_config():
 def _load_models(config):
     """Instantiate WorldModel + policy and load weights from checkpoint."""
 
-    episodes = tools.load_episodes(config.offline_traindir, limit=config.dataset_size)
+    episodes = tools.load_episodes(config.offline_evaldir, limit=config.dataset_size)
     if not episodes:
-        raise RuntimeError(f"No episodes found in {config.offline_traindir} for space inference.")
+        raise RuntimeError(f"No episodes found in {config.offline_evaldir} for space inference.")
     sample_ep = next(iter(episodes.values()))
     obs_space, act_space = _define_spaces(sample_ep, config)
     config.num_actions = act_space.shape[0]
