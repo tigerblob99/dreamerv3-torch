@@ -128,8 +128,16 @@ def _parse_config():
         required=True,
         help="Path to the raw HDF5 (used ONLY for 'env_state' resets)."
     )
+    parser.add_argument(
+        "--offline_evaldir",
+        type=str,
+        required=True,
+        help="Path to the NPZ eval dir."
+    )
     for key, value in sorted(defaults.items(), key=lambda x: x[0]):
         if key in complex_defaults:
+            continue
+        if key == "offline_evaldir":
             continue
         arg_type = tools.args_type(value)
         parser.add_argument(f"--{key}", type=arg_type, default=arg_type(value))
@@ -159,7 +167,7 @@ def _load_models(config):
     policy = ActionMLP(
         inp_dim=feat_size,
         shape=(config.num_actions,),
-        layers=4,
+        layers=config.mlp_layers,
         units=1024,
         act=config.act,
         norm=config.norm,
@@ -190,7 +198,7 @@ def main():
     # 2. Load the dataset
     dataset = EvalDataset(
         hdf5_path=config.hdf5_path,
-        eval_dir=config.offline_traindir,
+        eval_dir=config.offline_evaldir,
         config=config,
         warmup_len=config.warmup_len,
         horizon=config.horizon

@@ -376,6 +376,12 @@ can_env_eval:
           type: GRIP
 
 joint_train:
+  # --- model definition ---
+  encoder: *robomimic_encoder
+  mlp_layers: 3          # Number of MLP layers for policy and value networks
+  act: 'SiLU'              # Activation function
+  norm: True               # Use layer normalization
+
   # --- Training Loop ---
   steps: 50000             # Total training steps
   model_lr: 5e-4            # Learning rate for joint optimizer
