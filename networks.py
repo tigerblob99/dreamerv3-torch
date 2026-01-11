@@ -597,8 +597,10 @@ class ConvDecoder(nn.Module):
             x = F.interpolate(x, size=target_hw, mode="bilinear", align_corners=False)
         # (batch, time, -1) -> (batch, time, ch, h, w)
         mean = x.reshape(features.shape[:-1] + self._shape)
-        # (batch, time, ch, h, w) -> (batch, time, h, w, ch)
-        mean = mean.permute(0, 1, 3, 4, 2)
+        # Move channels to the last dimension: (..., ch, h, w) -> (..., h, w, ch)
+        perm = list(range(mean.dim()))
+        perm = perm[:-3] + [perm[-2], perm[-1], perm[-3]]
+        mean = mean.permute(*perm)
         if self._cnn_sigmoid:
             mean = F.sigmoid(mean)
         elif self._offset_outputs:

@@ -333,6 +333,11 @@ def eval_open_loop_wm(jm, Loader, config):
 
             # 3. Open-loop rollout in WM
             wm_rollout_obs = []
+            # Alternative approach:
+            # prior = jm.wm.dynamics.imagine_with_action(target_actions, current_state)
+            # feats = jm.feats(prior)
+            # preds = jm.get_preds(feats)
+            # wm_rollout_obs = list(preds["image"].permute(1, 0, 2, 3, 4))
             # `target_actions` has shape (B, T, A), we need to iterate through T
             for t in range(config.horizon):
                 # action has shape (B, A)
