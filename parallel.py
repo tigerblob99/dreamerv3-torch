@@ -42,7 +42,8 @@ class Parallel:
 
     @staticmethod
     def _respond(ctor, state, message, name, *args, **kwargs):
-        state = state or ctor
+        if state is None:
+            state = ctor() if callable(ctor) else ctor
         if message == PMessage.CALLABLE:
             assert not args and not kwargs, (args, kwargs)
             result = callable(getattr(state, name))
