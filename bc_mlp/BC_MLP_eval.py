@@ -282,6 +282,7 @@ def _prepare_obs(
 	crop_width: Optional[int] = None,
 	is_first: Optional[bool] = None,
 	is_terminal: Optional[bool] = None,
+	config: Optional[Any] = None,
 ) -> Dict[str, Any]:
 	"""Prepare observations in the exact order specified by config keys.
 	
@@ -304,17 +305,18 @@ def _prepare_obs(
 			processed[key] = np.asarray(raw_obs[key], dtype=np.float32)
 	
 	# Mapping for trig keys that need renaming
-	trig_key_map = {
-		"robot0_joint_pos_sin": "aux_robot0_joint_pos_sin",
-		"robot0_joint_pos_cos": "aux_robot0_joint_pos_cos",
-	}
-	reverse_trig_map = {v: k for k, v in trig_key_map.items()}
+	processed_to_raw = getattr(config, "aux_key_map", {})
+	if not processed_to_raw:
+		processed_to_raw = {
+			"aux_robot0_joint_pos_sin": "robot0_joint_pos_sin",
+			"aux_robot0_joint_pos_cos": "robot0_joint_pos_cos",
+		}
 	
 	# Add MLP keys in specified order
 	for key in mlp_keys_order:
-		if key in reverse_trig_map:
+		if key in processed_to_raw:
 			# This is an aux_ key, get from the original raw key
-			raw_key = reverse_trig_map[key]
+			raw_key = processed_to_raw[key]
 			if raw_key in raw_obs:
 				processed[key] = np.asarray(raw_obs[raw_key], dtype=np.float32)
 		elif key in raw_obs:
@@ -361,6 +363,7 @@ def _obs_to_torch(obs: Dict[str, Any], device: Any) -> Dict[str, Any]:
 def _replay_dataset_demo(
 	env,
 	config: EvalConfig,
+	dreamer_cfg: Any,
 	dataset_file: h5py.File,
 	demo_key: str,
 	video_recorder: EpisodeVideoRecorder,
@@ -431,6 +434,7 @@ def _replay_dataset_demo(
 			flip_keys=config.flip_camera_keys,
 			crop_height=getattr(config, "bc_crop_height", None),
 			crop_width=getattr(config, "bc_crop_width", None),
+			config=dreamer_cfg,
 		)
 		tensor_obs = _obs_to_torch(step_obs, device)
 		with torch.no_grad():
@@ -870,6 +874,7 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 		flip_keys=config.flip_camera_keys,
 		crop_height=getattr(config, "bc_crop_height", None),
 		crop_width=getattr(config, "bc_crop_width", None),
+		config=dreamer_cfg,
 	)
 	if dataset_obs_file and obs_demo_keys:
 		dataset_obs = _load_dataset_obs_frame(dataset_obs_file, obs_demo_keys[0], 0)
@@ -886,6 +891,7 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 				flip_keys=config.flip_camera_keys,
 				crop_height=getattr(config, "bc_crop_height", None),
 				crop_width=getattr(config, "bc_crop_width", None),
+				config=dreamer_cfg,
 			)
 			_compare_processed_obs(
 				"demo0 processed obs vs env warmup",
@@ -965,6 +971,7 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 				_replay_dataset_demo(
 					env,
 					config,
+					dreamer_cfg,
 					dataset_file,
 					replay_key,
 					video_recorder,
@@ -1025,6 +1032,7 @@ def evaluate_policy(config: EvalConfig, dreamer_cfg):
 				flip_keys=config.flip_camera_keys,
 				crop_height=getattr(config, "bc_crop_height", None),
 				crop_width=getattr(config, "bc_crop_width", None),
+				config=dreamer_cfg,
 			)
 			tensor_obs = _obs_to_torch(step_obs, device)
 			with torch.no_grad():

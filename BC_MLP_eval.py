@@ -126,14 +126,8 @@ def _make_robomimic_env(cfg: EvalConfig, image_hw: Tuple[int, int]):
 		horizon=cfg.max_env_steps,
 		ignore_done=getattr(cfg, "ignore_done", False),
 	)
-
-	try:
-		env.reset(seed=cfg.seed)
-	except TypeError:
-		seed_fn = getattr(env, "seed", None)
-		if callable(seed_fn):
-			seed_fn(cfg.seed)
-		env.reset()
+	
+	env.reset()
 	return env
 
 
@@ -162,8 +156,6 @@ def _stack_cameras(obs: Dict[str, Any], camera_keys: Iterable[str], flip_keys: I
 		frame = np.asarray(obs[key])
 		if frame.dtype != np.float32:
 			frame = frame.astype(np.float32)
-		#if frame.max() > 1.0:
-		#	frame /= 255.0
 		if key in flip_set:
 			frame = np.flip(frame, axis=0)  # Vertical flip only (flipud)
 		frames.append(frame)

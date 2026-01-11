@@ -14,8 +14,8 @@ import gym
 from collections import defaultdict, OrderedDict
 from types import SimpleNamespace
 
-# Ensure the folder containing this script is in python path
-sys.path.append(str(pathlib.Path(__file__).parent))
+
+sys.path.append(str(pathlib.Path(__file__).parent.parent))
 
 import tools
 from models import WorldModel
@@ -31,11 +31,9 @@ from bc_mlp.BC_MLP_eval import (
 )
 
 # Import helper from BC_Sweep
-try:
-    from BC_Sweep import _load_env_block
-except ImportError:
-    _load_env_block = None
-    print("Warning: Could not import _load_env_block from BC_Sweep.")
+
+from BC_Sweep import _load_env_block
+
 
 _EXCLUDE_KEYS = {"action", "reward", "discount", "is_first", "is_terminal", "policy_target"}
 
@@ -105,7 +103,9 @@ def _define_spaces(episode, config):
     obs_space = gym.spaces.Dict(obs_spaces)
     action = episode.get("action")
     if action is None: raise ValueError("Episode missing 'action'.")
-    act_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=action.shape[1:], dtype=np.float32)
+    # TODO: This is specific to robosuite environments.
+    # For more general environments, this should be configurable.
+    act_space = gym.spaces.Box(low=-1.0, high=1.0, shape=action.shape[1:], dtype=np.float32)
     
     return obs_space, act_space
 
@@ -269,26 +269,23 @@ class EnvWorker:
     def __init__(self, env_cfg, img_size):
         self._cfg = env_cfg
         self._image_size = img_size
-        self._env = None
+        self._env = _make_robomimic_env(self._cfg, self._image_size)
 
-    def _ensure_env(self):
-        if self._env is None:
-            self._env = _make_robomimic_env(self._cfg, self._image_size)
-
-    def reset(self, seed=None):
-        self._ensure_env()
-        if seed is not None:
-            try:
-                return self._env.reset(seed=seed)
-            except TypeError:
-                self._env.seed(seed)
-                return self._env.reset()
+    def reset(self):
         return self._env.reset()
 
     def step(self, action):
-        self._ensure_env()
         obs, reward, done, info = self._env.step(action)
+
         return obs, reward, done, info, _extract_success(info, self._env)
+    
+    def set_state(self,state):
+        state = state.cpu().numpy() if isinstance(state, torch.Tensor) else state
+        self._env.reset()
+        self._env.sim.set_state_from_flattened(state)
+        self._env.sim.forward()
+        raw_obs = self._env._get_observations(force_update=True)
+        return raw_obs
 
     def close(self):
         if self._env: self._env.close()
@@ -362,7 +359,8 @@ def evaluate_online(wm, policy, config, step, run, envs):
             camera_keys=config.camera_obs_keys,
             flip_keys=config.flip_camera_keys,
             crop_height=config.image_crop_height if config.image_crop_height > 0 else None,
-            crop_width=config.image_crop_width if config.image_crop_width > 0 else None
+            crop_width=config.image_crop_width if config.image_crop_width > 0 else None,
+            config=config
         )
 
         for i in range(num_envs):
@@ -377,7 +375,8 @@ def evaluate_online(wm, policy, config, step, run, envs):
                     camera_keys=config.camera_obs_keys,
                     flip_keys=config.flip_camera_keys,
                     crop_height=config.image_crop_height if config.image_crop_height > 0 else None,
-                    crop_width=config.image_crop_width if config.image_crop_width > 0 else None
+                    crop_width=config.image_crop_width if config.image_crop_width > 0 else None,
+                    config=config
                 )
                 for k, v in processed.items():
                     full_batch_lists[k].append(v)

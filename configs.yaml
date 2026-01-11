@@ -234,6 +234,9 @@ bc_defaults:
     - robot0_gripper_qvel
     - aux_robot0_joint_pos_sin
     - aux_robot0_joint_pos_cos
+  aux_key_map:
+    aux_robot0_joint_pos_sin: robot0_joint_pos_sin
+    aux_robot0_joint_pos_cos: robot0_joint_pos_cos
   bc_cnn_keys_order:
     - image
   bc_epochs: 20
@@ -414,6 +417,9 @@ joint_train:
     - robot0_gripper_qvel
     - aux_robot0_joint_pos_sin
     - aux_robot0_joint_pos_cos
+  aux_key_map:
+    aux_robot0_joint_pos_sin: robot0_joint_pos_sin
+    aux_robot0_joint_pos_cos: robot0_joint_pos_cos
     
   # --- System ---
   num_workers: 0            # Keep at 0 for efficient in-memory dataset usage

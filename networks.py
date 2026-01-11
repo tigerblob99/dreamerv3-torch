@@ -137,7 +137,7 @@ class RSSM(nn.Module):
             (state, state),
         )
 
-        # (batch, time, stoch, discrete_num) -> (batch, time, stoch, discrete_num)
+        # (time, batch, stoch, discrete_num) -> (batch, time, stoch, discrete_num)
         post = {k: swap(v) for k, v in post.items()}
         prior = {k: swap(v) for k, v in prior.items()}
         return post, prior
