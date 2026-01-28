@@ -110,12 +110,18 @@ class EvalDataset(Dataset):
         h_end = t0 + 1 + self.horizon
         
         # Apply crop to target image as well
-        target_img = episode['image'][h_start:h_end]
-        target_img = self._center_crop(target_img)
+        # target_img = episode['image'][h_start:h_end]
+        # target_img = self._center_crop(target_img)
         
         target_batch = {}
-        target_batch["target_image"] = target_img
-        target_batch["target_action"] = episode['action'][h_start:h_end]
+        for k, v in episode.items():
+            data_slice = v[h_start:h_end]
+            # Apply crop if this is an image
+            if "image" in k:
+                data_slice = self._center_crop(data_slice)
+            target_batch[f"target_{k}"] = data_slice
+        # target_batch["target_image"] = target_img
+        # target_batch["target_action"] = episode['action'][h_start:h_end]
 
         # 3. Env State
         h5_file = self._get_file()

@@ -5,6 +5,7 @@ defaults:
   evaldir: null
   offline_traindir: ''
   offline_evaldir: ''
+  offline_playdir: ''
   seed: 0
   deterministic_run: False
   steps: 1e6
@@ -216,7 +217,7 @@ robomimic:
   # aux_ sin/cos provided as inputs only (no explicit next-state vector supervision stored).
   encoder: &robomimic_encoder
     {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel|aux_.*)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
-  decoder:
+  decoder: &robomimic_decoder
     {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
 
 bc_defaults:
@@ -378,24 +379,26 @@ can_env_eval:
 joint_train:
   # --- model definition ---
   encoder: *robomimic_encoder
-  mlp_layers: 3          # Number of MLP layers for policy and value networks
+  decoder: *robomimic_decoder
+  mlp_layers: 4          # Number of MLP layers for policy and value networks
   act: 'SiLU'              # Activation function
   norm: True               # Use layer normalization
 
   # --- Training Loop ---
-  steps: 50000             # Total training steps
+  steps: 80000             # Total training steps
   model_lr: 5e-4            # Learning rate for joint optimizer
   weight_decay: 1e-5        # Weight decay for joint optimizer
 
   batch_size: 64            # Batch size
   batch_length: 64          # Sequence length
+  expert_data_fraction: 0.67  # Fraction of expert data in each batch (e.g., 0.67 for 2/3 expert, 1/3 play)
   grad_clip: 100.0          # Gradient clipping norm
   log_every: 100          # Logging frequency (steps)
   save_every: 10000
   
   # --- Loss Scales ---
   wm_loss_scale: 0.01        # Scale for World Model loss (Recon + KL + Reward)
-  bc_loss_scale: 1000.0        # Scale for Behavior Cloning loss
+  bc_loss_scale: 100.0        # Scale for Behavior Cloning loss
   
   # --- Data Augmentation (Dual Cropping) ---
   image_crop_height: 84     # Target crop height (from 84x84 source)
@@ -404,11 +407,11 @@ joint_train:
   bc_random_crop: False      # Random crop for Policy (BC) - Independent of WM crop
   
   # --- Evaluation Settings ---
-  eval_every: 1000         # Frequency of evaluation (steps)
+  eval_every: 5000         # Frequency of evaluation (steps)
   offline_eval_batches: 64  # Number of batches to calculate validation loss on
   eval_episodes: 50          # Number of online episodes to run in Robosuite
   max_env_steps: 500        # Max steps per online episode
-  num_envs: 25
+  num_envs: 15            # Number of parallel environments for online eval
   robosuite_task: 'PickPlaceCan'  # Robosuite task name
   
   # --- Observation Handling (Robosuite Defaults) ---

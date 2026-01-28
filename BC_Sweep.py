@@ -72,7 +72,7 @@ def _load_env_block(name: str | None):
     """Load env config block from configs.yaml if provided."""
     if not name:
         return None
-    cfg_path = pathlib.Path(__file__).resolve().parent.parent / "configs.yaml"
+    cfg_path = pathlib.Path(__file__).resolve().parent / "configs.yaml"
     if not cfg_path.exists():
         raise FileNotFoundError(f"configs.yaml not found at {cfg_path}")
     parser = yaml.YAML(typ="safe")

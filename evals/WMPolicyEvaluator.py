@@ -2,7 +2,7 @@
 "Closed-loop BC reconstruction error vs. open-loop WM reconstruction error"
 
 # Example:
-# python evals/WMPolicyEvaluator.py --configs joint_train --env_config can_env_eval_WMPolicy --offline_evaldir ./datasets/robomimic_data_MV/can_PH_eval --checkpoint /workspace/dreamerv3-torch/dreamerv3-torch/logdir/joint_run_04/latest.pt  --hdf5_path ./datasets/imagecanPH_v15.hdf5
+# python evals/WMPolicyEvaluator.py --configs joint_train --env_config can_env_eval --offline_evaldir ./datasets/robomimic_data_MV/can_PH_eval --checkpoint /workspace/dreamerv3-torch/dreamerv3-torch/logdir/joint_Play_1/step_40000.pt  --hdf5_path ./datasets/imagecanPH_v15.hdf5  --warmup_len 5 --horizon 40 --batch_size 16
 """
 
 import argparse
@@ -11,6 +11,7 @@ import sys
 from types import SimpleNamespace
 import matplotlib.pyplot as plt
 import numpy as np
+import re
 
 import ruamel.yaml as yaml
 import torch
@@ -234,16 +235,89 @@ def main():
            ]
     
     # 4. Run evaluations
-    real_env_errors = eval_closed_loop_bc_real_env(jm, Loader, envs, config)
-    wm_open_loop_errors = eval_open_loop_wm(jm, Loader, config)
-    wm_closed_loop_errors = eval_closed_loop_bc_wm(jm, Loader, config)
+    real_env_img_errors, real_env_prop_errors, real_env_img_error_sequences = eval_closed_loop_bc_real_env(jm, Loader, envs, config)
+    wm_open_loop_img_errors, wm_open_loop_prop_errors = eval_open_loop_wm(jm, Loader, config)
+    wm_closed_loop_img_errors, wm_closed_loop_prop_errors, wm_closed_loop_img_error_sequences = eval_closed_loop_bc_wm(jm, Loader, config)
 
     # 5. Plotting
-    assert len(real_env_errors) == len(wm_open_loop_errors) == len(wm_closed_loop_errors)
-    plot_errors(real_env_errors, wm_open_loop_errors, "real_env_vs_wm_open_loop")
-    plot_errors(real_env_errors, wm_closed_loop_errors, "real_env_vs_wm_closed_loop")
-    plot_errors(wm_open_loop_errors, wm_closed_loop_errors, "wm_open_loop_vs_wm_closed_loop")
+    assert len(real_env_img_errors) == len(wm_open_loop_img_errors) == len(wm_closed_loop_img_errors)
+    assert len(real_env_prop_errors) == len(wm_open_loop_prop_errors) == len(wm_closed_loop_prop_errors)
 
+    plot_errors(
+        real_env_img_errors,
+        wm_open_loop_img_errors,
+        "real_env_vs_wm_open_loop_image",
+        config,
+        xlabel="Real-env image MSE",
+        ylabel="WM open-loop image MSE",
+        title_text="Real env vs WM open-loop (image)",
+    )
+    plot_errors(
+        real_env_prop_errors,
+        wm_open_loop_prop_errors,
+        "real_env_vs_wm_open_loop_proprio",
+        config,
+        xlabel="Real-env proprio MSE",
+        ylabel="WM open-loop proprio MSE",
+        title_text="Real env vs WM open-loop (proprio)",
+    )
+    plot_errors(
+        real_env_img_errors,
+        wm_closed_loop_img_errors,
+        "real_env_vs_wm_closed_loop_image",
+        config,
+        xlabel="Real-env image MSE",
+        ylabel="WM closed-loop image MSE",
+        title_text="Real env vs WM closed-loop (image)",
+    )
+    plot_errors(
+        real_env_prop_errors,
+        wm_closed_loop_prop_errors,
+        "real_env_vs_wm_closed_loop_proprio",
+        config,
+        xlabel="Real-env proprio MSE",
+        ylabel="WM closed-loop proprio MSE",
+        title_text="Real env vs WM closed-loop (proprio)",
+    )
+    plot_errors(
+        wm_open_loop_img_errors,
+        wm_closed_loop_img_errors,
+        "wm_open_loop_vs_wm_closed_loop_image",
+        config,
+        xlabel="WM open-loop image MSE",
+        ylabel="WM closed-loop image MSE",
+        title_text="WM open-loop vs WM closed-loop (image)",
+    )
+    plot_errors(
+        wm_open_loop_prop_errors,
+        wm_closed_loop_prop_errors,
+        "wm_open_loop_vs_wm_closed_loop_proprio",
+        config,
+        xlabel="WM open-loop proprio MSE",
+        ylabel="WM closed-loop proprio MSE",
+        title_text="WM open-loop vs WM closed-loop (proprio)",
+    )
+
+    errs = np.asarray(wm_closed_loop_img_error_sequences)  # (B, T)
+    t = np.arange(errs.shape[1])
+
+    mean = errs.mean(axis=0)
+    std = errs.std(axis=0)
+    lower = mean - std
+    upper = mean + std
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(t, mean, color="C0", linewidth=3, label="mean")
+    plt.fill_between(t, lower, upper, color="C0", alpha=0.2, label="±1 std")
+    plt.xlabel("time step")
+    plt.ylabel("MSE")
+    plt.legend()
+    plt.tight_layout()
+    run_dir = pathlib.Path("imgs") / f"horizon{config.horizon}_warmup{config.warmup_len}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    out_path = run_dir / "wm_rollouts.png"
+    plt.savefig(out_path)
+    plt.close()
 
 from tqdm import tqdm
 
@@ -256,13 +330,19 @@ def eval_closed_loop_bc_real_env(jm, Loader, envs, config):
         - Measure the Mean Squared Error (MSE).
     """
     print("Evaluating closed-loop BC in real environment...")
-    errors = []
+    image_errors_mse = []
+    image_error_sequences = []
+    proprio_errors = []
     num_envs = len(envs)
     with torch.no_grad():
         for batch in tqdm(Loader):
+            proprio_keys = _get_proprio_keys(batch, config)
             # 1. Set states in all envs in parallel
             set_state_promises = [envs[i].set_state(batch['env_state'][i]) for i in range(num_envs)]
             current_obs_list = [p() for p in set_state_promises]
+            if proprio_keys:
+                available_keys = set(current_obs_list[0].keys())
+                proprio_keys = [k for k in proprio_keys if k in available_keys]
 
             # 2. Warm up RSSM for the whole batch
             warmup_data = {k.replace('warmup_', ''): v.to(config.device) for k, v in batch.items() if k.startswith('warmup_')}
@@ -270,6 +350,7 @@ def eval_closed_loop_bc_real_env(jm, Loader, envs, config):
 
             # 3. Rollout policy in parallel
             batch_policy_trajectory_obs = [[] for _ in range(num_envs)]
+            batch_policy_trajectory_prop = {k: [[] for _ in range(num_envs)] for k in proprio_keys}
             prev_actions = torch.zeros((num_envs, config.num_actions), device=config.device)
             for t in range(config.horizon):
                 # Collate observations from list of dicts to a dict of batched tensors
@@ -295,6 +376,9 @@ def eval_closed_loop_bc_real_env(jm, Loader, envs, config):
                     obs, reward, done, info, success = step_results[i]
                     current_obs_list.append(obs)
                     batch_policy_trajectory_obs[i].append(obs['image'])
+                    for key in proprio_keys:
+                        if key in obs:
+                            batch_policy_trajectory_prop[key][i].append(obs[key])
 
             # 4. Calculate error for the batch
             # policy_images shape: (B, T, H, W, C)
@@ -306,9 +390,19 @@ def eval_closed_loop_bc_real_env(jm, Loader, envs, config):
             
             # Calculate MSE for each episode in the batch
             mse = ((policy_images_scaled - target_images_scaled) ** 2).mean(axis=(1, 2, 3, 4))
-            errors.extend(mse.tolist())
+            image_error_sequences = ((policy_images_scaled - target_images_scaled) ** 2).mean(axis=(2, 3, 4))
+            image_errors_mse.extend(mse.tolist())
+
+            if proprio_keys:
+                pred_prop = {}
+                for key in proprio_keys:
+                    pred_prop[key] = np.stack([np.stack(traj) for traj in batch_policy_trajectory_prop[key]])
+                prop_mse = _compute_proprio_mse(pred_prop, batch, proprio_keys)
+                proprio_errors.extend(prop_mse.tolist())
+            else:
+                proprio_errors.extend([float("nan")] * policy_images.shape[0])
         
-    return errors
+    return image_errors_mse, proprio_errors, image_error_sequences, 
 
 
 def eval_open_loop_wm(jm, Loader, config):
@@ -321,9 +415,11 @@ def eval_open_loop_wm(jm, Loader, config):
         - Measure the MSE.
     """
     print("Evaluating open-loop WM...")
-    errors = []
+    image_errors = []
+    proprio_errors = []
     with torch.no_grad():
         for batch in tqdm(Loader):
+            proprio_keys = _get_proprio_keys(batch, config)
             # 1. Warm up RSSM
             warmup_data = {k.replace('warmup_', ''): v.to(config.device) for k, v in batch.items() if k.startswith('warmup_')}
             current_state = jm._warmup_rssm(warmup_data)
@@ -333,6 +429,7 @@ def eval_open_loop_wm(jm, Loader, config):
 
             # 3. Open-loop rollout in WM
             wm_rollout_obs = []
+            wm_rollout_prop = {k: [] for k in proprio_keys}
             # Alternative approach:
             # prior = jm.wm.dynamics.imagine_with_action(target_actions, current_state)
             # feats = jm.feats(prior)
@@ -350,6 +447,13 @@ def eval_open_loop_wm(jm, Loader, config):
                 reconstructed_image = preds["image"]
                 
                 wm_rollout_obs.append(reconstructed_image)
+                for key in proprio_keys:
+                    pred = preds.get(key)
+                    if pred is None:
+                        continue
+                    if hasattr(pred, "mode"):
+                        pred = pred.mode()
+                    wm_rollout_prop[key].append(pred)
                 current_state = next_state
 
             # 4. Calculate error
@@ -360,9 +464,21 @@ def eval_open_loop_wm(jm, Loader, config):
 
             # Assuming wm_images are in [0, 1] range from the model
             mse = ((wm_images - target_images_scaled) ** 2).mean(axis=(1, 2, 3, 4))
-            errors.extend(mse.tolist())
+            image_errors.extend(mse.tolist())
 
-    return errors
+            if proprio_keys:
+                pred_prop = {}
+                for key in proprio_keys:
+                    if not wm_rollout_prop.get(key):
+                        continue
+                    pred_seq = torch.stack(wm_rollout_prop[key], dim=1)
+                    pred_prop[key] = pred_seq.detach().cpu().numpy()
+                prop_mse = _compute_proprio_mse(pred_prop, batch, proprio_keys)
+                proprio_errors.extend(prop_mse.tolist())
+            else:
+                proprio_errors.extend([float("nan")] * wm_images.shape[0])
+
+    return image_errors, proprio_errors
 
 
 def eval_closed_loop_bc_wm(jm, Loader, config):
@@ -377,9 +493,12 @@ def eval_closed_loop_bc_wm(jm, Loader, config):
         - Measure the MSE.
     """
     print("Evaluating closed-loop BC in WM...")
-    errors = []
+    image_errors_mse = []
+    image_error_sequences = []
+    proprio_errors = []
     with torch.no_grad():
         for batch in tqdm(Loader):
+            proprio_keys = _get_proprio_keys(batch, config)
             # 1. Warm up RSSM
             warmup_data = {k.replace('warmup_', ''): v.to(config.device) for k, v in batch.items() if k.startswith('warmup_')}
             start_state = jm._warmup_rssm(warmup_data)
@@ -402,20 +521,76 @@ def eval_closed_loop_bc_wm(jm, Loader, config):
             
             # Assuming wm_images are in [0, 1] range from the model
             mse = ((wm_images - target_images_scaled) ** 2).mean(axis=(1, 2, 3, 4))
-            errors.extend(mse.tolist())
+            image_errors_mse.extend(mse.tolist())
+            image_error_sequences.extend(((wm_images - target_images_scaled) ** 2).mean(axis=(2, 3, 4)))
+
+            if proprio_keys:
+                pred_prop = {}
+                for key in proprio_keys:
+                    pred = preds.get(key)
+                    if pred is None:
+                        continue
+                    if hasattr(pred, "mode"):
+                        pred = pred.mode()
+                    pred = pred.view(T, B, *pred.shape[1:])
+                    pred = pred.permute(1, 0, *range(2, pred.ndim))
+                    pred_prop[key] = pred.detach().cpu().numpy()
+                prop_mse = _compute_proprio_mse(pred_prop, batch, proprio_keys)
+                proprio_errors.extend(prop_mse.tolist())
+            else:
+                proprio_errors.extend([float("nan")] * wm_images.shape[0])
             
-    return errors
+    return image_errors_mse, proprio_errors, image_error_sequences
 
 
-def plot_errors(errors1, errors2, title):
+def plot_errors(errors1, errors2, title, config, *, xlabel, ylabel, title_text=None):
     """Generates and saves a scatter plot of two sets of errors."""
     plt.figure()
     plt.scatter(errors1, errors2)
-    plt.xlabel("Error 1")
-    plt.ylabel("Error 2")
-    plt.title(title)
-    plt.savefig(f"imgs/{title}.png")
-    print(f"Saved plot to imgs/{title}.png")
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title_text or title)
+    run_dir = pathlib.Path("imgs") / f"horizon{config.horizon}_warmup{config.warmup_len}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    out_path = run_dir / f"{title}.png"
+    plt.savefig(out_path)
+    print(f"Saved plot to {out_path}")
+
+
+def _get_proprio_keys(batch, config):
+    mlp_pat = "$^"
+    decoder_cfg = getattr(config, "decoder", None)
+    if isinstance(decoder_cfg, dict):
+        mlp_pat = decoder_cfg.get("mlp_keys", "$^")
+    skip = {"image", "action", "reward", "discount", "is_first", "is_terminal", "cont"}
+    keys = []
+    for k in batch.keys():
+        if not k.startswith("target_"):
+            continue
+        base = k[len("target_"):]
+        if base in skip:
+            continue
+        if re.match(mlp_pat, base):
+            keys.append(base)
+    return keys
+
+
+def _compute_proprio_mse(pred_prop, batch, proprio_keys):
+    per_key = []
+    for key in proprio_keys:
+        if key not in pred_prop:
+            continue
+        pred = pred_prop[key]
+        target = batch[f"target_{key}"]
+        if torch.is_tensor(target):
+            target = target.detach().cpu().numpy()
+        if torch.is_tensor(pred):
+            pred = pred.detach().cpu().numpy()
+        mse = ((pred - target) ** 2).mean(axis=tuple(range(1, pred.ndim)))
+        per_key.append(mse)
+    if not per_key:
+        return np.full((batch["target_image"].shape[0],), np.nan, dtype=np.float32)
+    return np.stack(per_key, axis=0).mean(axis=0)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
 import gym
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 from types import SimpleNamespace
 
 
@@ -33,6 +33,12 @@ from bc_mlp.BC_MLP_eval import (
 # Import helper from BC_Sweep
 
 from BC_Sweep import _load_env_block
+
+""""python joint_train.py --configs joint_train robomimic --offline_traindir datasets/robomimic_data_MV/can_PH_train --offline_evaldir datasets/robomimic_data_MV/can_PH_eval --offline_playdir datasets/robomimic_data_MV/can_MH_train --logdir logdir/joint_Play_1 --env_config can_env_eval"""
+
+"""docker exec -it -w /workspace/dreamerv3-torch/dreamerv3-torch pytorch_dev_cu130 \
+  bash -lc 'python joint_train.py --configs joint_train robomimic --offline_traindir datasets/robomimic_data_MV/can_PH_train --offline_evaldir datasets/robomimic_data_MV/can_PH_eval --offline_playdir datasets/robomimic_data_MV/can_MH_train --logdir logdir/joint_Play_1 --env_config can_env_eval 2>&1 | tee /workspace/eval.log'
+"""
 
 
 _EXCLUDE_KEYS = {"action", "reward", "discount", "is_first", "is_terminal", "policy_target"}
@@ -112,11 +118,12 @@ def _define_spaces(episode, config):
 # --- Dataset ---
 
 class JointDataset(Dataset):
-    def __init__(self, directory, config, mode='train'):
+    def __init__(self, directory, config, mode='train', bc_mask_value=1.0):
         self.config = config
         self.mode = mode
         self.directory = pathlib.Path(directory).expanduser()
         self.batch_length = config.batch_length
+        self.bc_mask_value = float(bc_mask_value)
         self.crop_h = config.image_crop_height
         self.crop_w = config.image_crop_width
         self.do_crop = (self.crop_h > 0 and self.crop_w > 0)
@@ -194,6 +201,9 @@ class JointDataset(Dataset):
             collected['policy_target'].append(episode['action'][target_slice])
             collected['is_first'].append(first_chunk)
             collected['is_terminal'].append(episode['is_terminal'][input_slice])
+            collected['bc_mask'].append(
+                np.full((take,), self.bc_mask_value, dtype=np.float32)
+            )
 
             skip_keys = ['image', 'action', 'is_first', 'is_terminal', 'log_']
             for k, v in episode.items():
@@ -203,6 +213,10 @@ class JointDataset(Dataset):
             current_len += take
 
         return {k: np.concatenate(v, axis=0) for k, v in collected.items()}
+
+class PlayDataDataset(JointDataset):
+    def __init__(self, directory, config, mode='train'):
+        super().__init__(directory, config, mode=mode, bc_mask_value=0.0)
 
 def collate_episodes(batch):
     keys = batch[0].keys()
@@ -477,16 +491,21 @@ def joint_train(config):
     )
     print(f"Logging to {logdir}")
 
+    # --- Setup Datasets & Dataloaders ---
+    total_batch_size = config.batch_size
+    expert_batch_size = int(round(total_batch_size * config.expert_data_fraction))
+    play_batch_size = total_batch_size - expert_batch_size
+
     train_dataset = JointDataset(config.offline_traindir, config, mode='train')
     train_loader = DataLoader(
-        train_dataset, batch_size=config.batch_size, shuffle=True, 
+        train_dataset, batch_size=expert_batch_size, shuffle=True, 
         num_workers=config.num_workers, collate_fn=collate_episodes, 
         pin_memory=True, drop_last=True
     )
-    
+
     eval_dataset = JointDataset(config.offline_evaldir, config, mode='eval')
     eval_loader = DataLoader(
-        eval_dataset, batch_size=config.batch_size, shuffle=False, 
+        eval_dataset, batch_size=total_batch_size, shuffle=False, 
         num_workers=0, collate_fn=collate_episodes, pin_memory=True
     )
     
@@ -494,6 +513,30 @@ def joint_train(config):
         while True:
             for b in loader: yield b
     train_iter = cycle(train_loader)
+
+    play_iter = None
+    play_dir = getattr(config, 'offline_playdir', None)
+    if play_dir:
+        play_dataset = PlayDataDataset(play_dir, config, mode='train')
+        if play_dataset.num_episodes > 0 and len(play_dataset) > 0:
+            play_loader = DataLoader(
+                play_dataset, batch_size=play_batch_size, shuffle=True,
+                num_workers=config.num_workers, collate_fn=collate_episodes,
+                pin_memory=True, drop_last=True
+            )
+            play_iter = cycle(play_loader)
+        else:
+            print("PlayData dataset is empty; skipping PlayData in training.")
+
+    def concat_batches(a, b):
+        if a.keys() != b.keys():
+            missing_a = b.keys() - a.keys()
+            missing_b = a.keys() - b.keys()
+            raise KeyError(
+                f"Batch keys mismatch. Missing in a: {sorted(missing_a)} "
+                f"Missing in b: {sorted(missing_b)}"
+            )
+        return {k: np.concatenate([a[k], b[k]], axis=0) for k in a.keys()}
 
     print("Inferring Observation Space...")
     sample_ep = train_dataset.episode_list[0]
@@ -555,8 +598,10 @@ def joint_train(config):
     try:
         # Create envs once
         for _ in range(config.num_envs):
-            worker = EnvWorker(env_config, image_hw)
-            eval_envs.append(Parallel(worker, "process"))
+            # Create envs inside the worker process; avoid pickling live ctypes objects.
+            eval_envs.append(
+                Parallel(lambda cfg=env_config, hw=image_hw: EnvWorker(cfg, hw), "process")
+            )
 
         print("Starting Joint Training...")
         step = 0
@@ -566,6 +611,9 @@ def joint_train(config):
             policy.train()
             
             raw_batch = next(train_iter)
+            if play_iter is not None:
+                raw_play = next(play_iter)
+                raw_batch = concat_batches(raw_batch, raw_play)
             
             # 1. WM Branch
             data_wm = raw_batch.copy()
@@ -606,10 +654,16 @@ def joint_train(config):
             post_bc, _ = wm.dynamics.observe(embed_bc, data_bc['action'], data_bc['is_first'])
             feat_bc = wm.dynamics.get_feat(post_bc)
             
-            # --- BC Loss (Raw MSE) ---
+            # --- BC Loss (Masked MSE; only joint data updates BC) ---
             target = torch.tensor(raw_batch['policy_target'], device=config.device, dtype=torch.float32)
             pred_action = policy(feat_bc)
-            bc_loss = F.mse_loss(pred_action, target)
+            per_step_mse = ((pred_action - target) ** 2).mean(dim=-1)
+            bc_mask = torch.tensor(raw_batch['bc_mask'], device=config.device, dtype=torch.float32)
+            bc_mask_sum = bc_mask.sum()
+            if bc_mask_sum > 0:
+                bc_loss = (per_step_mse * bc_mask).sum() / bc_mask_sum
+            else:
+                bc_loss = torch.tensor(0.0, device=config.device)
             
             # 5. Optimization
             total_loss = (config.wm_loss_scale * wm_loss) + (config.bc_loss_scale * bc_loss)
