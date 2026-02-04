@@ -23,7 +23,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import tools
 from models import WorldModel
-from joint_train import _define_spaces, ActionMLP
+from joint_train import ActionMLP
 from joint_model import joint_model
 from evals.EvalEnvWorker import EvalEnvWorker
 from evals.EvalDataset import EvalDataset
@@ -156,7 +156,7 @@ def _load_models(config):
     if not episodes:
         raise RuntimeError(f"No episodes found in {config.offline_evaldir} for space inference.")
     sample_ep = next(iter(episodes.values()))
-    obs_space, act_space = _define_spaces(sample_ep, config)
+    obs_space, act_space = tools._define_spaces(sample_ep, config)
     config.num_actions = act_space.shape[0]
 
     wm = WorldModel(obs_space, act_space, 0, config).to(config.device)
@@ -172,7 +172,8 @@ def _load_models(config):
         units=1024,
         act=config.act,
         norm=config.norm,
-    ).to(config.device)
+        device=config.device,
+    )
 
     ckpt_path = pathlib.Path(config.checkpoint).expanduser()
     if not ckpt_path.exists():

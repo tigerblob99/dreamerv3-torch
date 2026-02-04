@@ -398,7 +398,7 @@ joint_train:
   
   # --- Loss Scales ---
   wm_loss_scale: 0.01        # Scale for World Model loss (Recon + KL + Reward)
-  bc_loss_scale: 100.0        # Scale for Behavior Cloning loss
+  bc_loss_scale: 1.0        # Scale for Behavior Cloning loss
   
   # --- Data Augmentation (Dual Cropping) ---
   image_crop_height: 84     # Target crop height (from 84x84 source)

@@ -15,6 +15,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch import distributions as torchd
 from torch.utils.tensorboard import SummaryWriter
+import gym
 
 
 to_np = lambda x: x.detach().cpu().numpy()
@@ -355,6 +356,61 @@ def save_episodes(directory, episodes):
             with filename.open("wb") as f2:
                 f2.write(f1.read())
     return True
+
+
+def _define_spaces(episode, config):
+    """Constructs observation space by filtering episode keys against config regex."""
+    exclude_keys = {
+        "action",
+        "reward",
+        "discount",
+        "is_first",
+        "is_terminal",
+        "policy_target",
+    }
+    obs_spaces = {}
+    mlp_pat = config.encoder.get("mlp_keys", "$^")
+    cnn_pat = config.encoder.get("cnn_keys", "$^")
+
+    for key, value in episode.items():
+        if key in exclude_keys:
+            continue
+
+        is_mlp = re.match(mlp_pat, key)
+        is_cnn = re.match(cnn_pat, key)
+        if not (is_mlp or is_cnn):
+            continue
+
+        shape = value.shape[1:]
+        if is_cnn:
+            h = config.image_crop_height
+            w = config.image_crop_width
+            if h > 0 and w > 0:
+                shape = (h, w, shape[-1])
+
+        if value.dtype == np.uint8:
+            low, high = 0, 255
+            dtype = np.uint8
+        else:
+            low, high = -np.inf, np.inf
+            dtype = np.float32
+
+        obs_spaces[key] = gym.spaces.Box(low=low, high=high, shape=shape, dtype=dtype)
+
+    if not obs_spaces:
+        raise ValueError("No keys matched config.encoder regex!")
+
+    obs_space = gym.spaces.Dict(obs_spaces)
+    action = episode.get("action")
+    if action is None:
+        raise ValueError("Episode missing 'action'.")
+    # TODO: This is specific to robosuite environments.
+    # For more general environments, this should be configurable.
+    act_space = gym.spaces.Box(
+        low=-1.0, high=1.0, shape=action.shape[1:], dtype=np.float32
+    )
+
+    return obs_space, act_space
 
 
 def from_generator(generator, batch_size):
@@ -702,13 +758,15 @@ class ContDist:
     def mode(self):
         out = self._dist.mean
         if self.absmax is not None:
-            out *= (self.absmax / torch.clip(torch.abs(out), min=self.absmax)).detach()
+            scale = (self.absmax / torch.clip(torch.abs(out), min=self.absmax)).detach()
+            out = out * scale
         return out
 
     def sample(self, sample_shape=()):
         out = self._dist.rsample(sample_shape)
         if self.absmax is not None:
-            out *= (self.absmax / torch.clip(torch.abs(out), min=self.absmax)).detach()
+            scale = (self.absmax / torch.clip(torch.abs(out), min=self.absmax)).detach()
+            out = out * scale
         return out
 
     def log_prob(self, x):

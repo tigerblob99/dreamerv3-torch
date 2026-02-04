@@ -27,7 +27,7 @@ from parallel import Parallel
 
 # Import helpers from joint_train with a defensive fallback
 
-from joint_train import _define_spaces, ActionMLP, EnvWorker, evaluate_online
+from joint_train import ActionMLP, EnvWorker, evaluate_online
 
 
 # Optional env-config loader (used in joint_train and BC_Sweep)
@@ -138,7 +138,7 @@ def _load_models(config):
     if not episodes:
         raise RuntimeError(f"No episodes found in {config.offline_traindir} for space inference.")
     sample_ep = next(iter(episodes.values()))
-    obs_space, act_space = _define_spaces(sample_ep, config)
+    obs_space, act_space = tools._define_spaces(sample_ep, config)
     config.num_actions = act_space.shape[0]
 
     wm = WorldModel(obs_space, act_space, 0, config).to(config.device)
@@ -154,7 +154,8 @@ def _load_models(config):
         units=1024,
         act=config.act,
         norm=config.norm,
-    ).to(config.device)
+        device=config.device,
+    )
 
     ckpt_path = pathlib.Path(config.checkpoint).expanduser()
     if not ckpt_path.exists():

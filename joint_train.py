@@ -18,6 +18,7 @@ from types import SimpleNamespace
 sys.path.append(str(pathlib.Path(__file__).parent.parent))
 
 import tools
+import networks
 from models import WorldModel
 import wandb
 
@@ -46,74 +47,57 @@ _EXCLUDE_KEYS = {"action", "reward", "discount", "is_first", "is_terminal", "pol
 def to_np(tensor):
     return tensor.detach().cpu().numpy()
 
-# --- Custom Action MLP (Raw Output) ---
+# --- Custom Action MLP (Distribution Wrapper) ---
 class ActionMLP(nn.Module):
-    def __init__(self, inp_dim, shape, layers=4, units=1024, act="SiLU", norm=False):
+    def __init__(
+        self,
+        inp_dim,
+        shape,
+        layers=4,
+        units=1024,
+        act="SiLU",
+        norm=False,
+        dist="normal",
+        std="learned",
+        min_std=0.1,
+        max_std=1.0,
+        absmax=1.0,
+        temp=0.1,
+        unimix_ratio=0.01,
+        outscale=1.0,
+        symlog_inputs=False,
+        device="cpu",
+    ):
         super().__init__()
-        act_cls = getattr(torch.nn, act)
-        out_dim = shape[0]
-        
-        net_layers = []
-        last_dim = inp_dim
-        
-        for _ in range(layers):
-            net_layers.append(nn.Linear(last_dim, units, bias=False))
-            if norm:
-                net_layers.append(nn.LayerNorm(units, eps=1e-03))
-            net_layers.append(act_cls())
-            last_dim = units
-            
-        net_layers.append(nn.Linear(last_dim, out_dim))
-        self.net = nn.Sequential(*net_layers)
-        
-        # Weight Init
-        self.apply(tools.weight_init)
+        self._mlp = networks.MLP(
+            inp_dim,
+            shape,
+            layers,
+            units,
+            act,
+            norm,
+            dist,
+            std,
+            min_std,
+            max_std,
+            absmax=absmax,
+            temp=temp,
+            unimix_ratio=unimix_ratio,
+            outscale=outscale,
+            symlog_inputs=symlog_inputs,
+            device=device,
+            name="ActionMLP",
+        )
+        if device is not None:
+            self.to(device)
 
-    def forward(self, features):
-        return self.net(features)
-
-# --- Config & Space Utilities ---
-
-def _define_spaces(episode, config):
-    """Constructs observation space by filtering episode keys against config regex."""
-    obs_spaces = {}
-    mlp_pat = config.encoder.get('mlp_keys', '$^')
-    cnn_pat = config.encoder.get('cnn_keys', '$^')
-    
-    for key, value in episode.items():
-        if key in _EXCLUDE_KEYS: continue
-        
-        is_mlp = re.match(mlp_pat, key)
-        is_cnn = re.match(cnn_pat, key)
-        if not (is_mlp or is_cnn): continue
-        
-        shape = value.shape[1:]
-        if is_cnn:
-            h = config.image_crop_height
-            w = config.image_crop_width
-            if h > 0 and w > 0:
-                shape = (h, w, shape[-1])
-        
-        if value.dtype == np.uint8:
-            low, high = 0, 255
-            dtype = np.uint8
-        else:
-            low, high = -np.inf, np.inf
-            dtype = np.float32
-            
-        obs_spaces[key] = gym.spaces.Box(low=low, high=high, shape=shape, dtype=dtype)
-            
-    if not obs_spaces:
-        raise ValueError("No keys matched config.encoder regex!")
-    
-    obs_space = gym.spaces.Dict(obs_spaces)
-    action = episode.get("action")
-    if action is None: raise ValueError("Episode missing 'action'.")
-    # TODO: This is specific to robosuite environments.
-    # For more general environments, this should be configurable.
-    act_space = gym.spaces.Box(low=-1.0, high=1.0, shape=action.shape[1:], dtype=np.float32)
-    
-    return obs_space, act_space
+    def forward(self, features, return_dist=False, sample=False):
+        dist = self._mlp(features)
+        if return_dist:
+            return dist
+        if sample:
+            return dist.sample()
+        return dist.mode()
 
 # --- Dataset ---
 
@@ -540,7 +524,7 @@ def joint_train(config):
 
     print("Inferring Observation Space...")
     sample_ep = train_dataset.episode_list[0]
-    obs_space, act_space = _define_spaces(sample_ep, config)
+    obs_space, act_space = tools._define_spaces(sample_ep, config)
     config.num_actions = act_space.shape[0]
     
     wm = WorldModel(obs_space, act_space, 0, config).to(config.device)
@@ -554,9 +538,12 @@ def joint_train(config):
     policy = ActionMLP(
         inp_dim=feat_size,
         shape=(config.num_actions,),
-        layers=4,
-        units=1024, act=config.act, norm=config.norm
-    ).to(config.device)
+        layers=config.mlp_layers,
+        units=1024,
+        act=config.act,
+        norm=config.norm,
+        device=config.device,
+    )
     
     # Print Param Count for Sanity Check
     print(f"--- Parameter Check ---")
@@ -603,7 +590,7 @@ def joint_train(config):
                 Parallel(lambda cfg=env_config, hw=image_hw: EnvWorker(cfg, hw), "process")
             )
 
-        print("Starting Joint Training...")
+        print("Starting Joint Pretraining...")
         step = 0
         
         for _ in range(int(config.steps)):
@@ -705,7 +692,7 @@ def joint_train(config):
                     'optimizer': optimizer.state_dict()
                 }, logdir / f"step_{step}.pt")
 
-        print("Training Finished.")
+        print("Pretraining Finished.")
     
     finally:
         print("Closing Eval Envs...")
