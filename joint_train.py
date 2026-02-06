@@ -196,7 +196,7 @@ class JointDataset(Dataset):
 
             current_len += take
 
-        return {k: np.concatenate(v, axis=0) for k, v in collected.items()}
+        return {k: torch.from_numpy(np.concatenate(v, axis=0)) for k, v in collected.items()}
 
 class PlayDataDataset(JointDataset):
     def __init__(self, directory, config, mode='train'):
@@ -204,10 +204,7 @@ class PlayDataDataset(JointDataset):
 
 def collate_episodes(batch):
     keys = batch[0].keys()
-    res = {}
-    for k in keys:
-        res[k] = np.stack([b[k] for b in batch], axis=0)
-    return res
+    return {k: torch.stack([b[k] for b in batch], dim=0) for k in keys}
 
 # --- Evaluation Functions ---
 
@@ -520,7 +517,7 @@ def joint_train(config):
                 f"Batch keys mismatch. Missing in a: {sorted(missing_a)} "
                 f"Missing in b: {sorted(missing_b)}"
             )
-        return {k: np.concatenate([a[k], b[k]], axis=0) for k in a.keys()}
+        return {k: torch.cat([a[k], b[k]], dim=0) for k in a.keys()}
 
     print("Inferring Observation Space...")
     sample_ep = train_dataset.episode_list[0]

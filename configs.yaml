@@ -383,6 +383,10 @@ joint_train:
   mlp_layers: 4          # Number of MLP layers for policy and value networks
   act: 'SiLU'              # Activation function
   norm: True               # Use layer normalization
+  actor:
+      {layers: 4, dist: 'normal', entropy: 3e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+  critic:
+      {layers: 4, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
 
   # --- Training Loop ---
   steps: 80000             # Total training steps
@@ -395,6 +399,9 @@ joint_train:
   grad_clip: 100.0          # Gradient clipping norm
   log_every: 100          # Logging frequency (steps)
   save_every: 10000
+
+  rl_critic_pretrain_steps: 1000
+  rl_critic_pretrain_log_every: 100
   
   # --- Loss Scales ---
   wm_loss_scale: 0.01        # Scale for World Model loss (Recon + KL + Reward)

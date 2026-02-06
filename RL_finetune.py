@@ -4,7 +4,6 @@ import argparse
 import os
 import pathlib
 import sys
-import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -52,7 +51,6 @@ def _make_batch_iter(dataset, config):
         num_workers=int(getattr(config, "num_workers", 0)),
         collate_fn=collate_episodes,
         drop_last=True,
-        pin_memory=True,
     )
 
     while True:
@@ -190,7 +188,7 @@ def rl_finetune(config):
     if wandb is not None:
         try:
             run = wandb.init(
-                project=os.getenv("WANDB_PROJECT", "dreamerv3"),
+                project=os.getenv("WANDB_PROJECT", "RL_finetune"),
                 entity=os.getenv("WANDB_ENTITY"),
                 name=os.getenv("WANDB_NAME"),
                 config=vars(config),
@@ -265,6 +263,54 @@ def rl_finetune(config):
     save_every = int(getattr(config, "rl_save_every", config.save_every))
     eval_every = int(getattr(config, "rl_eval_every", getattr(config, "eval_every", 0)))
     eval_envs = _init_eval_envs(config)
+    pretrain_steps = int(getattr(config, "rl_critic_pretrain_steps", 0))
+    pretrain_log_every = int(
+        getattr(config, "rl_critic_pretrain_log_every", log_every)
+    )
+
+    if pretrain_steps > 0:
+        pretrain_step_offset = 0
+        actor.requires_grad_(False)
+        for pre_step in range(pretrain_steps):
+            raw_batch = next(batch_iter)
+            data_wm = wm.preprocess(dict(raw_batch))
+
+            with torch.no_grad():
+                with torch.amp.autocast(
+                    device_type=amp_device, enabled=use_amp, dtype=torch.float16
+                ):
+                    embed = wm.encoder(data_wm)
+                    post, _ = wm.dynamics.observe(
+                        embed, data_wm["action"], data_wm["is_first"]
+                    )
+                    expert_feat = wm.dynamics.get_feat(post)
+                    start_state = {k: v[:, 0] for k, v in post.items()}
+                    horizon = expert_feat.shape[1]
+                    if horizon_cfg > 0:
+                        horizon = min(horizon, horizon_cfg)
+                    expert_feat = expert_feat[:, :horizon]
+                    #agent_feat, agent_actions = _imagine_policy(
+                    #    wm, actor, start_state, horizon
+                    #)
+
+            if getattr(config, "gail_use_transitions", True) and horizon < 2:
+                raise ValueError("Need at least 2 steps for transition rewards.")
+
+            #rewards = reward_model(agent_feat, expert_feat)
+            rewards = reward_model(expert_feat, expert_feat)
+            critic_metrics = critic.update(expert_feat, rewards)
+
+            if pretrain_log_every > 0 and (pre_step % pretrain_log_every == 0):
+                logger.step = pretrain_step_offset + pre_step
+                metrics = {}
+                metrics.update({f"pretrain/{k}": v for k, v in critic_metrics.items()})
+                metrics["pretrain/reward_mean"] = float(rewards.mean().item())
+                metrics["pretrain/reward_std"] = float(rewards.std().item())
+                for name, value in metrics.items():
+                    logger.scalar(name, value)
+                logger.write(fps=False)
+
+        actor.requires_grad_(True)
 
     try:
         for step in range(total_steps):
@@ -302,7 +348,7 @@ def rl_finetune(config):
             )
 
             if log_every > 0 and (step % log_every == 0):
-                logger.step = step
+                logger.step = pretrain_steps + step
                 metrics = {}
                 metrics.update({f"train/{k}": v for k, v in critic_metrics.items()})
                 metrics.update({f"train/{k}": v for k, v in actor_metrics.items()})
@@ -319,6 +365,7 @@ def rl_finetune(config):
                 )
                 for name, value in online_metrics.items():
                     logger.scalar(name, value)
+                logger.step = pretrain_steps + step
                 logger.write(fps=False)
                 actor.train()
 
@@ -384,6 +431,10 @@ def _parse_config(argv=None):
     defaults.setdefault("rl_log_every", defaults.get("log_every", 1e4))
     defaults.setdefault("rl_save_every", defaults.get("save_every", 1e4))
     defaults.setdefault("rl_eval_every", defaults.get("eval_every", 0))
+    defaults.setdefault("rl_critic_pretrain_steps", 0)
+    defaults.setdefault(
+        "rl_critic_pretrain_log_every", defaults.get("rl_log_every", 1e4)
+    )
     defaults.setdefault("reward_model", "ditto")
     defaults.setdefault("reward_metric", "max_cos")
     defaults.setdefault("gail_hidden_dim", 256)
