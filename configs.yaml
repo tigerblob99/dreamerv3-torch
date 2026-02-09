@@ -384,7 +384,7 @@ joint_train:
   act: 'SiLU'              # Activation function
   norm: True               # Use layer normalization
   actor:
-      {layers: 4, dist: 'normal', entropy: 3e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+      {layers: 4, dist: 'normal', entropy: 5e-2, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
   critic:
       {layers: 4, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
 
@@ -400,11 +400,12 @@ joint_train:
   log_every: 100          # Logging frequency (steps)
   save_every: 10000
 
-  rl_critic_pretrain_steps: 1000
-  rl_critic_pretrain_log_every: 100
+  rl_critic_pretrain_steps: 3000
+  rl_critic_pretrain_log_every: 50
+  discount_lambda: 1.0  # No TD-lambda, pure Monte Carlo returns for critic 
   
   # --- Loss Scales ---
-  wm_loss_scale: 0.01        # Scale for World Model loss (Recon + KL + Reward)
+  wm_loss_scale: 0.1        # Scale for World Model loss (Recon + KL + Reward)
   bc_loss_scale: 1.0        # Scale for Behavior Cloning loss
   
   # --- Data Augmentation (Dual Cropping) ---
@@ -440,3 +441,65 @@ joint_train:
   # --- System ---
   num_workers: 0            # Keep at 0 for efficient in-memory dataset usage
   video_pred_log: False      # Log reconstruction and rollout videos to WandB
+
+rl_train:
+  # --- Online RL training with fresh on-policy env rollouts ---
+  # Uses frozen World-Model encoder + RSSM features.
+  # Per update: collect fresh data -> actor update -> critic update -> discard rollout.
+  logdir: logdir/rl_train
+  checkpoint: 'logdir/joint_Play_stoc_actr_2/step_50000.pt'  # Path to pre-trained Dreamer/joint checkpoint
+  expert_dir: 'datasets/robomimic_data_MV/can_PH_train'  # Directory with reference episodes to infer obs/act shapes
+
+  encoder: *robomimic_encoder
+  decoder: *robomimic_decoder
+
+  # --- Environment ---
+  robosuite_task: 'PickPlaceCan'
+  robosuite_reward_shaping: False  # Dense shaped reward (not sparse)
+  size: [84, 84]
+  num_collect_envs: 8       # Parallel envs for experience collection
+  num_eval_envs: 8          # Parallel envs for evaluation rollouts
+  max_env_steps: 500        # Horizon per episode
+  clip_actions: True        # Clip policy actions to [-1, 1]
+
+  # --- Observation keys (must match encoder config) ---
+  camera_obs_keys: [agentview_image, robot0_eye_in_hand_image]
+  flip_camera_keys: [agentview_image, robot0_eye_in_hand_image]
+  bc_cnn_keys_order: [image]
+  bc_mlp_keys_order:
+    - robot0_joint_pos
+    - robot0_joint_vel
+    - robot0_gripper_qpos
+    - robot0_gripper_qvel
+    - aux_robot0_joint_pos_sin
+    - aux_robot0_joint_pos_cos
+  aux_key_map:
+    aux_robot0_joint_pos_sin: robot0_joint_pos_sin
+    aux_robot0_joint_pos_cos: robot0_joint_pos_cos
+  image_crop_height: 84
+  image_crop_width: 84
+
+  # --- On-policy update schedule ---
+  rl_updates: 200           # Number of collect-train updates
+  collect_steps: 4000       # Fresh env steps collected per update
+  train_batches_per_collect: 8  # Gradient updates sampled from each fresh collection
+
+  # --- Training ---
+  policy_init: random   # checkpoint: load actor+WM, random: load WM only
+  batch_size: 64
+  mini_batch_size: 64       # Per-update sampled mini-batch size (<=0 uses batch_size)
+  batch_length: 64
+  model_lr: 1e-4
+  actor:
+    {layers: 4, dist: 'normal', entropy: 5e-2, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+  critic:
+    {layers: 4, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+  discount: 0.997
+  discount_lambda: 0.95
+
+  # --- Logging / Checkpoints ---
+  log_every: 10
+  eval_every: 5             # Evaluate every N updates (0 = off)
+  eval_episodes: 16         # Number of online eval episodes
+  save_every: 10            # Save checkpoint every N updates
+  video_pred_log: True       # Log open-loop reconstruction/prediction videos

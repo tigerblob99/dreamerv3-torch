@@ -8,7 +8,6 @@ import numpy as np
 import ruamel.yaml as yaml
 import torch
 from torch import nn
-from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
 import gym
 from collections import defaultdict
@@ -35,7 +34,7 @@ from bc_mlp.BC_MLP_eval import (
 
 from BC_Sweep import _load_env_block
 
-""""python joint_train.py --configs joint_train robomimic --offline_traindir datasets/robomimic_data_MV/can_PH_train --offline_evaldir datasets/robomimic_data_MV/can_PH_eval --offline_playdir datasets/robomimic_data_MV/can_MH_train --logdir logdir/joint_Play_1 --env_config can_env_eval"""
+""""python joint_train.py --configs joint_train robomimic --offline_traindir datasets/robomimic_data_MV/can_PH_train --offline_evaldir datasets/robomimic_data_MV/can_PH_eval --offline_playdir datasets/robomimic_data_MV/can_MH_train --logdir logdir/joint_Play_stoc_actr_2 --env_config can_env_eval"""
 
 """docker exec -it -w /workspace/dreamerv3-torch/dreamerv3-torch pytorch_dev_cu130 \
   bash -lc 'python joint_train.py --configs joint_train robomimic --offline_traindir datasets/robomimic_data_MV/can_PH_train --offline_evaldir datasets/robomimic_data_MV/can_PH_eval --offline_playdir datasets/robomimic_data_MV/can_MH_train --logdir logdir/joint_Play_1 --env_config can_env_eval 2>&1 | tee /workspace/eval.log'
@@ -250,10 +249,10 @@ def evaluate_offline(wm, policy, eval_loader, config, step):
             post_bc, _ = wm.dynamics.observe(embed_bc, data_bc['action'], data_bc['is_first'])
             feat_bc = wm.dynamics.get_feat(post_bc)
             
-            # --- BC Loss (MSE) ---
+            # --- BC Loss (negative log-likelihood) ---
             target = torch.tensor(raw_batch['policy_target'], device=config.device, dtype=torch.float32)
-            pred_action = policy(feat_bc)
-            bc_loss = F.mse_loss(pred_action, target)
+            pred_dist = policy(feat_bc, return_dist=True)
+            bc_loss = (-pred_dist.log_prob(target)).mean()
             metrics['eval/bc_loss'].append(bc_loss.item())
 
     agg_metrics = {k: np.mean(v) for k, v in metrics.items()}
@@ -638,14 +637,14 @@ def joint_train(config):
             post_bc, _ = wm.dynamics.observe(embed_bc, data_bc['action'], data_bc['is_first'])
             feat_bc = wm.dynamics.get_feat(post_bc)
             
-            # --- BC Loss (Masked MSE; only joint data updates BC) ---
+            # --- BC Loss (masked negative log-likelihood; only joint data updates BC) ---
             target = torch.tensor(raw_batch['policy_target'], device=config.device, dtype=torch.float32)
-            pred_action = policy(feat_bc)
-            per_step_mse = ((pred_action - target) ** 2).mean(dim=-1)
+            pred_dist = policy(feat_bc, return_dist=True)
+            per_step_nll = -pred_dist.log_prob(target)
             bc_mask = torch.tensor(raw_batch['bc_mask'], device=config.device, dtype=torch.float32)
             bc_mask_sum = bc_mask.sum()
             if bc_mask_sum > 0:
-                bc_loss = (per_step_mse * bc_mask).sum() / bc_mask_sum
+                bc_loss = (per_step_nll * bc_mask).sum() / bc_mask_sum
             else:
                 bc_loss = torch.tensor(0.0, device=config.device)
             

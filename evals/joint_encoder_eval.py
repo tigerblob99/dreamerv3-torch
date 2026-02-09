@@ -3,7 +3,7 @@ python evals/joint_encoder_eval.py \
   --configs joint_train \
   --env_config can_env_eval \
   --offline_traindir ./datasets/robomimic_data_MV/can_PH_train \
-  --checkpoint /workspace/dreamerv3-torch/dreamerv3-torch/logdir/joint_run_04/latest.pt \
+  --checkpoint /workspace/dreamerv3-torch/dreamerv3-torch/logdir/joint_Play_stoc_actr_2/step_50000.pt \
   --eval_episodes 500 \
   --num_envs 20
 """
@@ -196,8 +196,10 @@ def _build_envs(config):
 
     envs = []
     for _ in range(config.num_envs):
-        worker = EnvWorker(env_cfg, image_hw)
-        envs.append(Parallel(worker, "process"))
+        # Build env workers inside each subprocess to avoid pickling simulator ctypes state.
+        envs.append(
+            Parallel(lambda cfg=env_cfg, hw=image_hw: EnvWorker(cfg, hw), "process")
+        )
     return envs
 
 

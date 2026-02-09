@@ -14,36 +14,19 @@ from torch.utils.data import DataLoader
 import tools
 from AC_RL.actor import Actor
 from AC_RL.critic import Critic
+from AC_RL.RlDataset import RlDataset
 from models import WorldModel
-from joint_train import JointDataset, collate_episodes, EnvWorker, evaluate_online
+from joint_train import collate_episodes, EnvWorker, evaluate_online
 from parallel import Parallel
 from rewards.DITTO import DittoReward
 from rewards.Gail import GailReward
 
-try:
-    import wandb
-except ImportError:
-    wandb = None
-
-
-def _ensure_flags(batch):
-    sample = next(iter(batch.values()))
-    if sample.ndim < 2:
-        raise ValueError("Batch samples must be at least 2D (B, T, ...).")
-    batch = dict(batch)
-    b, t = sample.shape[:2]
-    if "is_first" not in batch:
-        is_first = np.zeros((b, t), dtype=bool)
-        is_first[:, 0] = True
-        batch["is_first"] = is_first
-    if "is_terminal" not in batch:
-        batch["is_terminal"] = np.zeros((b, t), dtype=bool)
-    return batch
+import wandb
 
 
 def _make_batch_iter(dataset, config):
     if dataset.num_episodes == 0:
-        raise RuntimeError("JointDataset is empty.")
+        raise RuntimeError("RlDataset is empty.")
     loader = DataLoader(
         dataset,
         batch_size=int(config.batch_size),
@@ -55,14 +38,7 @@ def _make_batch_iter(dataset, config):
 
     while True:
         for batch in loader:
-            batch = dict(batch)
-            if "image_wm" in batch:
-                batch["image"] = batch.pop("image_wm")
-                batch.pop("image_bc", None)
-                batch.pop("policy_target", None)
-                batch.pop("bc_mask", None)
-            batch = _ensure_flags(batch)
-            yield batch
+            yield dict(batch)
 
 
 def _build_reward_model(config, feat_size):
@@ -205,7 +181,7 @@ def rl_finetune(config):
     if not expert_dir:
         raise ValueError("expert_dir or offline_traindir must be provided.")
 
-    train_dataset = JointDataset(expert_dir, config, mode="train")
+    train_dataset = RlDataset(expert_dir, config, mode="train")
     if train_dataset.num_episodes == 0:
         raise RuntimeError(f"No episodes found in {expert_dir}.")
     episodes = train_dataset.episodes
@@ -289,16 +265,17 @@ def rl_finetune(config):
                     if horizon_cfg > 0:
                         horizon = min(horizon, horizon_cfg)
                     expert_feat = expert_feat[:, :horizon]
-                    #agent_feat, agent_actions = _imagine_policy(
-                    #    wm, actor, start_state, horizon
-                    #)
+                    agent_feat, agent_actions = _imagine_policy(
+                        wm, actor, start_state, horizon
+                    )
 
             if getattr(config, "gail_use_transitions", True) and horizon < 2:
                 raise ValueError("Need at least 2 steps for transition rewards.")
 
-            #rewards = reward_model(agent_feat, expert_feat)
-            rewards = reward_model(expert_feat, expert_feat)
-            critic_metrics = critic.update(expert_feat, rewards)
+            rewards = reward_model(agent_feat, expert_feat)
+            #rewards = reward_model(expert_feat, expert_feat)
+            #critic_metrics = critic.update(expert_feat, rewards)
+            critic_metrics = critic.update(agent_feat, rewards)
 
             if pretrain_log_every > 0 and (pre_step % pretrain_log_every == 0):
                 logger.step = pretrain_step_offset + pre_step
