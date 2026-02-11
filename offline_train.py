@@ -289,6 +289,16 @@ def _setup_config(config):
     config.image_crop_height = int(getattr(config, "image_crop_height", 0) or 0)
     config.image_crop_width = int(getattr(config, "image_crop_width", 0) or 0)
     config.image_crop_random = bool(getattr(config, "image_crop_random", False))
+    config.dataset_backend = str(getattr(config, "dataset_backend", "cpu")).lower()
+    config.dataset_gpu_fallback = str(
+        getattr(config, "dataset_gpu_fallback", "hybrid")
+    ).lower()
+    config.dataset_store_image_dtype = str(
+        getattr(config, "dataset_store_image_dtype", "uint8")
+    )
+    config.dataset_store_float_dtype = str(
+        getattr(config, "dataset_store_float_dtype", "float32")
+    )
     preserve_lengths = bool(getattr(config, "offline_eval_preserve_length", False))
     config.offline_eval_preserve_length = preserve_lengths
     if getattr(config, "eval_only", False) and config.offline_eval_batches <= 0 and not preserve_lengths:
@@ -401,6 +411,16 @@ def offline_train(config):
     train_eps = tools.load_episodes(config.offline_traindir, limit=config.dataset_size)
     if not train_eps:
         raise RuntimeError(f"No episodes found in {config.offline_traindir}.")
+    train_transitions = sum(max(0, len(ep["reward"]) - 1) for ep in train_eps.values())
+    print(
+        "[startup] offline dataset backend="
+        f"{config.dataset_backend}, gpu_fallback={config.dataset_gpu_fallback}, "
+        f"store_image_dtype={config.dataset_store_image_dtype}, "
+        f"store_float_dtype={config.dataset_store_float_dtype}"
+    )
+    print(
+        f"[startup] loaded offline train episodes={len(train_eps)}, transitions={train_transitions}"
+    )
     if getattr(config, "image_standardize", False) and getattr(
         config, "image_standardize_dataset", False
     ):
@@ -414,6 +434,7 @@ def offline_train(config):
         eval_eps = tools.load_episodes(config.offline_evaldir)
     else:
         eval_eps = train_eps
+    eval_shares_train = eval_eps is train_eps
     
     # FIX: Removed the call to _maybe_crop_episodes here, as it was destructive.
 
@@ -421,7 +442,38 @@ def offline_train(config):
     obs_space, act_space = _infer_spaces(first_episode, config)
     config.num_actions = getattr(act_space, "n", act_space.shape[0])
 
-    train_dataset = None if config.eval_only else make_dataset(train_eps, config)
+    train_store = None
+    if (not config.eval_only) and config.dataset_backend == "gpu":
+        if config.dataset_gpu_fallback == "hybrid":
+            train_store = tools.HybridReplayStore(config, name="offline_replay")
+        elif config.dataset_gpu_fallback in ("none", "gpu", "strict"):
+            train_store = tools.GpuReplayStore(config, name="offline_replay")
+        else:
+            raise ValueError(
+                f"Unsupported dataset_gpu_fallback: {config.dataset_gpu_fallback}"
+            )
+        for episode_id, episode in train_eps.items():
+            train_store.add_episode(episode_id, episode)
+        train_store.evict_to_limit(config.dataset_size)
+        stats = train_store.stats()
+        print(
+            "[startup] offline replay store "
+            f"gpu_eps={stats['replay_gpu_episodes']} "
+            f"spill_eps={stats['replay_spill_episodes']} "
+            f"gpu_transitions={stats['replay_gpu_transitions']} "
+            f"spill_transitions={stats['replay_spill_transitions']} "
+            f"oom_fallbacks={stats['replay_oom_fallbacks']}"
+        )
+        if not eval_shares_train:
+            train_eps.clear()
+        train_dataset = make_dataset(
+            train_store,
+            batch_size=config.batch_size,
+            batch_length=config.batch_length,
+        )
+    else:
+        print("[startup] offline using CPU episode dataset (original replay path).")
+        train_dataset = None if config.eval_only else make_dataset(train_eps, config)
     
     # FIX: Added the missing eval_dataset definition here
     eval_dataset = _make_eval_dataset(eval_eps, config)
@@ -496,6 +548,11 @@ def offline_train(config):
                     continue
                 logger.scalar(name, float(np.mean(values)))
                 agent._metrics[name] = []
+            if train_store is not None:
+                stats = train_store.stats()
+                for name, value in stats.items():
+                    logger.scalar(name, float(value))
+                logger.scalar("dataset_size", float(len(train_store)))
             if config.video_pred_log:
                 try:
                     video_pred = agent._wm.video_pred(next(eval_dataset))
@@ -576,6 +633,10 @@ if __name__ == "__main__":
     defaults.setdefault("image_crop_height", 0)
     defaults.setdefault("image_crop_width", 0)
     defaults.setdefault("image_crop_random", False)
+    defaults.setdefault("dataset_backend", "cpu")
+    defaults.setdefault("dataset_gpu_fallback", "hybrid")
+    defaults.setdefault("dataset_store_image_dtype", "uint8")
+    defaults.setdefault("dataset_store_float_dtype", "float32")
 
     parser = argparse.ArgumentParser()
     for key, value in sorted(defaults.items(), key=lambda x: x[0]):

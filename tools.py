@@ -83,9 +83,10 @@ class Logger:
     def video(self, name, value):
         self._videos[name] = self._prepare_video_array(value)
 
-    def write(self, fps=False, step=False):
-        if not step:
+    def write(self, fps=False, step=None):
+        if step is None:
             step = self.step
+        step = int(step)
         scalars = list(self._scalars.items())
         if fps:
             scalars.append(("fps", self._compute_fps(step)))
@@ -115,7 +116,13 @@ class Logger:
 
         self._writer.flush()
         if wandb_payload:
+            wandb_payload.setdefault("env_step", step)
             self._wandb_run.log(wandb_payload, step=step)
+            # Keep wandb's internal global step aligned to env steps for hooks like wandb.watch.
+            try:
+                self._wandb_run.step = step
+            except Exception:
+                pass
         self._scalars = {}
         self._images = {}
         self._videos = {}
@@ -134,17 +141,27 @@ class Logger:
     def offline_scalar(self, name, value, step):
         self._writer.add_scalar("scalars/" + name, value, step)
         if self._wandb_ready():
-            self._wandb_run.log({name: float(value)}, step=step)
+            step = int(step)
+            self._wandb_run.log({name: float(value), "env_step": step}, step=step)
+            try:
+                self._wandb_run.step = step
+            except Exception:
+                pass
 
     def offline_video(self, name, value, step):
         value = self._prepare_video_array(value)
         writer_video, wandb_video = self._format_video_for_logging(value)
         self._writer.add_video(name, writer_video, step, 16)
         if self._wandb_ready():
+            step = int(step)
             self._wandb_run.log(
                 {name: self._wandb_module.Video(wandb_video, fps=16, format="mp4")},
                 step=step,
             )
+            try:
+                self._wandb_run.step = step
+            except Exception:
+                pass
 
     def _prepare_video_array(self, value):
         value = np.array(value)
@@ -177,6 +194,336 @@ class Logger:
         return self._wandb_module is not None and self._wandb_run is not None
 
 
+def _as_clean_episode_arrays(episode):
+    clean = {}
+    for key, value in episode.items():
+        if key.startswith("log_"):
+            continue
+        arr = np.asarray(value)
+        if arr.ndim == 0:
+            arr = arr[None]
+        clean[key] = arr
+    if not clean:
+        return None
+    steps = next(iter(clean.values())).shape[0]
+    if steps < 2:
+        return None
+    for key, value in clean.items():
+        if value.shape[0] != steps:
+            raise ValueError(f"Inconsistent episode length for key '{key}'.")
+    return clean
+
+
+def _episode_signature(episode):
+    keys = []
+    for key, value in episode.items():
+        arr = np.asarray(value)
+        keys.append((key, arr.shape[1:], arr.dtype.str))
+    return tuple(sorted(keys))
+
+
+def _parse_store_float_dtype(name):
+    mapping = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "half": torch.float16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "float64": torch.float64,
+        "fp64": torch.float64,
+        "double": torch.float64,
+    }
+    key = str(name).lower()
+    if key not in mapping:
+        raise ValueError(f"Unsupported dataset_store_float_dtype: {name}")
+    return mapping[key]
+
+
+class ReplayStoreDataset:
+    def __init__(self, replay_store, batch_size, batch_length, device=None):
+        self._store = replay_store
+        self._batch_size = int(batch_size)
+        self._batch_length = int(batch_length)
+        self._device = device
+        if self._batch_size <= 0:
+            raise ValueError(f"batch_size must be positive; got {batch_size}.")
+        if self._batch_length <= 0:
+            raise ValueError(f"batch_length must be positive; got {batch_length}.")
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self._store.sample_batch(
+            self._batch_size, self._batch_length, device=self._device
+        )
+
+
+class _BaseReplayStore:
+    def __init__(self, config, name, allow_cpu_fallback):
+        self._name = str(name)
+        self._allow_cpu_fallback = bool(allow_cpu_fallback)
+        self._episodes = collections.OrderedDict()
+        self._ref_signature = None
+        self._warned_incompatible = False
+        self._rng = np.random.RandomState(int(getattr(config, "seed", 0)))
+        self._dataset_limit = int(getattr(config, "dataset_size", 0) or 0)
+        self._oom_fallbacks = 0
+        self._last_sample_ms = 0.0
+        self._last_spill_copy_ms = 0.0
+
+        self._store_float_dtype = _parse_store_float_dtype(
+            getattr(config, "dataset_store_float_dtype", "float32")
+        )
+        store_image_dtype = str(
+            getattr(config, "dataset_store_image_dtype", "uint8")
+        ).lower()
+        if store_image_dtype != "uint8":
+            raise ValueError(
+                "Only dataset_store_image_dtype='uint8' is supported for replay store."
+            )
+        self._store_image_dtype = torch.uint8
+
+        self._gpu_device = torch.device(getattr(config, "device", "cuda:0"))
+        self._gpu_enabled = (
+            self._gpu_device.type == "cuda" and torch.cuda.is_available()
+        )
+        if not self._gpu_enabled and not self._allow_cpu_fallback:
+            raise ValueError(
+                f"{self.__class__.__name__} requires CUDA device in config.device."
+            )
+        if not self._gpu_enabled and self._allow_cpu_fallback:
+            print(
+                f"[{self.__class__.__name__}] CUDA unavailable; storing all data in CPU spill."
+            )
+
+        self._gpu_transitions = 0
+        self._spill_transitions = 0
+        self._gpu_bytes = 0
+        self._spill_bytes = 0
+
+    @staticmethod
+    def _is_oom_error(err):
+        return "out of memory" in str(err).lower()
+
+    @staticmethod
+    def _tensor_nbytes(tensor):
+        return int(tensor.numel() * tensor.element_size())
+
+    def _storage_dtype_for(self, key, arr):
+        if key == "image":
+            return self._store_image_dtype
+        if key in ("is_first", "is_terminal"):
+            return torch.bool
+        if np.issubdtype(arr.dtype, np.bool_):
+            return torch.bool
+        if np.issubdtype(arr.dtype, np.floating):
+            return self._store_float_dtype
+        if np.issubdtype(arr.dtype, np.integer):
+            return self._store_float_dtype
+        raise NotImplementedError(f"Unsupported dtype for key '{key}': {arr.dtype}")
+
+    def _tensorize_episode(self, episode, device):
+        tensors = {}
+        nbytes = 0
+        for key, arr in episode.items():
+            dtype = self._storage_dtype_for(key, arr)
+            tensor = torch.as_tensor(arr, dtype=dtype)
+            if device is not None:
+                tensor = tensor.to(device=device, non_blocking=False)
+            tensors[key] = tensor
+            nbytes += self._tensor_nbytes(tensor)
+        return tensors, nbytes
+
+    def _prepare_episode(self, episode):
+        clean = _as_clean_episode_arrays(episode)
+        if clean is None:
+            return None
+        sig = _episode_signature(clean)
+        if self._ref_signature is None:
+            self._ref_signature = sig
+        elif sig != self._ref_signature:
+            if not self._warned_incompatible:
+                print(
+                    f"[{self.__class__.__name__}] Dropping incompatible episode in {self._name}."
+                )
+                self._warned_incompatible = True
+            return None
+        return clean
+
+    def _remove_episode(self, episode_id):
+        meta = self._episodes.pop(episode_id, None)
+        if meta is None:
+            return
+        if meta["location"] == "gpu":
+            self._gpu_transitions -= meta["transitions"]
+            self._gpu_bytes -= meta["bytes"]
+        else:
+            self._spill_transitions -= meta["transitions"]
+            self._spill_bytes -= meta["bytes"]
+
+    def _store_episode_meta(self, episode_id, data, location, steps, nbytes):
+        self._remove_episode(episode_id)
+        transitions = int(max(steps - 1, 0))
+        meta = {
+            "id": episode_id,
+            "data": data,
+            "location": location,
+            "steps": int(steps),
+            "transitions": transitions,
+            "bytes": int(nbytes),
+        }
+        self._episodes[episode_id] = meta
+        if location == "gpu":
+            self._gpu_transitions += transitions
+            self._gpu_bytes += int(nbytes)
+        else:
+            self._spill_transitions += transitions
+            self._spill_bytes += int(nbytes)
+
+    def add_episode(self, episode_id, episode):
+        clean = self._prepare_episode(episode)
+        if clean is None:
+            return False
+        steps = next(iter(clean.values())).shape[0]
+
+        if self._gpu_enabled:
+            try:
+                data, nbytes = self._tensorize_episode(clean, self._gpu_device)
+                self._store_episode_meta(episode_id, data, "gpu", steps, nbytes)
+            except RuntimeError as err:
+                if not self._allow_cpu_fallback or not self._is_oom_error(err):
+                    raise
+                self._oom_fallbacks += 1
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                data, nbytes = self._tensorize_episode(clean, torch.device("cpu"))
+                self._store_episode_meta(episode_id, data, "spill", steps, nbytes)
+        else:
+            data, nbytes = self._tensorize_episode(clean, torch.device("cpu"))
+            self._store_episode_meta(episode_id, data, "spill", steps, nbytes)
+
+        self.evict_to_limit(self._dataset_limit)
+        return True
+
+    def evict_to_limit(self, limit=None):
+        if limit is None:
+            limit = self._dataset_limit
+        limit = int(limit or 0)
+        if limit <= 0:
+            return
+        while len(self) > limit and self._episodes:
+            oldest_id = next(iter(self._episodes.keys()))
+            self._remove_episode(oldest_id)
+
+    def __len__(self):
+        return int(self._gpu_transitions + self._spill_transitions)
+
+    def _sample_sequence(self, length, target_device):
+        if target_device is None:
+            target_device = self._gpu_device if self._gpu_enabled else torch.device("cpu")
+        target_device = torch.device(target_device)
+        entries = [meta for meta in self._episodes.values() if meta["transitions"] >= 1]
+        if not entries:
+            raise ValueError("No replay episodes with at least 1 transition are available.")
+
+        transitions = np.array(
+            [max(meta["transitions"], 1) for meta in entries], dtype=np.float64
+        )
+        weights = 1.0 / transitions
+        weights /= np.sum(weights)
+
+        spill_copy_ms = 0.0
+        size = 0
+        ret = None
+        while size < length:
+            meta = entries[int(self._rng.choice(len(entries), p=weights))]
+            episode = meta["data"]
+            total = meta["steps"]
+            if total < 2:
+                continue
+
+            if ret is None:
+                start = int(self._rng.randint(0, total - 1))
+                end = min(start + length, total)
+                segment = {}
+                for key, value in episode.items():
+                    seq = value[start:end].clone()
+                    if seq.device != target_device:
+                        t0 = time.perf_counter()
+                        seq = seq.to(target_device, non_blocking=True)
+                        spill_copy_ms += (time.perf_counter() - t0) * 1000.0
+                    segment[key] = seq
+                ret = segment
+                if "is_first" in ret:
+                    ret["is_first"][0] = True
+            else:
+                take = min(length - size, total)
+                appended = {}
+                for key, value in episode.items():
+                    seq = value[:take].clone()
+                    if seq.device != target_device:
+                        t0 = time.perf_counter()
+                        seq = seq.to(target_device, non_blocking=True)
+                        spill_copy_ms += (time.perf_counter() - t0) * 1000.0
+                    appended[key] = seq
+                ret = {key: torch.cat([ret[key], appended[key]], dim=0) for key in ret}
+                if "is_first" in ret:
+                    ret["is_first"][size] = True
+            size = int(next(iter(ret.values())).shape[0])
+        return ret, spill_copy_ms
+
+    def sample_batch(self, batch_size, length, device=None):
+        batch_size = int(batch_size)
+        length = int(length)
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive; got {batch_size}.")
+        if length <= 0:
+            raise ValueError(f"length must be positive; got {length}.")
+        start_time = time.perf_counter()
+        batch = []
+        total_copy_ms = 0.0
+        target_device = device if device is not None else (
+            self._gpu_device if self._gpu_enabled else torch.device("cpu")
+        )
+        for _ in range(batch_size):
+            sequence, copy_ms = self._sample_sequence(length, target_device)
+            batch.append(sequence)
+            total_copy_ms += copy_ms
+        data = {}
+        for key in batch[0]:
+            data[key] = torch.stack([sample[key] for sample in batch], dim=0)
+        self._last_sample_ms = (time.perf_counter() - start_time) * 1000.0
+        self._last_spill_copy_ms = float(total_copy_ms)
+        return data
+
+    def stats(self):
+        return {
+            "replay_gpu_episodes": int(
+                sum(1 for meta in self._episodes.values() if meta["location"] == "gpu")
+            ),
+            "replay_gpu_transitions": int(self._gpu_transitions),
+            "replay_gpu_bytes": int(self._gpu_bytes),
+            "replay_spill_episodes": int(
+                sum(1 for meta in self._episodes.values() if meta["location"] != "gpu")
+            ),
+            "replay_spill_transitions": int(self._spill_transitions),
+            "replay_oom_fallbacks": int(self._oom_fallbacks),
+            "replay_sample_ms": float(self._last_sample_ms),
+            "replay_spill_copy_ms": float(self._last_spill_copy_ms),
+        }
+
+
+class GpuReplayStore(_BaseReplayStore):
+    def __init__(self, config, name="replay"):
+        super().__init__(config=config, name=name, allow_cpu_fallback=False)
+
+
+class HybridReplayStore(_BaseReplayStore):
+    def __init__(self, config, name="replay"):
+        super().__init__(config=config, name=name, allow_cpu_fallback=True)
+
+
 def simulate(
     agent,
     envs,
@@ -189,6 +536,7 @@ def simulate(
     episodes=0,
     state=None,
     action_repeat=1,
+    on_episode_done=None,
 ):
     # initialize or unpack simulation state
     start_logger_step = int(logger.step)
@@ -260,45 +608,101 @@ def simulate(
             indices = [index for index, d in enumerate(done) if d]
             # logging for done episode
             for i in indices:
-                save_episodes(directory, {envs[i].id: cache[envs[i].id]})
-                length = len(cache[envs[i].id]["reward"]) - 1
-                score = float(np.array(cache[envs[i].id]["reward"]).sum())
-                video = cache[envs[i].id]["image"]
-                # record logs given from environments
-                for key in list(cache[envs[i].id].keys()):
-                    if "log_" in key:
-                        logger.scalar(
-                            key, float(np.array(cache[envs[i].id][key]).sum())
-                        )
-                        # log items won't be used later
-                        cache[envs[i].id].pop(key)
+                if on_episode_done is None:
+                    # Preserve original CPU replay behavior path exactly.
+                    save_episodes(directory, {envs[i].id: cache[envs[i].id]})
+                    length = len(cache[envs[i].id]["reward"]) - 1
+                    score = float(np.array(cache[envs[i].id]["reward"]).sum())
+                    video = cache[envs[i].id]["image"]
+                    # record logs given from environments
+                    for key in list(cache[envs[i].id].keys()):
+                        if "log_" in key:
+                            logger.scalar(
+                                key, float(np.array(cache[envs[i].id][key]).sum())
+                            )
+                            # log items won't be used later
+                            cache[envs[i].id].pop(key)
 
-                if not is_eval:
-                    step_in_dataset = erase_over_episodes(cache, limit)
-                    logger.scalar(f"dataset_size", step_in_dataset)
-                    logger.scalar(f"train_return", score)
-                    logger.scalar(f"train_length", length)
-                    logger.scalar(f"train_episodes", len(cache))
-                    logger.write(step=logger.step)
-                else:
-                    if not "eval_lengths" in locals():
-                        eval_lengths = []
-                        eval_scores = []
-                        eval_done = False
-                    # start counting scores for evaluation
-                    eval_scores.append(score)
-                    eval_lengths.append(length)
-
-                    score = sum(eval_scores) / len(eval_scores)
-                    length = sum(eval_lengths) / len(eval_lengths)
-                    logger.video(f"eval_policy", np.array(video)[None])
-
-                    if len(eval_scores) >= episodes and not eval_done:
-                        logger.scalar(f"eval_return", score)
-                        logger.scalar(f"eval_length", length)
-                        logger.scalar(f"eval_episodes", len(eval_scores))
+                    if not is_eval:
+                        step_in_dataset = erase_over_episodes(cache, limit)
+                        logger.scalar(f"dataset_size", step_in_dataset)
+                        logger.scalar(f"train_return", score)
+                        logger.scalar(f"train_length", length)
+                        logger.scalar(f"train_episodes", len(cache))
                         logger.write(step=logger.step)
-                        eval_done = True
+                    else:
+                        if not "eval_lengths" in locals():
+                            eval_lengths = []
+                            eval_scores = []
+                            eval_done = False
+                        # start counting scores for evaluation
+                        eval_scores.append(score)
+                        eval_lengths.append(length)
+
+                        score = sum(eval_scores) / len(eval_scores)
+                        length = sum(eval_lengths) / len(eval_lengths)
+                        logger.video(f"eval_policy", np.array(video)[None])
+
+                        if len(eval_scores) >= episodes and not eval_done:
+                            logger.scalar(f"eval_return", score)
+                            logger.scalar(f"eval_length", length)
+                            logger.scalar(f"eval_episodes", len(eval_scores))
+                            logger.write(step=logger.step)
+                            eval_done = True
+                else:
+                    episode_data = {
+                        key: np.asarray(value) for key, value in cache[envs[i].id].items()
+                    }
+                    save_episodes(directory, {envs[i].id: episode_data})
+                    length = len(episode_data["reward"]) - 1
+                    score = float(np.array(episode_data["reward"]).sum())
+                    video = episode_data["image"]
+                    # record logs given from environments
+                    for key in list(episode_data.keys()):
+                        if "log_" in key:
+                            logger.scalar(
+                                key, float(np.array(episode_data[key]).sum())
+                            )
+                            episode_data.pop(key)
+
+                    callback_stats = None
+                    if not is_eval:
+                        callback_stats = on_episode_done(envs[i].id, episode_data)
+                        cache.pop(envs[i].id, None)
+
+                    if not is_eval:
+                        step_in_dataset = int(callback_stats.get("dataset_size", 0))
+                        train_episodes = int(
+                            callback_stats.get("train_episodes", len(cache))
+                        )
+                        for name, value in callback_stats.items():
+                            if name in ("dataset_size", "train_episodes"):
+                                continue
+                            logger.scalar(name, float(value))
+                        logger.scalar(f"dataset_size", step_in_dataset)
+                        logger.scalar(f"train_return", score)
+                        logger.scalar(f"train_length", length)
+                        logger.scalar(f"train_episodes", train_episodes)
+                        logger.write(step=logger.step)
+                    else:
+                        if not "eval_lengths" in locals():
+                            eval_lengths = []
+                            eval_scores = []
+                            eval_done = False
+                        # start counting scores for evaluation
+                        eval_scores.append(score)
+                        eval_lengths.append(length)
+
+                        score = sum(eval_scores) / len(eval_scores)
+                        length = sum(eval_lengths) / len(eval_lengths)
+                        logger.video(f"eval_policy", np.array(video)[None])
+
+                        if len(eval_scores) >= episodes and not eval_done:
+                            logger.scalar(f"eval_return", score)
+                            logger.scalar(f"eval_length", length)
+                            logger.scalar(f"eval_episodes", len(eval_scores))
+                            logger.write(step=logger.step)
+                            eval_done = True
     if is_eval:
         # keep only last item for saving memory. this cache is used for video_pred later
         while len(cache) > 1:
@@ -439,16 +843,21 @@ def sample_episodes(episodes, length, seed=0):
     if not episodes:
         raise ValueError("No episodes available for sampling.")
 
-    def _signature(episode):
-        keys = []
+    def _signature_map(episode):
+        fields = {}
         for key, value in episode.items():
             if key.startswith("log_"):
                 continue
             arr = np.asarray(value)
-            keys.append((key, arr.shape[1:], arr.dtype))
-        return tuple(sorted(keys))
+            fields[key] = (arr.shape[1:], str(arr.dtype))
+        return fields
+
+    def _signature(episode):
+        sig_map = _signature_map(episode)
+        return tuple(sorted((key, *sig_map[key]) for key in sig_map))
 
     ref_episode = next(iter(episodes.values()))
+    ref_sig_map = _signature_map(ref_episode)
     ref_sig = _signature(ref_episode)
     warned_incompatible = False
 
@@ -456,9 +865,14 @@ def sample_episodes(episodes, length, seed=0):
         valid_episodes = []
         dropped_incompatible = 0
         dropped_too_short = 0
-        for episode in episodes.values():
+        first_incompatible_name = None
+        first_incompatible_sig_map = None
+        for episode_name, episode in episodes.items():
             if _signature(episode) != ref_sig:
                 dropped_incompatible += 1
+                if first_incompatible_sig_map is None:
+                    first_incompatible_name = str(episode_name)
+                    first_incompatible_sig_map = _signature_map(episode)
                 continue
             total = len(next(iter(episode.values())))
             if total < 2:
@@ -476,6 +890,35 @@ def sample_episodes(episodes, length, seed=0):
                 "[tools.sample_episodes] Dropped "
                 f"{dropped_incompatible} incompatible and {dropped_too_short} short episode(s)."
             )
+            if dropped_incompatible and first_incompatible_sig_map is not None:
+                missing = sorted(set(ref_sig_map) - set(first_incompatible_sig_map))
+                extra = sorted(set(first_incompatible_sig_map) - set(ref_sig_map))
+                changed = sorted(
+                    key
+                    for key in (set(ref_sig_map) & set(first_incompatible_sig_map))
+                    if ref_sig_map[key] != first_incompatible_sig_map[key]
+                )
+                print(
+                    "[tools.sample_episodes] Example incompatible episode: "
+                    f"{first_incompatible_name}"
+                )
+                if missing:
+                    print(f"[tools.sample_episodes] Missing keys: {missing}")
+                if extra:
+                    print(f"[tools.sample_episodes] Extra keys: {extra}")
+                if changed:
+                    preview = changed[:8]
+                    diff = {
+                        key: {
+                            "ref": ref_sig_map[key],
+                            "episode": first_incompatible_sig_map[key],
+                        }
+                        for key in preview
+                    }
+                    print(
+                        "[tools.sample_episodes] Changed key shape/dtype "
+                        f"(showing {len(preview)}/{len(changed)}): {diff}"
+                    )
             warned_incompatible = True
 
         size = 0

@@ -188,12 +188,24 @@ class WorldModel(nn.Module):
 
     # this function is called during both rollout and training
     def preprocess(self, obs):
-        obs = {
-            k: torch.as_tensor(v, device=self._config.device, dtype=torch.float32)
-            for k, v in obs.items()
-        }
+        device = torch.device(self._config.device)
+        converted = {}
+        for key, value in obs.items():
+            if torch.is_tensor(value):
+                tensor = value
+                if tensor.device != device:
+                    tensor = tensor.to(device=device, non_blocking=True)
+                if tensor.dtype != torch.float32:
+                    tensor = tensor.to(dtype=torch.float32)
+            else:
+                tensor = torch.as_tensor(value, device=device, dtype=torch.float32)
+            converted[key] = tensor
+        obs = converted
         if "image" in obs:
-            image = obs["image"] / 255.0
+            image = obs["image"]
+            if image.dtype != torch.float32:
+                image = image.to(dtype=torch.float32)
+            image = image / 255.0
             if self._config.image_standardize:
                 if self._dataset_image_mean is not None and self._dataset_image_std is not None:
                     image_mean = self._dataset_image_mean

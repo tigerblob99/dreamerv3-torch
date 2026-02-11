@@ -77,6 +77,10 @@ defaults:
   opt_eps: 1e-8
   grad_clip: 1000
   dataset_size: 100000
+  dataset_backend: 'cpu'
+  dataset_gpu_fallback: 'hybrid'
+  dataset_store_image_dtype: 'uint8'
+  dataset_store_float_dtype: 'float32'
   opt: 'adam'
 
   # Behavior.
@@ -186,11 +190,12 @@ memorymaze:
 robosuite_lift:
   prefill: 500
   robosuite_reward_shift: -2.25
-  logdir: logdir/robosuite_lift_run6
-  traindir: logdir/robosuite_lift_run6/train_eps
+  log_every: 500
+  logdir: logdir/robosuite_lift_run7
+  exptdir: logdir/robosuite_lift_run7/expt_eps
   task: 'robosuite_Lift'
   size: [84, 84]
-  envs: 4
+  envs: 8
   action_repeat: 1
   parallel: True
   video_pred_log: true
@@ -240,6 +245,11 @@ robosuite_lift:
   robosuite_control_freq: 20
   max_env_steps: 300
   robosuite_render_device: -1
+  dataset_backend: 'gpu'
+  dataset_gpu_fallback: 'hybrid'
+  dataset_store_image_dtype: 'uint8'
+  dataset_store_float_dtype: 'float32'
+  expert_data_fraction: 0.5
 
 debug:
   debug: True

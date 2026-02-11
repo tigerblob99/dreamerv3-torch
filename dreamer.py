@@ -124,10 +124,17 @@ class Dreamer(nn.Module):
             return next(self._dataset)
         replay_batch = next(self._dataset)
         expert_batch = next(self._expt_dataset)
-        merged_batch = {
-            key: np.concatenate([expert_batch[key], replay_batch[key]], axis=0)
-            for key in replay_batch
-        }
+        first_key = next(iter(replay_batch))
+        if torch.is_tensor(replay_batch[first_key]):
+            merged_batch = {
+                key: torch.cat([expert_batch[key], replay_batch[key]], dim=0)
+                for key in replay_batch
+            }
+        else:
+            merged_batch = {
+                key: np.concatenate([expert_batch[key], replay_batch[key]], axis=0)
+                for key in replay_batch
+            }
         first_key = next(iter(merged_batch))
         merged_size = merged_batch[first_key].shape[0]
         expected_size = int(self._config.batch_size)
@@ -181,6 +188,14 @@ def make_dataset(episodes, config=None, *, batch_size=None, batch_length=None):
         raise ValueError(f"batch_size must be positive; got {batch_size}.")
     if batch_length <= 0:
         raise ValueError(f"batch_length must be positive; got {batch_length}.")
+    if hasattr(episodes, "sample_batch"):
+        dataset = tools.ReplayStoreDataset(
+            episodes,
+            batch_size=batch_size,
+            batch_length=batch_length,
+            device=(getattr(config, "device", None) if config is not None else None),
+        )
+        return dataset
     generator = tools.sample_episodes(episodes, batch_length)
     dataset = tools.from_generator(generator, batch_size)
     return dataset
@@ -272,6 +287,29 @@ def main(config):
     config.time_limit //= config.action_repeat
     if config.eval_only:
         config.eval_episode_num = 1
+    config.dataset_backend = str(
+        getattr(config, "dataset_backend", "cpu")
+    ).lower()
+    config.dataset_gpu_fallback = str(
+        getattr(config, "dataset_gpu_fallback", "hybrid")
+    ).lower()
+    config.dataset_store_image_dtype = str(
+        getattr(config, "dataset_store_image_dtype", "uint8")
+    )
+    config.dataset_store_float_dtype = str(
+        getattr(config, "dataset_store_float_dtype", "float32")
+    )
+
+    def _episode_stats(episodes):
+        if not episodes:
+            return 0, 0
+        transitions = 0
+        for episode in episodes.values():
+            try:
+                transitions += max(0, len(episode["reward"]) - 1)
+            except Exception:
+                continue
+        return len(episodes), transitions
 
     print("Logdir", logdir)
     logdir.mkdir(parents=True, exist_ok=True)
@@ -320,9 +358,98 @@ def main(config):
             raise ValueError(
                 "expert_data_fraction requires expert data, but config.exptdir is not set."
             )
-        expt_eps = tools.load_episodes(exptdir, limit=200)
+        expt_eps = tools.load_episodes(exptdir, limit=10000)
         if not expt_eps:
             raise ValueError(f"No expert episodes found in {exptdir}.")
+
+    use_gpu_dataset = (
+        (not config.eval_only)
+        and config.dataset_backend == "gpu"
+    )
+    train_ep_count, train_transitions = _episode_stats(train_eps)
+    eval_ep_count, eval_transitions = _episode_stats(eval_eps)
+    expert_ep_count, expert_transitions = _episode_stats(expt_eps)
+    print(
+        "[startup] dataset backend="
+        f"{config.dataset_backend}, gpu_fallback={config.dataset_gpu_fallback}, "
+        f"store_image_dtype={config.dataset_store_image_dtype}, "
+        f"store_float_dtype={config.dataset_store_float_dtype}"
+    )
+    print(
+        "[startup] expert fraction="
+        f"{expert_fraction:.3f}, replay_batch_size={replay_batch_size}, "
+        f"expert_batch_size={expert_batch_size}"
+    )
+    print(
+        f"[startup] loaded train episodes={train_ep_count}, transitions={train_transitions}"
+    )
+    print(
+        f"[startup] loaded eval episodes={eval_ep_count}, transitions={eval_transitions}"
+    )
+    if expert_batch_size > 0:
+        print(
+            f"[startup] loaded expert episodes={expert_ep_count}, transitions={expert_transitions}"
+        )
+    else:
+        print("[startup] expert dataset disabled by expert_data_fraction=0.0")
+
+    def _build_replay_store(episodes, name):
+        fallback_mode = config.dataset_gpu_fallback
+        if fallback_mode == "hybrid":
+            store = tools.HybridReplayStore(config, name=name)
+        elif fallback_mode in ("none", "gpu", "strict"):
+            store = tools.GpuReplayStore(config, name=name)
+        else:
+            raise ValueError(
+                f"Unsupported dataset_gpu_fallback: {config.dataset_gpu_fallback}"
+            )
+        for episode_id, episode in episodes.items():
+            store.add_episode(episode_id, episode)
+        store.evict_to_limit(config.dataset_size)
+        return store
+
+    replay_store = None
+    expert_store = None
+    train_cache = train_eps
+    if use_gpu_dataset:
+        replay_store = _build_replay_store(train_eps, name="replay")
+        replay_stats = replay_store.stats()
+        print(
+            "[startup] replay store "
+            f"gpu_eps={replay_stats['replay_gpu_episodes']} "
+            f"spill_eps={replay_stats['replay_spill_episodes']} "
+            f"gpu_transitions={replay_stats['replay_gpu_transitions']} "
+            f"spill_transitions={replay_stats['replay_spill_transitions']} "
+            f"oom_fallbacks={replay_stats['replay_oom_fallbacks']}"
+        )
+        train_eps.clear()
+        if expt_eps is not None:
+            expert_store = _build_replay_store(expt_eps, name="expert")
+            expert_stats = expert_store.stats()
+            print(
+                "[startup] expert store "
+                f"gpu_eps={expert_stats['replay_gpu_episodes']} "
+                f"spill_eps={expert_stats['replay_spill_episodes']} "
+                f"gpu_transitions={expert_stats['replay_gpu_transitions']} "
+                f"spill_transitions={expert_stats['replay_spill_transitions']} "
+                f"oom_fallbacks={expert_stats['replay_oom_fallbacks']}"
+            )
+            expt_eps.clear()
+        train_cache = {}
+    else:
+        print("[startup] using CPU episode datasets (original replay path).")
+
+    def _on_train_episode_done(episode_id, episode_data):
+        if replay_store is None:
+            return {}
+        replay_store.add_episode(episode_id, episode_data)
+        replay_store.evict_to_limit(config.dataset_size)
+        stats = replay_store.stats()
+        stats["dataset_size"] = int(len(replay_store))
+        stats["train_episodes"] = int(
+            stats["replay_gpu_episodes"] + stats["replay_spill_episodes"]
+        )
+        return stats
 
     make = lambda mode, id: make_env(config, mode, id)
     if config.parallel:
@@ -372,12 +499,13 @@ def main(config):
         state = tools.simulate(
             random_agent,
             train_envs,
-            train_eps,
+            train_cache,
             config.traindir,
             logger,
             limit=config.dataset_size,
             steps=prefill,
             action_repeat=config.action_repeat,
+            on_episode_done=(_on_train_episode_done if use_gpu_dataset else None),
         )
         print(f"Logger: ({logger.step} steps).")
 
@@ -386,27 +514,33 @@ def main(config):
     expt_dataset = None
     if not config.eval_only:
         if expert_batch_size <= 0:
+            source = replay_store if use_gpu_dataset else train_eps
             train_dataset = make_dataset(
-                train_eps,
-                batch_size=config.batch_size,
-                batch_length=config.batch_length,
+                source, batch_size=config.batch_size, batch_length=config.batch_length
             )
+            print("[startup] train dataset source: replay only")
         elif expert_batch_size >= config.batch_size:
+            source = expert_store if use_gpu_dataset else expt_eps
             train_dataset = make_dataset(
-                expt_eps,
-                batch_size=config.batch_size,
-                batch_length=config.batch_length,
+                source, batch_size=config.batch_size, batch_length=config.batch_length
             )
+            print("[startup] train dataset source: expert only")
         else:
+            replay_source = replay_store if use_gpu_dataset else train_eps
+            expert_source = expert_store if use_gpu_dataset else expt_eps
             train_dataset = make_dataset(
-                train_eps,
+                replay_source,
                 batch_size=replay_batch_size,
                 batch_length=config.batch_length,
             )
             expt_dataset = make_dataset(
-                expt_eps,
+                expert_source,
                 batch_size=expert_batch_size,
                 batch_length=config.batch_length,
+            )
+            print(
+                "[startup] train dataset source: mixed "
+                f"(expert={expert_batch_size}, replay={replay_batch_size})"
             )
     eval_dataset = make_dataset(
         eval_eps,
@@ -501,13 +635,14 @@ def main(config):
         state = tools.simulate(
             agent,
             train_envs,
-            train_eps,
+            train_cache,
             config.traindir,
             logger,
             limit=config.dataset_size,
             steps=config.eval_every,
             state=state,
             action_repeat=config.action_repeat,
+            on_episode_done=(_on_train_episode_done if use_gpu_dataset else None),
         )
         items_to_save = {
             "agent_state_dict": agent.state_dict(),
