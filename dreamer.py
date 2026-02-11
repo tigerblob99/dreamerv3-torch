@@ -27,7 +27,7 @@ to_np = lambda x: x.detach().cpu().numpy()
 
 
 class Dreamer(nn.Module):
-    def __init__(self, obs_space, act_space, config, logger, dataset):
+    def __init__(self, obs_space, act_space, config, logger, dataset, expt_dataset):
         super(Dreamer, self).__init__()
         self._config = config
         self._logger = logger
@@ -42,6 +42,7 @@ class Dreamer(nn.Module):
         self._step = logger.step // config.action_repeat
         self._update_count = 0
         self._dataset = dataset
+        self._expt_dataset = expt_dataset
         self._wm = models.WorldModel(obs_space, act_space, self._step, config)
         self._task_behavior = models.ImagBehavior(config, self._wm)
         if (
@@ -65,7 +66,7 @@ class Dreamer(nn.Module):
                 else self._should_train(step)
             )
             for _ in range(steps):
-                self._train(next(self._dataset))
+                self._train(self._sample_train_batch())
                 self._update_count += 1
                 self._metrics["update_count"] = self._update_count
             if self._should_log(step):
@@ -118,6 +119,28 @@ class Dreamer(nn.Module):
         state = (latent, action)
         return policy_output, state
 
+    def _sample_train_batch(self):
+        if self._expt_dataset is None:
+            return next(self._dataset)
+        replay_batch = next(self._dataset)
+        expert_batch = next(self._expt_dataset)
+        merged_batch = {
+            key: np.concatenate([expert_batch[key], replay_batch[key]], axis=0)
+            for key in replay_batch
+        }
+        first_key = next(iter(merged_batch))
+        merged_size = merged_batch[first_key].shape[0]
+        expected_size = int(self._config.batch_size)
+        if merged_size != expected_size:
+            expert_size = expert_batch[first_key].shape[0]
+            replay_size = replay_batch[first_key].shape[0]
+            raise ValueError(
+                "Merged train batch has incorrect size: "
+                f"got {merged_size} (expert={expert_size}, replay={replay_size}), "
+                f"expected {expected_size}."
+            )
+        return merged_batch
+
     def _train(self, data):
         metrics = {}
         post, context, mets = self._wm._train(data)
@@ -141,9 +164,25 @@ def count_steps(folder):
     return sum(int(str(n).split("-")[-1][:-4]) - 1 for n in folder.glob("*.npz"))
 
 
-def make_dataset(episodes, config):
-    generator = tools.sample_episodes(episodes, config.batch_length)
-    dataset = tools.from_generator(generator, config.batch_size)
+def make_dataset(episodes, config=None, *, batch_size=None, batch_length=None):
+    if config is not None:
+        if batch_size is None:
+            batch_size = getattr(config, "batch_size", None)
+        if batch_length is None:
+            batch_length = getattr(config, "batch_length", None)
+    if batch_size is None or batch_length is None:
+        raise ValueError(
+            "make_dataset requires either a config with batch_size and batch_length "
+            "or explicit batch_size and batch_length."
+        )
+    batch_size = int(batch_size)
+    batch_length = int(batch_length)
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive; got {batch_size}.")
+    if batch_length <= 0:
+        raise ValueError(f"batch_length must be positive; got {batch_length}.")
+    generator = tools.sample_episodes(episodes, batch_length)
+    dataset = tools.from_generator(generator, batch_size)
     return dataset
 
 
@@ -217,8 +256,16 @@ def main(config):
     if config.deterministic_run:
         tools.enable_deterministic_run()
     logdir = pathlib.Path(config.logdir).expanduser()
-    config.traindir = config.traindir or logdir / "train_eps"
-    config.evaldir = config.evaldir or logdir / "eval_eps"
+    config.traindir = (
+        pathlib.Path(config.traindir).expanduser()
+        if config.traindir
+        else logdir / "train_eps"
+    )
+    config.evaldir = (
+        pathlib.Path(config.evaldir).expanduser()
+        if config.evaldir
+        else logdir / "eval_eps"
+    )
     config.steps //= config.action_repeat
     config.eval_every //= config.action_repeat
     config.log_every //= config.action_repeat
@@ -235,7 +282,7 @@ def main(config):
     # --- Weights & Biases init; sync existing TensorBoard logs automatically ---
     os.environ.setdefault("WANDB_LOGDIR", str(logdir))
     run = wandb.init(
-        project=os.getenv("WANDB_PROJECT", "dreamerv3"),
+        project=os.getenv("WANDB_PROJECT", "dreamerv3_can"),
         entity=os.getenv("WANDB_ENTITY"),                 # optional
         name=os.getenv("WANDB_NAME"),                     # optional
         config=vars(config),                              # capture all flags
@@ -246,6 +293,7 @@ def main(config):
 
     # step in logger is environmental step
     logger = tools.Logger(logdir, config.action_repeat * step)
+    logger.attach_wandb(wandb, run)
 
 
 
@@ -260,15 +308,41 @@ def main(config):
     else:
         directory = config.evaldir
     eval_eps = tools.load_episodes(directory, limit=1)
+    expert_fraction = float(np.clip(getattr(config, "expert_data_fraction", 0.0), 0.0, 1.0))
+    expert_batch_size = int(round(config.batch_size * expert_fraction))
+    expert_batch_size = int(np.clip(expert_batch_size, 0, int(config.batch_size)))
+    replay_batch_size = int(config.batch_size) - expert_batch_size
+
+    expt_eps = None
+    if not config.eval_only and expert_batch_size > 0:
+        exptdir = getattr(config, "exptdir", None)
+        if not exptdir:
+            raise ValueError(
+                "expert_data_fraction requires expert data, but config.exptdir is not set."
+            )
+        expt_eps = tools.load_episodes(exptdir, limit=200)
+        if not expt_eps:
+            raise ValueError(f"No expert episodes found in {exptdir}.")
+
     make = lambda mode, id: make_env(config, mode, id)
-    train_envs = [make("train", i) for i in range(config.envs)]
-    eval_envs = [make("eval", i) for i in range(config.envs)]
     if config.parallel:
-        train_envs = [Parallel(env, "process") for env in train_envs]
-        eval_envs = [Parallel(env, "process") for env in eval_envs]
+        train_envs = [
+            Parallel(
+                lambda cfg=config, mode="train", idx=i: make_env(cfg, mode, idx),
+                "process",
+            )
+            for i in range(config.envs)
+        ]
+        eval_envs = [
+            Parallel(
+                lambda cfg=config, mode="eval", idx=i: make_env(cfg, mode, idx),
+                "process",
+            )
+            for i in range(config.envs//2)
+        ]
     else:
-        train_envs = [Damy(env) for env in train_envs]
-        eval_envs = [Damy(env) for env in eval_envs]
+        train_envs = [Damy(make("train", i)) for i in range(config.envs)]
+        eval_envs = [Damy(make("eval", i)) for i in range(config.envs//2)]
     acts = train_envs[0].action_space
     print("Action Space", acts)
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
@@ -303,24 +377,54 @@ def main(config):
             logger,
             limit=config.dataset_size,
             steps=prefill,
+            action_repeat=config.action_repeat,
         )
-        logger.step += prefill * config.action_repeat
         print(f"Logger: ({logger.step} steps).")
 
     print("Simulate agent.")
-    train_dataset = None if config.eval_only else make_dataset(train_eps, config)
-    eval_dataset = make_dataset(eval_eps, config)
+    train_dataset = None
+    expt_dataset = None
+    if not config.eval_only:
+        if expert_batch_size <= 0:
+            train_dataset = make_dataset(
+                train_eps,
+                batch_size=config.batch_size,
+                batch_length=config.batch_length,
+            )
+        elif expert_batch_size >= config.batch_size:
+            train_dataset = make_dataset(
+                expt_eps,
+                batch_size=config.batch_size,
+                batch_length=config.batch_length,
+            )
+        else:
+            train_dataset = make_dataset(
+                train_eps,
+                batch_size=replay_batch_size,
+                batch_length=config.batch_length,
+            )
+            expt_dataset = make_dataset(
+                expt_eps,
+                batch_size=expert_batch_size,
+                batch_length=config.batch_length,
+            )
+    eval_dataset = make_dataset(
+        eval_eps,
+        batch_size=config.batch_size,
+        batch_length=config.batch_length,
+    )
     agent = Dreamer(
         train_envs[0].observation_space,
         train_envs[0].action_space,
         config,
         logger,
         train_dataset,
+        expt_dataset,
     ).to(config.device)
     agent.requires_grad_(requires_grad=False)
 
     try:
-        wandb.watch(agent, log="all", log_freq=1000)
+        wandb.watch(agent, log="all", log_freq=500)
     except Exception:
         pass
 
@@ -341,6 +445,7 @@ def main(config):
             logger,
             is_eval=True,
             episodes=1,
+            action_repeat=config.action_repeat,
         )
         latest_eval = tools.load_episodes(config.evaldir, limit=1)
         if latest_eval:
@@ -384,6 +489,7 @@ def main(config):
                 logger,
                 is_eval=True,
                 episodes=config.eval_episode_num,
+                action_repeat=config.action_repeat,
             )
             if config.video_pred_log:
                 video_pred = agent._wm.video_pred(next(eval_dataset))
@@ -401,6 +507,7 @@ def main(config):
             limit=config.dataset_size,
             steps=config.eval_every,
             state=state,
+            action_repeat=config.action_repeat,
         )
         items_to_save = {
             "agent_state_dict": agent.state_dict(),

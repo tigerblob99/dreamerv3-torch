@@ -27,7 +27,7 @@ defaults:
   action_repeat: 2
   time_limit: 1000
   grayscale: False
-  prefill: 2500
+  prefill: 0
   reward_EMA: True
 
   # Model
@@ -76,7 +76,7 @@ defaults:
   model_lr: 1e-4
   opt_eps: 1e-8
   grad_clip: 1000
-  dataset_size: 1000000
+  dataset_size: 100000
   opt: 'adam'
 
   # Behavior.
@@ -184,26 +184,62 @@ memorymaze:
   task: 'memorymaze_9x9'
 
 robosuite_lift:
+  prefill: 500
+  robosuite_reward_shift: -2.25
+  logdir: logdir/robosuite_lift_run6
+  traindir: logdir/robosuite_lift_run6/train_eps
   task: 'robosuite_Lift'
   size: [84, 84]
-  envs: 1
+  envs: 4
   action_repeat: 1
-  parallel: False
-  steps: 5e4
-  prefill: 0
-  train_ratio: 512
+  parallel: True
   video_pred_log: true
-  offline_eval_batches: 5
-  offline_eval_video_batches: 2
-  robosuite_task_name: 'Lift'
-  robosuite_robots: 'Panda'
+  encoder:
+    {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel|aux_.*)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
+  decoder:
+    {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
+  robosuite_task: 'Lift'
+  robosuite_robots: ['Panda']
   robosuite_controller: 'OSC_POSE'
-  robosuite_camera: 'agentview'
-  robosuite_reward_shaping: true
+  controller_configs:
+    type: BASIC
+    body_parts:
+      right:
+        type: OSC_POSE
+        input_max: 1
+        input_min: -1
+        output_max: [0.05, 0.05, 0.05, 0.5, 0.5, 0.5]
+        output_min: [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5]
+        kp: 150
+        damping: 1
+        impedance_mode: fixed
+        kp_limits: [0, 300]
+        damping_limits: [0, 10]
+        position_limits: null
+        orientation_limits: null
+        uncouple_pos_ori: true
+        control_delta: true
+        interpolation: null
+        ramp_ratio: 0.2
+        input_ref_frame: world
+        gripper:
+          type: GRIP
+  camera_obs_keys: ['agentview_image', 'robot0_eye_in_hand_image']
+  flip_camera_keys: ['agentview_image', 'robot0_eye_in_hand_image']
+  bc_mlp_keys_order:
+    - robot0_joint_pos
+    - robot0_joint_vel
+    - robot0_gripper_qpos
+    - robot0_gripper_qvel
+    - aux_robot0_joint_pos_sin
+    - aux_robot0_joint_pos_cos
+  aux_key_map:
+    aux_robot0_joint_pos_sin: robot0_joint_pos_sin
+    aux_robot0_joint_pos_cos: robot0_joint_pos_cos
+  robosuite_reward_shaping: True
   robosuite_control_freq: 20
+  max_env_steps: 300
   robosuite_render_device: -1
-  robosuite_add_joint_trig: true
-  robosuite_lowdim_keys: ['robot0_joint_pos', 'robot0_joint_vel', 'robot0_gripper_qpos', 'robot0_gripper_qvel']
 
 debug:
   debug: True

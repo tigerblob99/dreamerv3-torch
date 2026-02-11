@@ -1,16 +1,29 @@
-# convert_robomimic_to_dreamer.py
+"""
+Convert a RoboMimic HDF5 dataset into Dreamer-style episode `.npz` files.
+
+Example:
+    python toolkit/convert_robomimic_to_dreamer.py \
+        --in_h5 datasets/imageliftPH_shaped.hdf5 \
+        --out_dir datasets/robomimic_data_MV/lift_PH_Shaped_shifted \
+        --reward_shift -2.25 \
+        --img_keys agentview_image,robot0_eye_in_hand_image \
+        --lowdim_keys robot0_joint_pos,robot0_joint_vel,robot0_gripper_qpos,robot0_gripper_qvel \
+        --aux_only_keys robot0_joint_pos_sin,robot0_joint_pos_cos
+"""
 import argparse, h5py, numpy as np, pathlib, os
 from collections import OrderedDict
+from tqdm import tqdm
 
 def concat_cams(obs_group, keys):
-    imgs = [obs_group[k][()] for k in keys]  # each (T,H,W,3) uint8
+    # Match online replay schema: image tensors are uint8.
+    imgs = [obs_group[k][()].astype(np.uint8) for k in keys]  # each (T,H,W,3) uint8
     # sanity check same HWC
     H,W,C = imgs[0].shape[1:]
     for im in imgs[1:]:
         assert im.shape[1:] == (H,W,C)
     return np.concatenate(imgs, axis=-1)     # (T,H,W,3*K) uint8
 
-def build_episode(g, img_keys, lowdim_keys, aux_only_keys=None):
+def build_episode(g, img_keys, lowdim_keys, aux_only_keys=None, reward_shift=0.0):
     """
     g = f['data/demo_xx']
     returns dict of arrays with length T+1
@@ -47,12 +60,14 @@ def build_episode(g, img_keys, lowdim_keys, aux_only_keys=None):
     action[1:T+1] = A
 
     # rewards/discount/is_first/is_terminal
+    # Keep flags float32 to match online replay episodes produced by tools.simulate.
     r = g['rewards'][()].astype(np.float32)            # (T,)
-    d = g['dones'][()].astype(np.uint8)                # (T,)
+    r = r + np.float32(reward_shift)
+    d = g['dones'][()].astype(np.float32)              # (T,)
     reward      = np.zeros((T+1,), dtype=np.float32);  reward[1:T+1] = r
     discount    = np.ones((T+1,), dtype=np.float32);   discount[1:T+1] = 1.0 - d
-    is_first    = np.zeros((T+1,), dtype=np.uint8);    is_first[0] = 1
-    is_terminal = np.zeros((T+1,), dtype=np.uint8);    is_terminal[1:T+1] = d
+    is_first    = np.zeros((T+1,), dtype=np.float32);  is_first[0] = 1.0
+    is_terminal = np.zeros((T+1,), dtype=np.float32);  is_terminal[1:T+1] = d
 
     ep = OrderedDict()
     if image is not None: ep['image'] = image
@@ -77,6 +92,7 @@ if __name__ == "__main__":
     ap.add_argument("--img_keys", default="agentview_image")
     ap.add_argument("--lowdim_keys", default="robot0_joint_pos,robot0_joint_vel,robot0_gripper_qpos,robot0_gripper_qvel")
     ap.add_argument("--aux_only_keys", default="robot0_joint_pos_sin,robot0_joint_pos_cos")
+    ap.add_argument("--reward_shift", type=float, default=-2.25, help="Additive reward shift applied to all non-initial timesteps.")
     args = ap.parse_args()
 
     img_keys = [k for k in args.img_keys.split(",") if k.strip()]
@@ -84,7 +100,8 @@ if __name__ == "__main__":
     aux_only_keys = [k for k in args.aux_only_keys.split(",") if k.strip()]
 
     with h5py.File(args.in_h5, "r") as f:
-        for demo in sorted(f["data"].keys(), key=lambda s: int(s.split("_")[-1])):
+        demos = sorted(f["data"].keys(), key=lambda s: int(s.split("_")[-1]))
+        for demo in tqdm(demos, desc="Converting demos"):
             g = f["data"][demo]
-            ep = build_episode(g, img_keys, lowdim_keys, aux_only_keys)
+            ep = build_episode(g, img_keys, lowdim_keys, aux_only_keys, args.reward_shift)
             save_episode_npz(args.out_dir, demo, ep)

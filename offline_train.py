@@ -427,7 +427,7 @@ def offline_train(config):
     eval_dataset = _make_eval_dataset(eval_eps, config)
     eval_sequences = _make_eval_sequences(eval_eps)
 
-    agent = Dreamer(obs_space, act_space, config, logger, train_dataset).to(config.device)
+    agent = Dreamer(obs_space, act_space, config, logger, train_dataset, None).to(config.device)
     agent.requires_grad_(requires_grad=False)
 
     wandb_run = None

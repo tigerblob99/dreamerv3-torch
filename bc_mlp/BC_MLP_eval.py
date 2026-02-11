@@ -31,10 +31,6 @@ except ImportError:
 
 import tools
 from BC_MLP_train import _build_encoder, _extract_encoder_state, _load_config
-from envs.robosuite_env import (
-	_ensure_composite_controller_config,
-	_resolve_controller_loader,
-)
 
 
 @dataclass
@@ -88,6 +84,47 @@ class EvalConfig:
 	npz_evaldir: pathlib.Path | None = None  # Directory containing NPZ episodes
 
 
+def _load_controller_config_from_name(suite: Any, controller_name: str):
+	"""Resolve controller config for robosuite>=1.5 using part/composite loaders."""
+	errors: List[str] = []
+
+	part_loader = getattr(suite, "load_part_controller_config", None)
+	if callable(part_loader):
+		for call_desc, kwargs in (
+			("load_part_controller_config(default_controller=...)", {"default_controller": controller_name}),
+			("load_part_controller_config(controller=...)", {"controller": controller_name}),
+		):
+			try:
+				return part_loader(**kwargs)
+			except TypeError:
+				continue
+			except Exception as exc:
+				errors.append(f"{call_desc} -> {type(exc).__name__}: {exc}")
+				break
+
+	composite_loader = getattr(suite, "load_composite_controller_config", None)
+	if callable(composite_loader):
+		for call_desc, kwargs in (
+			("load_composite_controller_config(controller=...)", {"controller": controller_name}),
+			("load_composite_controller_config(default_controller=...)", {"default_controller": controller_name}),
+		):
+			try:
+				return composite_loader(**kwargs)
+			except TypeError:
+				continue
+			except Exception as exc:
+				errors.append(f"{call_desc} -> {type(exc).__name__}: {exc}")
+				break
+
+	raise AttributeError(
+		"robosuite>=1.5 controller config loader not usable for "
+		f"'{controller_name}'. Available top-level loaders: "
+		f"load_part_controller_config={callable(part_loader)}, "
+		f"load_composite_controller_config={callable(composite_loader)}. "
+		+ ("; ".join(errors) if errors else "No compatible loader call signature succeeded.")
+	)
+
+
 def _make_robomimic_env(cfg: EvalConfig, image_hw: Tuple[int, int]):
 	"""Create and configure a robosuite Can environment.
 
@@ -103,11 +140,11 @@ def _make_robomimic_env(cfg: EvalConfig, image_hw: Tuple[int, int]):
 		An instantiated and seeded robosuite environment.
 	"""
 	suite = importlib.import_module("robosuite")
-	load_controller_config = _resolve_controller_loader(suite)
 	controller_cfg = getattr(cfg, "controller_configs", None)
 	if controller_cfg is None:
-		controller_cfg = load_controller_config(default_controller=cfg.robosuite_controller)
-	controller_cfg = _ensure_composite_controller_config(controller_cfg, cfg.robosuite_robots)
+		controller_cfg = _load_controller_config_from_name(
+			suite, str(cfg.robosuite_controller)
+		)
 
 	env = suite.make(
 		env_name=cfg.robosuite_task,

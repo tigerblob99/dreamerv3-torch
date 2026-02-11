@@ -188,8 +188,10 @@ def simulate(
     steps=0,
     episodes=0,
     state=None,
+    action_repeat=1,
 ):
     # initialize or unpack simulation state
+    start_logger_step = int(logger.step)
     if state is None:
         step, episode = 0, 0
         done = np.ones(len(envs), bool)
@@ -237,13 +239,17 @@ def simulate(
         length += 1
         step += len(envs)
         length *= 1 - done
+        if not is_eval:
+            logger.step = start_logger_step + int(step * action_repeat)
         # add to cache
         for a, result, env in zip(action, results, envs):
             o, r, d, info = result
             o = {k: convert(v) for k, v in o.items()}
             transition = o.copy()
             if isinstance(a, dict):
-                transition.update(a)
+                # Intentionally disable storing policy log-probabilities in replay.
+                # This avoids schema mismatches with offline demos that do not have "logprob".
+                transition.update({k: v for k, v in a.items() if k != "logprob"})
             else:
                 transition["action"] = a
             transition["reward"] = r
@@ -442,63 +448,72 @@ def sample_episodes(episodes, length, seed=0):
             keys.append((key, arr.shape[1:], arr.dtype))
         return tuple(sorted(keys))
 
-    episodes = collections.OrderedDict(episodes)
-    ref_key, ref_episode = next(iter(episodes.items()))
+    ref_episode = next(iter(episodes.values()))
     ref_sig = _signature(ref_episode)
-    compatible = collections.OrderedDict()
-    incompatible = []
-    for key, episode in episodes.items():
-        sig = _signature(episode)
-        if sig == ref_sig:
-            compatible[key] = episode
-        else:
-            incompatible.append(key)
+    warned_incompatible = False
 
-    if not compatible:
-        raise ValueError("All episodes have incompatible observation structures and were dropped.")
-
-    if incompatible:
-        print(
-            f"[tools.sample_episodes] Dropped {len(incompatible)} episode(s) with incompatible shapes: "
-            + ", ".join(incompatible[:3])
-            + ("..." if len(incompatible) > 3 else "")
-        )
-
-    episodes = compatible
     while True:
+        valid_episodes = []
+        dropped_incompatible = 0
+        dropped_too_short = 0
+        for episode in episodes.values():
+            if _signature(episode) != ref_sig:
+                dropped_incompatible += 1
+                continue
+            total = len(next(iter(episode.values())))
+            if total < 2:
+                dropped_too_short += 1
+                continue
+            valid_episodes.append(episode)
+
+        if not valid_episodes:
+            raise ValueError(
+                "No compatible episodes with at least 2 frames are available for sampling."
+            )
+
+        if not warned_incompatible and (dropped_incompatible or dropped_too_short):
+            print(
+                "[tools.sample_episodes] Dropped "
+                f"{dropped_incompatible} incompatible and {dropped_too_short} short episode(s)."
+            )
+            warned_incompatible = True
+
         size = 0
         ret = None
-        p = np.array(
-            [len(next(iter(episode.values()))) for episode in episodes.values()]
+        lengths = np.array(
+            [len(next(iter(episode.values()))) for episode in valid_episodes],
+            dtype=np.float64,
         )
+        # Prefer shorter episodes by sampling with inverse transition count.
+        transition_counts = np.maximum(lengths - 1.0, 1.0)
+        p = 1.0 / transition_counts
         p = p / np.sum(p)
         while size < length:
-            episode = np_random.choice(list(episodes.values()), p=p)
+            episode = np_random.choice(valid_episodes, p=p)
             total = len(next(iter(episode.values())))
             # make sure at least one transition included
             if total < 2:
                 continue
             if not ret:
                 index = int(np_random.randint(0, total - 1))
-                start, stop = index, min(index + length, total)
-                ret = {}
-                for k, v in episode.items():
-                    if k.startswith("log_"):
-                        continue
-                    segment = np.asarray(v[start:stop]).copy()
-                    ret[k] = segment
+                ret = {
+                    k: v[index : min(index + length, total)].copy()
+                    for k, v in episode.items()
+                    if "log_" not in k
+                }
                 if "is_first" in ret:
                     ret["is_first"][0] = True
             else:
                 # 'is_first' comes after 'is_last'
                 index = 0
                 possible = length - size
-                start, stop = index, min(index + possible, total)
-                for k, v in episode.items():
-                    if k.startswith("log_"):
-                        continue
-                    segment = np.asarray(v[start:stop]).copy()
-                    ret[k] = np.concatenate([ret[k], segment], axis=0)
+                ret = {
+                    k: np.append(
+                        ret[k], v[index : min(index + possible, total)].copy(), axis=0
+                    )
+                    for k, v in episode.items()
+                    if "log_" not in k
+                }
                 if "is_first" in ret:
                     ret["is_first"][size] = True
             size = len(next(iter(ret.values())))
