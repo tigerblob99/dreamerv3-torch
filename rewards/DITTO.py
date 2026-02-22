@@ -8,8 +8,10 @@ class DittoReward(BaseReward):
     def __init__(
         self,
         metric: str = "max_cos",
+        reward_scale: float = 1.0,
+        reward_shift: float = 0.0,
     ) -> None:
-        super().__init__()
+        super().__init__(reward_scale=reward_scale, reward_shift=reward_shift)
         self.metric = metric.lower()
 
     def forward(self, agent_latents: torch.Tensor, expert_latents: torch.Tensor) -> torch.Tensor:

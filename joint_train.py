@@ -530,14 +530,24 @@ def joint_train(config):
         feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
     else:
         feat_size = config.dyn_stoch + config.dyn_deter
-        
+
+    ac = config.action_mlp
     policy = ActionMLP(
         inp_dim=feat_size,
         shape=(config.num_actions,),
-        layers=config.mlp_layers,
-        units=1024,
-        act=config.act,
-        norm=config.norm,
+        layers=ac['layers'],
+        units=ac['units'],
+        act=ac['act'],
+        norm=ac['norm'],
+        dist=ac['dist'],
+        std=ac['std'],
+        min_std=ac['min_std'],
+        max_std=ac['max_std'],
+        absmax=ac['absmax'],
+        temp=ac['temp'],
+        unimix_ratio=ac['unimix_ratio'],
+        outscale=ac['outscale'],
+        symlog_inputs=ac['symlog_inputs'],
         device=config.device,
     )
     

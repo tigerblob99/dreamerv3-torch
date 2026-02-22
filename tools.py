@@ -73,6 +73,12 @@ class Logger:
             return
         self._wandb_module = wandb_module
         self._wandb_run = wandb_run
+        try:
+            # Use environment steps as the canonical x-axis for all metrics.
+            self._wandb_run.define_metric("env_step")
+            self._wandb_run.define_metric("*", step_metric="env_step", step_sync=True)
+        except Exception:
+            pass
 
     def scalar(self, name, value):
         self._scalars[name] = float(value)
@@ -155,7 +161,10 @@ class Logger:
         if self._wandb_ready():
             step = int(step)
             self._wandb_run.log(
-                {name: self._wandb_module.Video(wandb_video, fps=16, format="mp4")},
+                {
+                    name: self._wandb_module.Video(wandb_video, fps=16, format="mp4"),
+                    "env_step": step,
+                },
                 step=step,
             )
             try:
@@ -239,6 +248,25 @@ def _parse_store_float_dtype(name):
     return mapping[key]
 
 
+def _parse_episode_sampling_mode(name):
+    key = str(name).strip().lower()
+    aliases = {
+        "shorter": "shorter",
+        "short": "shorter",
+        "inverse": "shorter",
+        "inverse_transition": "shorter",
+        "inverse_transitions": "shorter",
+        "uniform": "uniform",
+        "equal": "uniform",
+    }
+    if key not in aliases:
+        raise ValueError(
+            "Unsupported dataset_episode_sampling mode: "
+            f"{name}. Expected one of: 'shorter', 'uniform'."
+        )
+    return aliases[key]
+
+
 class ReplayStoreDataset:
     def __init__(self, replay_store, batch_size, batch_length, device=None):
         self._store = replay_store
@@ -274,6 +302,9 @@ class _BaseReplayStore:
 
         self._store_float_dtype = _parse_store_float_dtype(
             getattr(config, "dataset_store_float_dtype", "float32")
+        )
+        self._episode_sampling_mode = _parse_episode_sampling_mode(
+            getattr(config, "dataset_episode_sampling", "shorter")
         )
         store_image_dtype = str(
             getattr(config, "dataset_store_image_dtype", "uint8")
@@ -430,8 +461,13 @@ class _BaseReplayStore:
         transitions = np.array(
             [max(meta["transitions"], 1) for meta in entries], dtype=np.float64
         )
-        weights = 1.0 / transitions
-        weights /= np.sum(weights)
+        if self._episode_sampling_mode == "uniform":
+            weights = np.full_like(
+                transitions, 1.0 / float(len(transitions)), dtype=np.float64
+            )
+        else:
+            weights = 1.0 / transitions
+            weights /= np.sum(weights)
 
         spill_copy_ms = 0.0
         size = 0
@@ -524,6 +560,47 @@ class HybridReplayStore(_BaseReplayStore):
         super().__init__(config=config, name=name, allow_cpu_fallback=True)
 
 
+def _episode_end_reason(info):
+    if not isinstance(info, dict):
+        return False, 0.0, 0.0, 0.0
+
+    env_info = info.get("env_info")
+    if not isinstance(env_info, dict):
+        env_info = {}
+
+    tracked = (
+        ("success" in info)
+        or ("task_success" in info)
+        or ("success" in env_info)
+        or ("task_success" in env_info)
+    )
+    if not tracked:
+        return False, 0.0, 0.0, 0.0
+
+    success = bool(
+        info.get(
+            "success",
+            info.get(
+                "task_success",
+                env_info.get("success", env_info.get("task_success", False)),
+            ),
+        )
+    )
+    timeout = bool(info.get("episode_timeout", env_info.get("episode_timeout", False)))
+
+    if not success and not timeout:
+        discount = info.get("discount", env_info.get("discount", None))
+        if discount is not None and np.isclose(
+            float(np.asarray(discount)), 1.0, atol=1e-6
+        ):
+            timeout = True
+
+    if success:
+        timeout = False
+    other = (not success) and (not timeout)
+    return True, float(success), float(timeout), float(other)
+
+
 def simulate(
     agent,
     envs,
@@ -540,15 +617,18 @@ def simulate(
 ):
     # initialize or unpack simulation state
     start_logger_step = int(logger.step)
+    eval_end_success = []
+    eval_end_timeout = []
+    eval_end_other = []
     if state is None:
         step, episode = 0, 0
         done = np.ones(len(envs), bool)
-        length = np.zeros(len(envs), np.int32)
+        env_lengths = np.zeros(len(envs), np.int32)
         obs = [None] * len(envs)
         agent_state = None
         reward = [0] * len(envs)
     else:
-        step, episode, done, length, obs, agent_state, reward = state
+        step, episode, done, env_lengths, obs, agent_state, reward = state
     while (steps and step < steps) or (episodes and episode < episodes):
         # reset envs if necessary
         if done.any():
@@ -584,12 +664,13 @@ def simulate(
         reward = list(reward)
         done = np.stack(done)
         episode += int(done.sum())
-        length += 1
+        env_lengths += 1
         step += len(envs)
-        length *= 1 - done
+        env_lengths *= 1 - done
         if not is_eval:
             logger.step = start_logger_step + int(step * action_repeat)
         # add to cache
+        terminal_infos = {}
         for a, result, env in zip(action, results, envs):
             o, r, d, info = result
             o = {k: convert(v) for k, v in o.items()}
@@ -603,15 +684,21 @@ def simulate(
             transition["reward"] = r
             transition["discount"] = info.get("discount", np.array(1 - float(d)))
             add_to_cache(cache, env.id, transition)
+            if d:
+                terminal_infos[env.id] = info
 
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
             # logging for done episode
             for i in indices:
+                terminal_info = terminal_infos.get(envs[i].id, {})
+                tracked, end_success, end_timeout, end_other = _episode_end_reason(
+                    terminal_info
+                )
                 if on_episode_done is None:
                     # Preserve original CPU replay behavior path exactly.
                     save_episodes(directory, {envs[i].id: cache[envs[i].id]})
-                    length = len(cache[envs[i].id]["reward"]) - 1
+                    episode_length = len(cache[envs[i].id]["reward"]) - 1
                     score = float(np.array(cache[envs[i].id]["reward"]).sum())
                     video = cache[envs[i].id]["image"]
                     # record logs given from environments
@@ -627,8 +714,12 @@ def simulate(
                         step_in_dataset = erase_over_episodes(cache, limit)
                         logger.scalar(f"dataset_size", step_in_dataset)
                         logger.scalar(f"train_return", score)
-                        logger.scalar(f"train_length", length)
+                        logger.scalar(f"train_length", episode_length)
                         logger.scalar(f"train_episodes", len(cache))
+                        if tracked:
+                            logger.scalar("train_end_success", end_success)
+                            logger.scalar("train_end_timeout", end_timeout)
+                            logger.scalar("train_end_other", end_other)
                         logger.write(step=logger.step)
                     else:
                         if not "eval_lengths" in locals():
@@ -637,16 +728,33 @@ def simulate(
                             eval_done = False
                         # start counting scores for evaluation
                         eval_scores.append(score)
-                        eval_lengths.append(length)
+                        eval_lengths.append(episode_length)
+                        if tracked:
+                            eval_end_success.append(end_success)
+                            eval_end_timeout.append(end_timeout)
+                            eval_end_other.append(end_other)
 
                         score = sum(eval_scores) / len(eval_scores)
-                        length = sum(eval_lengths) / len(eval_lengths)
+                        mean_eval_length = sum(eval_lengths) / len(eval_lengths)
                         logger.video(f"eval_policy", np.array(video)[None])
 
                         if len(eval_scores) >= episodes and not eval_done:
                             logger.scalar(f"eval_return", score)
-                            logger.scalar(f"eval_length", length)
+                            logger.scalar(f"eval_length", mean_eval_length)
                             logger.scalar(f"eval_episodes", len(eval_scores))
+                            if eval_end_success:
+                                logger.scalar(
+                                    "eval_end_success_rate",
+                                    float(np.mean(eval_end_success)),
+                                )
+                                logger.scalar(
+                                    "eval_end_timeout_rate",
+                                    float(np.mean(eval_end_timeout)),
+                                )
+                                logger.scalar(
+                                    "eval_end_other_rate",
+                                    float(np.mean(eval_end_other)),
+                                )
                             logger.write(step=logger.step)
                             eval_done = True
                 else:
@@ -654,7 +762,7 @@ def simulate(
                         key: np.asarray(value) for key, value in cache[envs[i].id].items()
                     }
                     save_episodes(directory, {envs[i].id: episode_data})
-                    length = len(episode_data["reward"]) - 1
+                    episode_length = len(episode_data["reward"]) - 1
                     score = float(np.array(episode_data["reward"]).sum())
                     video = episode_data["image"]
                     # record logs given from environments
@@ -681,8 +789,12 @@ def simulate(
                             logger.scalar(name, float(value))
                         logger.scalar(f"dataset_size", step_in_dataset)
                         logger.scalar(f"train_return", score)
-                        logger.scalar(f"train_length", length)
+                        logger.scalar(f"train_length", episode_length)
                         logger.scalar(f"train_episodes", train_episodes)
+                        if tracked:
+                            logger.scalar("train_end_success", end_success)
+                            logger.scalar("train_end_timeout", end_timeout)
+                            logger.scalar("train_end_other", end_other)
                         logger.write(step=logger.step)
                     else:
                         if not "eval_lengths" in locals():
@@ -691,16 +803,33 @@ def simulate(
                             eval_done = False
                         # start counting scores for evaluation
                         eval_scores.append(score)
-                        eval_lengths.append(length)
+                        eval_lengths.append(episode_length)
+                        if tracked:
+                            eval_end_success.append(end_success)
+                            eval_end_timeout.append(end_timeout)
+                            eval_end_other.append(end_other)
 
                         score = sum(eval_scores) / len(eval_scores)
-                        length = sum(eval_lengths) / len(eval_lengths)
+                        mean_eval_length = sum(eval_lengths) / len(eval_lengths)
                         logger.video(f"eval_policy", np.array(video)[None])
 
                         if len(eval_scores) >= episodes and not eval_done:
                             logger.scalar(f"eval_return", score)
-                            logger.scalar(f"eval_length", length)
+                            logger.scalar(f"eval_length", mean_eval_length)
                             logger.scalar(f"eval_episodes", len(eval_scores))
+                            if eval_end_success:
+                                logger.scalar(
+                                    "eval_end_success_rate",
+                                    float(np.mean(eval_end_success)),
+                                )
+                                logger.scalar(
+                                    "eval_end_timeout_rate",
+                                    float(np.mean(eval_end_timeout)),
+                                )
+                                logger.scalar(
+                                    "eval_end_other_rate",
+                                    float(np.mean(eval_end_other)),
+                                )
                             logger.write(step=logger.step)
                             eval_done = True
     if is_eval:
@@ -708,7 +837,15 @@ def simulate(
         while len(cache) > 1:
             # FIFO
             cache.popitem(last=False)
-    return (step - steps, episode - episodes, done, length, obs, agent_state, reward)
+    return (
+        step - steps,
+        episode - episodes,
+        done,
+        env_lengths,
+        obs,
+        agent_state,
+        reward,
+    )
 
 
 def add_to_cache(cache, id, transition):
@@ -837,8 +974,9 @@ def from_generator(generator, batch_size):
         yield data
 
 
-def sample_episodes(episodes, length, seed=0):
+def sample_episodes(episodes, length, seed=0, sampling_mode="shorter"):
     np_random = np.random.RandomState(seed)
+    sampling_mode = _parse_episode_sampling_mode(sampling_mode)
 
     if not episodes:
         raise ValueError("No episodes available for sampling.")
@@ -927,10 +1065,17 @@ def sample_episodes(episodes, length, seed=0):
             [len(next(iter(episode.values()))) for episode in valid_episodes],
             dtype=np.float64,
         )
-        # Prefer shorter episodes by sampling with inverse transition count.
         transition_counts = np.maximum(lengths - 1.0, 1.0)
-        p = 1.0 / transition_counts
-        p = p / np.sum(p)
+        if sampling_mode == "uniform":
+            p = np.full_like(
+                transition_counts,
+                1.0 / float(len(transition_counts)),
+                dtype=np.float64,
+            )
+        else:
+            # Prefer shorter episodes by sampling with inverse transition count.
+            p = 1.0 / transition_counts
+            p = p / np.sum(p)
         while size < length:
             episode = np_random.choice(valid_episodes, p=p)
             total = len(next(iter(episode.values())))
@@ -1229,6 +1374,62 @@ class ContDist:
 
     def log_prob(self, x):
         return self._dist.log_prob(x)
+
+
+class FaithfulContDist:
+    """Faithful heteroscedastic normal (Stirn et al.).
+
+    Splits the NLL into two terms so that:
+      - The mean is trained with unit-variance log_prob (equivalent to MSE).
+      - The std is trained with its own log_prob using a detached mean,
+        so std gradients only update the std head.
+    Requires that the trunk features are already detached before the std head
+    (handled in MLP.forward).
+    """
+
+    def __init__(self, mean, std, absmax=None):
+        super().__init__()
+        self._mean = mean
+        self._std = std
+        self.absmax = absmax
+
+    @property
+    def mean(self):
+        return self._mean
+
+    def mode(self):
+        out = self._mean
+        if self.absmax is not None:
+            scale = (self.absmax / torch.clip(torch.abs(out), min=self.absmax)).detach()
+            out = out * scale
+        return out
+
+    def sample(self, sample_shape=()):
+        dist = torchd.independent.Independent(
+            torchd.normal.Normal(self._mean, self._std), 1
+        )
+        out = dist.rsample(sample_shape)
+        if self.absmax is not None:
+            scale = (self.absmax / torch.clip(torch.abs(out), min=self.absmax)).detach()
+            out = out * scale
+        return out
+
+    def entropy(self):
+        dist = torchd.independent.Independent(
+            torchd.normal.Normal(self._mean, self._std), 1
+        )
+        return dist.entropy()
+
+    def log_prob(self, x):
+        # Mean term: unit variance → gradients are pure MSE for the mean/trunk
+        mean_dist = torchd.independent.Independent(
+            torchd.normal.Normal(self._mean, torch.ones_like(self._std)), 1
+        )
+        # Std term: detached mean → gradients only update the std head
+        std_dist = torchd.independent.Independent(
+            torchd.normal.Normal(self._mean.detach(), self._std), 1
+        )
+        return mean_dist.log_prob(x) + std_dist.log_prob(x)
 
 
 class Bernoulli:

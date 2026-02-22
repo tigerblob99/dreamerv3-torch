@@ -1,13 +1,4 @@
-"""On-policy online RL on Robosuite with fresh rollouts only.
-
-Design goals:
-- Use a pre-trained world model as a frozen latent encoder/dynamics module.
-- Collect trajectories with the current policy directly in the real environment.
-- Compute lambda-return targets from dense environment rewards.
-- Update actor first, then critic, and discard collected data after each update.
-"""
-# Run:
-# python AC_RL/RL_train.py --configs rl_train --env_config can_env_eval --policy_init checkpoint --train_batches_per_collect 8 --mini_batch_size 64
+"""Compact on-policy RL training on Robosuite using a frozen world model."""
 
 from __future__ import annotations
 
@@ -16,26 +7,23 @@ import os
 import pathlib
 import sys
 from collections import OrderedDict, defaultdict
-from types import SimpleNamespace
 
 import numpy as np
-import ruamel.yaml as yaml
-from ruamel.yaml import YAML
 import torch
+from ruamel.yaml import YAML
 
-# Ensure repo root is importable
+# Ensure repo root is importable when running this file directly.
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import tools
-from models import WorldModel
 from AC_RL.actor import Actor
 from AC_RL.critic import Critic
 from RL_finetune import _load_pretrained as _load_pretrained_finetune
-from joint_train import EnvWorker, evaluate_online
+from envs.robosuite_env import make_Robosuite_env
+from models import WorldModel
 from parallel import Parallel
-from bc_mlp.BC_MLP_eval import _prepare_obs
 
 try:
     import wandb
@@ -43,129 +31,84 @@ except ImportError:
     wandb = None
 
 
-def _to_float(value) -> float:
+def _mean_scalar(value) -> float:
     if isinstance(value, torch.Tensor):
-        return float(value.detach().mean().cpu().item())
+        return float(value.detach().float().mean().cpu().item())
     arr = np.asarray(value)
-    if arr.size == 0:
-        return 0.0
-    return float(arr.mean())
+    return float(arr.mean()) if arr.size else 0.0
 
 
-def _load_world_model_only(world_model: WorldModel, checkpoint_path: str, device):
-    """Load only world model weights from a checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    if "wm" in checkpoint:
-        world_model.load_state_dict(checkpoint["wm"])
-        return
-    if "world_model" in checkpoint:
-        world_model.load_state_dict(checkpoint["world_model"])
-        return
-    if "agent_state_dict" in checkpoint:
-        wm_state = {
-            k[len("_wm.") :]: v
-            for k, v in checkpoint["agent_state_dict"].items()
-            if k.startswith("_wm.")
-        }
-        if not wm_state:
-            wm_state = {
-                k[len("_wm._orig_mod.") :]: v
-                for k, v in checkpoint["agent_state_dict"].items()
-                if k.startswith("_wm._orig_mod.")
-            }
-        if wm_state:
-            world_model.load_state_dict(wm_state, strict=False)
-            return
-    raise KeyError("Checkpoint missing world model weights.")
-
-
-# ---------------------------------------------------------------------------
-# Environment helpers
-# ---------------------------------------------------------------------------
-
-def _make_env_workers(config, num_envs, purpose="collect"):
-    crop_h = int(getattr(config, "image_crop_height", 0))
-    crop_w = int(getattr(config, "image_crop_width", 0))
-    image_hw = (
-        (crop_h, crop_w)
-        if (crop_h > 0 and crop_w > 0)
-        else tuple(getattr(config, "size", (84, 84)))
-    )
-
-    env_config = SimpleNamespace(
-        robosuite_task=getattr(config, "robosuite_task", "PickPlaceCan"),
-        robosuite_robots=getattr(config, "robosuite_robots", ["Panda"]),
-        robosuite_controller=getattr(config, "robosuite_controller", "OSC_POSE"),
-        robosuite_reward_shaping=getattr(config, "robosuite_reward_shaping", True),
-        robosuite_control_freq=getattr(config, "robosuite_control_freq", 20),
-        max_env_steps=getattr(config, "max_env_steps", 500),
-        ignore_done=getattr(config, "ignore_done", False),
-        has_renderer=False,
-        has_offscreen_renderer=True,
-        use_camera_obs=True,
-        camera_depths=False,
-        camera_obs_keys=tuple(config.camera_obs_keys),
-        seed=config.seed,
-        render=False,
-    )
-    if hasattr(config, "controller_configs"):
-        env_config.controller_configs = config.controller_configs
-
-    print(f"Creating {num_envs} {purpose} envs (task={env_config.robosuite_task})...")
+def _make_envs(config, count: int, purpose: str):
+    """Create Robosuite envs with Dreamer-style parallel wrappers."""
+    base_seed = int(getattr(config, "seed", 0)) + (10_000 if purpose == "eval" else 0)
+    task = getattr(config, "robosuite_task", "Lift")
+    print(f"Creating {count} {purpose} envs (task={task})...")
     return [
-        Parallel(lambda cfg=env_config, hw=image_hw: EnvWorker(cfg, hw), "process")
-        for _ in range(num_envs)
+        Parallel(
+            lambda cfg=config, seed=base_seed + i: make_Robosuite_env(cfg, seed=seed),
+            "process",
+        )
+        for i in range(count)
     ]
 
 
-def _obs_to_encoder_input(raw_obs, config, wm):
-    return _prepare_obs(
-        raw_obs,
-        cnn_keys_order=config.bc_cnn_keys_order,
-        mlp_keys_order=config.bc_mlp_keys_order,
-        camera_keys=config.camera_obs_keys,
-        flip_keys=config.flip_camera_keys,
-        crop_height=config.image_crop_height if config.image_crop_height > 0 else None,
-        crop_width=config.image_crop_width if config.image_crop_width > 0 else None,
-        config=config,
-    )
+def _close_envs(envs):
+    for env in envs:
+        try:
+            env.close()
+        except Exception:
+            pass
 
 
-def _stack_obs_batch(obs_list, config, wm, device):
-    batch = defaultdict(list)
-    for obs in obs_list:
-        for k, v in obs.items():
-            batch[k].append(v)
+def _to_model_obs(raw_obs):
+    """Convert env obs into encoder input tensors."""
+    out = {}
+    for key, value in raw_obs.items():
+        if key in ("is_first", "is_terminal"):
+            continue
+        arr = np.asarray(value)
+        if key == "image":
+            out[key] = arr.astype(np.uint8, copy=False)
+        else:
+            out[key] = arr.astype(np.float32, copy=False)
+    return out
 
+
+def _stack_obs(obs_list, device):
     data = {}
-    for k, v_list in batch.items():
-        arr = np.stack(v_list)
+    for key in obs_list[0]:
+        arr = np.stack([obs[key] for obs in obs_list])
         tensor = torch.as_tensor(arr, device=device).float()
-        if k == "image":
+        if key == "image":
             tensor = tensor / 255.0
-            if (
-                getattr(config, "image_standardize", False)
-                and wm._dataset_image_mean is not None
-            ):
-                tensor = (tensor - wm._dataset_image_mean) / wm._dataset_image_std
-        data[k] = tensor
+        data[key] = tensor
     return data
 
-
-# ---------------------------------------------------------------------------
-# Collection
-# ---------------------------------------------------------------------------
-
-def collect_episodes(
-    wm,
-    actor,
-    envs,
-    config,
-    num_steps: int,
-    *,
-    sample: bool = True,
-    random_actions: bool = False,
+def _append_transition(
+    buf,
+    obs,
+    action,
+    reward: float,
+    is_first: bool,
+    is_terminal: bool,
+    discount: float,
+    action_dim: int,
 ):
+    for key, value in obs.items():
+        buf[key].append(np.asarray(value))
+    buf["action"].append(
+        np.zeros(action_dim, dtype=np.float32)
+        if action is None
+        else np.asarray(action, dtype=np.float32)
+    )
+    buf["reward"].append(np.float32(reward))
+    buf["discount"].append(np.float32(discount))
+    buf["is_first"].append(np.float32(is_first))
+    buf["is_terminal"].append(np.float32(is_terminal))
+
+
+def _collect_episodes(wm, actor, envs, config, num_steps: int):
+    """Collect fresh on-policy episodes and keep a t=0 placeholder transition."""
     wm.eval()
     actor.eval()
 
@@ -177,210 +120,313 @@ def collect_episodes(
     prev_action = torch.zeros((num_envs, config.num_actions), device=device)
     is_first = torch.ones(num_envs, device=device)
 
+    reset_promises = [env.reset() for env in envs]
+    obs_list = [_to_model_obs(promise()) for promise in reset_promises]
     ep_buffers = [defaultdict(list) for _ in range(num_envs)]
     ep_steps = [0] * num_envs
     ep_success = [False] * num_envs
-    completed = []
-    completed_success = []
-    total_steps_collected = 0
 
-    obs_list = [None] * num_envs
     for i in range(num_envs):
-        raw_obs = envs[i].reset()()
-        obs_list[i] = _obs_to_encoder_input(raw_obs, config, wm)
         _append_transition(
             ep_buffers[i],
             obs_list[i],
             action=None,
             reward=0.0,
-            is_first_flag=True,
-            is_terminal_flag=False,
+            is_first=True,
+            is_terminal=False,
             discount=1.0,
             action_dim=config.num_actions,
         )
 
-    while total_steps_collected < num_steps:
-        data = _stack_obs_batch(obs_list, config, wm, device)
+    completed = []
+    completed_success = []
+    total_steps = 0
 
+    while total_steps < num_steps:
+        data = _stack_obs(obs_list, device)
         with torch.no_grad():
             embed = wm.encoder(data)
-            post, _ = wm.dynamics.obs_step(
-                rssm_state, prev_action, embed, is_first, sample=False
-            )
+            # is_first resets only the env slots that just started a new episode.
+            post, _ = wm.dynamics.obs_step(rssm_state, prev_action, embed, is_first, sample=False)
             rssm_state = post
             feat = wm.dynamics.get_feat(post)
-
-            if random_actions:
-                action_tensor = (
-                    2.0 * torch.rand((num_envs, config.num_actions), device=device) - 1.0
-                )
-            else:
-                action_tensor = actor.generate_actions(feat, sample=sample)
+            action_tensor = actor.generate_actions(feat, sample=True)
             if getattr(config, "clip_actions", True):
                 action_tensor = torch.clamp(action_tensor, -1.0, 1.0)
             prev_action = action_tensor
 
-        action_np = action_tensor.cpu().numpy()
-        promises = [envs[i].step(action_np[i]) for i in range(num_envs)]
-
-        for i, promise in enumerate(promises):
-            obs, reward, done, info, success = promise()
+        action_np = action_tensor.detach().cpu().numpy()
+        step_promises = [env.step(action_np[i]) for i, env in enumerate(envs)]
+        for i, promise in enumerate(step_promises):
+            raw_obs, reward, done, info = promise()
             ep_steps[i] += 1
-            total_steps_collected += 1
-            ep_success[i] = ep_success[i] or success
+            total_steps += 1
+            ep_success[i] = ep_success[i] or bool(info.get("success", False))
 
-            processed_obs = _obs_to_encoder_input(obs, config, wm)
-            env_done = done or success or (ep_steps[i] >= max_env_steps)
-
+            next_obs = _to_model_obs(raw_obs)
             _append_transition(
                 ep_buffers[i],
-                processed_obs,
+                next_obs,
                 action=action_np[i],
                 reward=float(reward),
-                is_first_flag=False,
-                is_terminal_flag=env_done,
-                discount=0.0 if env_done else 1.0,
+                is_first=False,
+                is_terminal=done,
+                discount=0.0 if done else 1.0,
+                action_dim=config.num_actions,
             )
 
-            if env_done:
-                episode = _finalise_episode(ep_buffers[i])
-                completed.append(episode)
+            if done:
+                completed.append({k: np.stack(v, axis=0) for k, v in ep_buffers[i].items()})
                 completed_success.append(bool(ep_success[i]))
-
-                raw_obs = envs[i].reset()()
-                obs_list[i] = _obs_to_encoder_input(raw_obs, config, wm)
                 ep_buffers[i] = defaultdict(list)
+                ep_steps[i] = 0
+                ep_success[i] = False
+                obs_list[i] = _to_model_obs(envs[i].reset()())
                 _append_transition(
                     ep_buffers[i],
                     obs_list[i],
                     action=None,
                     reward=0.0,
-                    is_first_flag=True,
-                    is_terminal_flag=False,
+                    is_first=True,
+                    is_terminal=False,
                     discount=1.0,
                     action_dim=config.num_actions,
                 )
-                ep_steps[i] = 0
-                ep_success[i] = False
                 is_first[i] = 1.0
                 prev_action[i] = 0.0
             else:
-                obs_list[i] = processed_obs
+                obs_list[i] = next_obs
                 is_first[i] = 0.0
 
-    # Include in-progress episodes so each update always has fresh data.
+            if total_steps >= num_steps:
+                break
+
+    # Keep partial episodes so each update always has fresh transitions.
     for i in range(num_envs):
         if len(ep_buffers[i].get("reward", ())) > 1:
-            completed.append(_finalise_episode(ep_buffers[i]))
+            completed.append({k: np.stack(v, axis=0) for k, v in ep_buffers[i].items()})
             completed_success.append(bool(ep_success[i]))
 
     actor.train()
-    return completed, total_steps_collected, completed_success
+    return completed, total_steps, completed_success
 
 
-def _append_transition(
-    buf,
-    obs,
-    *,
-    action,
-    reward,
-    is_first_flag,
-    is_terminal_flag,
-    discount,
-    action_dim: int | None = None,
-):
-    for k, v in obs.items():
-        if k in ("is_first", "is_terminal"):
-            continue
-        buf[k].append(np.asarray(v))
-
-    buf["is_first"].append(np.array(is_first_flag, dtype=np.float32))
-    buf["is_terminal"].append(np.array(is_terminal_flag, dtype=np.float32))
-    buf["reward"].append(np.array(reward, dtype=np.float32))
-    buf["discount"].append(np.array(discount, dtype=np.float32))
-
-    if action is None:
-        if action_dim is None:
-            raise ValueError(
-                "action_dim is required for reset transition placeholder action"
-            )
-        buf["action"].append(np.zeros(int(action_dim), dtype=np.float32))
-    else:
-        buf["action"].append(np.asarray(action, dtype=np.float32))
-
-
-def _finalise_episode(buf):
-    return {k: np.stack(v, axis=0) for k, v in buf.items()}
-
-
-def _sample_fresh_batch(episodes, config, device, *, batch_size: int | None = None):
-    episodes_dict = OrderedDict()
-    for idx, episode in enumerate(episodes):
-        if len(episode.get("action", ())) > 1:
-            episodes_dict[f"ep_{idx:06d}"] = episode
-    if not episodes_dict:
-        raise RuntimeError("No valid collected episodes available for fresh batch sampling.")
-
-    sample_seed = np.random.randint(0, 2**31 - 1)
-    episode_gen = tools.sample_episodes(
-        episodes_dict, length=int(config.batch_length), seed=sample_seed
+def _sample_batch(episodes, config, device, batch_size: int):
+    ep_dict = OrderedDict(
+        (f"ep_{i:06d}", ep) for i, ep in enumerate(episodes) if len(ep.get("action", ())) > 1
     )
-    effective_batch_size = int(batch_size or config.batch_size)
-    batch_np = next(tools.from_generator(episode_gen, effective_batch_size))
-    return {k: torch.as_tensor(v, device=device) for k, v in batch_np.items()}
+    episode_gen = tools.sample_episodes(
+        ep_dict,
+        length=int(config.batch_length),
+        seed=np.random.randint(0, 2**31 - 1),
+        sampling_mode=getattr(config, "dataset_episode_sampling", "shorter"),
+    )
+    batch = next(tools.from_generator(episode_gen, int(batch_size)))
+    return {k: torch.as_tensor(v, device=device) for k, v in batch.items()}
 
 
-def _train_step(
-    wm,
-    actor,
-    critic,
-    batch,
-    config,
-):
-    """One on-policy train step from fresh real environment trajectories."""
+def _train_step(wm, actor, critic, batch, config):
     with torch.no_grad():
         data = wm.preprocess(dict(batch))
         embed = wm.encoder(data)
         post, _ = wm.dynamics.observe(embed, data["action"], data["is_first"])
-        feat_real = wm.dynamics.get_feat(post)  # (B, T, D)
+        feat = wm.dynamics.get_feat(post)
+
+    # Data format has a placeholder at t=0; learning targets start from t=1.
+    rewards = data["reward"][:, 1:]
+    discounts = data.get("discount")
+    if discounts is None:
+        discounts = config.discount * (1.0 - data["is_terminal"]).unsqueeze(-1)
+    elif discounts.ndim == 2:
+        discounts = discounts.unsqueeze(-1)
+    discounts = discounts[:, 1:]
+    actions = data["action"][:, 1:]
+
+    # Update order is intentional: slow-target sync, then actor and critic updates.
+    critic.update_slow_target()
+    target, weights, values = critic.compute_targets(feat, rewards, discounts=discounts)
+    actor_metrics = actor.update(feat, actions, target, weights, values)
+    critic_metrics = critic.update_from_targets(feat, target, weights)
+
+    out = {f"actor/{k}": v for k, v in actor_metrics.items()}
+    out.update({f"critic/{k}": v for k, v in critic_metrics.items()})
+    out.update(tools.tensorstats(rewards, "env_reward"))
+    return out
+
+
+def _critic_only_step(wm, critic, batch, config):
+    with torch.no_grad():
+        data = wm.preprocess(dict(batch))
+        embed = wm.encoder(data)
+        post, _ = wm.dynamics.observe(embed, data["action"], data["is_first"])
+        feat = wm.dynamics.get_feat(post)
 
     rewards = data["reward"][:, 1:]
     discounts = data.get("discount")
     if discounts is None:
         discounts = config.discount * (1.0 - data["is_terminal"]).unsqueeze(-1)
-    else:
-        if discounts.ndim == 2:
-            discounts = discounts.unsqueeze(-1)
+    elif discounts.ndim == 2:
+        discounts = discounts.unsqueeze(-1)
     discounts = discounts[:, 1:]
 
-    # Required update order.
     critic.update_slow_target()
-    target, weights, value_seq = critic.compute_targets(
-        feat_real, rewards, discounts=discounts
+    target, weights, _ = critic.compute_targets(feat, rewards, discounts=discounts)
+    critic_metrics = critic.update_from_targets(feat, target, weights)
+
+    out = {f"critic/{k}": v for k, v in critic_metrics.items()}
+    out.update(tools.tensorstats(rewards, "env_reward"))
+    return out
+
+
+def _critic_pretrain(wm, critic, episodes, config, logger, batch_size: int):
+    pretrain_steps = int(getattr(config, "rl_critic_pretrain_steps", 0))
+    if pretrain_steps <= 0:
+        return
+    valid_episodes = [ep for ep in episodes if len(ep.get("action", ())) > 1]
+    if not valid_episodes:
+        raise RuntimeError("Critic pretraining requested but no episodes were loaded.")
+
+    pretrain_log_every = int(
+        getattr(config, "rl_critic_pretrain_log_every", getattr(config, "log_every", 100))
     )
+    print(
+        "Starting critic pretraining: "
+        f"steps={pretrain_steps} episodes={len(valid_episodes)} batch={int(batch_size)}"
+    )
+    metrics_acc = defaultdict(list)
+    for pre_step in range(1, pretrain_steps + 1):
+        batch = _sample_batch(valid_episodes, config, config.device, batch_size)
+        step_metrics = _critic_only_step(wm, critic, batch, config)
+        for name, value in step_metrics.items():
+            metrics_acc[name].append(_mean_scalar(value))
 
-    actions = data["action"][:, 1:]
-    actor_metrics = actor.update(feat_real, actions, target, weights, value_seq)
-    critic_metrics = critic.update_from_targets(feat_real, target, weights)
+        should_log = pretrain_log_every > 0 and (
+            pre_step % pretrain_log_every == 0 or pre_step == pretrain_steps
+        )
+        if should_log:
+            logger.step = pre_step
+            logger.scalar("pretrain/step", pre_step)
+            for name, values in metrics_acc.items():
+                logger.scalar(f"pretrain/{name}", float(np.mean(values)))
+            logger.write(fps=False)
+            metrics_acc.clear()
+    print("Critic pretraining complete.")
 
-    metrics = {}
-    metrics.update({f"actor/{k}": v for k, v in actor_metrics.items()})
-    metrics.update({f"critic/{k}": v for k, v in critic_metrics.items()})
-    metrics.update(tools.tensorstats(rewards, "env_reward"))
-    return metrics
+
+def evaluate_online(wm, policy, config, envs):
+    wm.eval()
+    policy.eval()
+
+    device = config.device
+    num_envs = len(envs)
+    total_episodes = int(getattr(config, "eval_episodes", 0))
+    max_env_steps = int(getattr(config, "max_env_steps", 500))
+    if total_episodes <= 0 or num_envs <= 0:
+        return {"eval_online/success_rate": 0.0, "eval_online/mean_return": 0.0}
+
+    obs_batch = [None] * num_envs
+    rssm_state = None
+    prev_action = torch.zeros((num_envs, config.num_actions), device=device)
+    is_first = torch.ones(num_envs, device=device)
+
+    ep_rewards = [0.0] * num_envs
+    ep_steps = [0] * num_envs
+    ep_success = [False] * num_envs
+
+    completed = 0
+    assigned = 0
+    returns = []
+    successes = []
+
+    for i in range(num_envs):
+        if assigned >= total_episodes:
+            break
+        obs_batch[i] = _to_model_obs(envs[i].reset()())
+        assigned += 1
+
+    while completed < total_episodes:
+        active = [i for i, obs in enumerate(obs_batch) if obs is not None]
+        if not active:
+            break
+
+        template = obs_batch[active[0]]
+        model_obs = [
+            obs_batch[i] if obs_batch[i] is not None else {k: np.zeros_like(v) for k, v in template.items()}
+            for i in range(num_envs)
+        ]
+        data = _stack_obs(model_obs, device)
+
+        with torch.no_grad():
+            embed = wm.encoder(data)
+            post, _ = wm.dynamics.obs_step(rssm_state, prev_action, embed, is_first, sample=False)
+            rssm_state = post
+            feat = wm.dynamics.get_feat(post)
+            action_tensor = policy(feat)
+            if getattr(config, "clip_actions", True):
+                action_tensor = torch.clamp(action_tensor, -1.0, 1.0)
+            prev_action = action_tensor
+
+        action_np = action_tensor.detach().cpu().numpy()
+        step_promises = {i: envs[i].step(action_np[i]) for i in active}
+        for i in active:
+            raw_obs, reward, done, info = step_promises[i]()
+            success = bool(info.get("success", False))
+            ep_rewards[i] += float(reward)
+            ep_steps[i] += 1
+            ep_success[i] = ep_success[i] or success
+
+            env_done = bool(done) or success or (ep_steps[i] >= max_env_steps)
+            if env_done:
+                completed += 1
+                returns.append(ep_rewards[i])
+                successes.append(ep_success[i])
+                if assigned < total_episodes:
+                    obs_batch[i] = _to_model_obs(envs[i].reset()())
+                    ep_rewards[i] = 0.0
+                    ep_steps[i] = 0
+                    ep_success[i] = False
+                    assigned += 1
+                    is_first[i] = 1.0
+                    prev_action[i] = 0.0
+                else:
+                    obs_batch[i] = None
+                    is_first[i] = 0.0
+                    prev_action[i] = 0.0
+            else:
+                obs_batch[i] = _to_model_obs(raw_obs)
+                is_first[i] = 0.0
+
+    return {
+        "eval_online/success_rate": float(np.mean(successes)) if successes else 0.0,
+        "eval_online/mean_return": float(np.mean(returns)) if returns else 0.0,
+    }
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def _load_wm_from_checkpoint(wm, checkpoint_path: str, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if "wm" in checkpoint:
+        wm.load_state_dict(checkpoint["wm"])
+        return
+    if "world_model" in checkpoint:
+        wm.load_state_dict(checkpoint["world_model"])
+        return
+    state = checkpoint.get("agent_state_dict", {})
+    wm_state = {k[len("_wm.") :]: v for k, v in state.items() if k.startswith("_wm.")}
+    if not wm_state:
+        wm_state = {
+            k[len("_wm._orig_mod.") :]: v for k, v in state.items() if k.startswith("_wm._orig_mod.")
+        }
+    if not wm_state:
+        raise KeyError("Checkpoint missing world model weights.")
+    wm.load_state_dict(wm_state, strict=False)
+
 
 def rl_train(config):
     tools.set_seed_everywhere(int(config.seed))
-
     if "cuda" not in str(config.device) or not torch.cuda.is_available():
         config.precision = 32
 
-    logdir = pathlib.Path(config.logdir or "logdir/rl_train")
+    logdir = pathlib.Path(getattr(config, "logdir", "logdir/rl_train"))
     logdir.mkdir(parents=True, exist_ok=True)
     config.logdir = str(logdir)
     logger = tools.Logger(logdir, 0)
@@ -402,17 +448,13 @@ def rl_train(config):
 
     ref_dir = getattr(config, "expert_dir", "") or getattr(config, "offline_traindir", "")
     if not ref_dir:
-        raise ValueError(
-            "expert_dir or offline_traindir must be provided to infer obs/act shapes"
-        )
-
+        raise ValueError("expert_dir or offline_traindir must be provided.")
     ref_eps = tools.load_episodes(ref_dir, limit=1)
     if not ref_eps:
-        raise RuntimeError(f"No episodes found in {ref_dir} to infer spaces")
-
+        raise RuntimeError(f"No episodes found in {ref_dir}")
     sample_ep = next(iter(ref_eps.values()))
     obs_space, act_space = tools._define_spaces(sample_ep, config)
-    config.num_actions = act_space.shape[0]
+    config.num_actions = int(act_space.shape[0])
 
     wm = WorldModel(obs_space, act_space, 0, config).to(config.device)
     feat_size = (
@@ -423,160 +465,117 @@ def rl_train(config):
     actor = Actor(config, feat_size, config.num_actions).to(config.device)
     critic = Critic(config, feat_size).to(config.device)
 
-    ckpt_path = getattr(config, "checkpoint", "")
-    if not ckpt_path:
-        candidate = logdir / "latest.pt"
-        if candidate.exists():
-            ckpt_path = str(candidate)
-
-    if ckpt_path:
-        print(f"Loading checkpoint from {ckpt_path}")
-        policy_init = str(getattr(config, "policy_init", "")).strip().lower()
-        if not policy_init:
-            policy_init = (
-                "checkpoint"
-                if bool(getattr(config, "load_actor_from_checkpoint", False))
-                else "random"
-            )
-
+    ckpt_path = getattr(config, "checkpoint", "") or str(logdir / "latest.pt")
+    if ckpt_path and pathlib.Path(ckpt_path).exists():
+        policy_init = str(getattr(config, "policy_init", "")).strip().lower() or (
+            "checkpoint" if bool(getattr(config, "load_actor_from_checkpoint", False)) else "random"
+        )
+        print(f"Loading checkpoint ({policy_init}) from {ckpt_path}")
         if policy_init == "checkpoint":
             _load_pretrained_finetune(wm, actor, ckpt_path, config.device)
-        elif policy_init == "random":
-            checkpoint = torch.load(ckpt_path, map_location=config.device)
-            if "wm" in checkpoint:
-                wm.load_state_dict(checkpoint["wm"])
-            elif "world_model" in checkpoint:
-                wm.load_state_dict(checkpoint["world_model"])
-            elif "agent_state_dict" in checkpoint:
-                wm_state = {
-                    k[len("_wm.") :]: v
-                    for k, v in checkpoint["agent_state_dict"].items()
-                    if k.startswith("_wm.")
-                }
-                if not wm_state:
-                    wm_state = {
-                        k[len("_wm._orig_mod.") :]: v
-                        for k, v in checkpoint["agent_state_dict"].items()
-                        if k.startswith("_wm._orig_mod.")
-                    }
-                if not wm_state:
-                    raise KeyError("Checkpoint missing world model weights.")
-                wm.load_state_dict(wm_state, strict=False)
-            else:
-                raise KeyError("Checkpoint missing world model weights.")
         else:
-            raise ValueError(
-                f"Unknown policy_init='{policy_init}'. Use 'random' or 'checkpoint'."
-            )
+            _load_wm_from_checkpoint(wm, ckpt_path, config.device)
     else:
-        print("[warn] No checkpoint provided; world model will be randomly initialized.")
+        print("[warn] No checkpoint provided; world model starts random.")
 
-    # Keep world model frozen for RL.
     wm.eval()
     wm.requires_grad_(False)
-
-    num_collect_envs = int(getattr(config, "num_collect_envs", getattr(config, "envs", 4)))
-    num_eval_envs = int(getattr(config, "num_eval_envs", getattr(config, "num_envs", 4)))
-    collect_envs = _make_env_workers(config, num_collect_envs, purpose="collect")
-    eval_envs = _make_env_workers(config, num_eval_envs, purpose="eval")
 
     total_updates = int(getattr(config, "rl_updates", getattr(config, "rl_epochs", 200)))
     collect_steps = int(getattr(config, "collect_steps", 2000))
     save_every = int(getattr(config, "save_every", 10))
     eval_every = int(getattr(config, "eval_every", 5))
-    train_batches_per_collect = int(getattr(config, "train_batches_per_collect", 1))
-    mini_batch_size = int(getattr(config, "mini_batch_size", 0))
-    if mini_batch_size <= 0:
-        mini_batch_size = int(config.batch_size)
+    batches_per_collect = int(getattr(config, "train_batches_per_collect", 1))
+    mini_batch_size = int(getattr(config, "mini_batch_size", 0)) or int(config.batch_size)
+    pretrain_steps = int(getattr(config, "rl_critic_pretrain_steps", 0))
+
+    if pretrain_steps > 0:
+        pretrain_dir = getattr(config, "rl_critic_pretrain_dir", "") or ref_dir
+        pretrain_limit = int(
+            getattr(config, "rl_critic_pretrain_dataset_size", getattr(config, "dataset_size", 0))
+            or 0
+        )
+        pretrain_eps = tools.load_episodes(
+            pretrain_dir, limit=(pretrain_limit if pretrain_limit > 0 else None)
+        )
+        if not pretrain_eps:
+            raise RuntimeError(
+                f"Critic pretraining requested but no episodes found in {pretrain_dir}"
+            )
+        _critic_pretrain(
+            wm,
+            critic,
+            list(pretrain_eps.values()),
+            config,
+            logger,
+            batch_size=mini_batch_size,
+        )
+
+    num_collect_envs = int(getattr(config, "num_collect_envs", getattr(config, "envs", 4)))
+    num_eval_envs = int(getattr(config, "num_eval_envs", getattr(config, "num_envs", 4)))
+    collect_envs = _make_envs(config, num_collect_envs, "collect")
+    eval_envs = _make_envs(config, num_eval_envs, "eval")
 
     global_env_steps = 0
+    restart_every = int(getattr(config, "env_restart_every", 0) or 0)
+    next_env_restart = None
+    if restart_every > 0:
+        next_env_restart = int(global_env_steps + restart_every)
+        print(
+            "[startup] env restarts enabled: "
+            f"every={restart_every} next_at={int(next_env_restart)}"
+        )
 
     try:
         for update in range(1, total_updates + 1):
-            print(
-                f"\n=== Update {update}/{total_updates}: collect {collect_steps} steps ==="
+            print(f"\n=== Update {update}/{total_updates}: collect {collect_steps} steps ===")
+            episodes, steps_collected, success_flags = _collect_episodes(
+                wm, actor, collect_envs, config, num_steps=collect_steps
             )
-
-            episodes, steps_collected, success_flags = collect_episodes(
-                wm,
-                actor,
-                collect_envs,
-                config,
-                num_steps=collect_steps,
-                sample=True,
-                random_actions=False,
-            )
+            if not episodes:
+                continue
             global_env_steps += int(steps_collected)
 
-            if not episodes:
-                print("No episodes collected; skipping this update.")
-                continue
+            # Recreate worker processes periodically to avoid long-run simulator instability.
+            if next_env_restart is not None and global_env_steps >= next_env_restart:
+                print(f"[runtime] restarting envs at step={global_env_steps}.")
+                _close_envs(collect_envs + eval_envs)
+                collect_envs = _make_envs(config, num_collect_envs, "collect")
+                eval_envs = _make_envs(config, num_eval_envs, "eval")
+                next_env_restart = int(global_env_steps + restart_every)
 
-            actor.train()
+            metrics_acc = defaultdict(list)
             batch = None
-            metrics_buffer = defaultdict(list)
-            for _ in range(train_batches_per_collect):
-                batch = _sample_fresh_batch(
-                    episodes, config, config.device, batch_size=mini_batch_size
-                )
+            for _ in range(batches_per_collect):
+                batch = _sample_batch(episodes, config, config.device, mini_batch_size)
                 step_metrics = _train_step(wm, actor, critic, batch, config)
-                for k, v in step_metrics.items():
-                    metrics_buffer[k].append(_to_float(v))
+                for name, value in step_metrics.items():
+                    metrics_acc[name].append(_mean_scalar(value))
 
-            step_metrics = {
-                k: float(np.mean(v)) if len(v) > 0 else 0.0
-                for k, v in metrics_buffer.items()
-            }
-            step_metrics["train_batches_per_collect"] = float(train_batches_per_collect)
-            step_metrics["mini_batch_size"] = float(mini_batch_size)
-
+            train_metrics = {k: float(np.mean(v)) for k, v in metrics_acc.items()}
             ep_rewards = [float(np.asarray(ep["reward"][1:]).sum()) for ep in episodes]
             ep_lengths = [max(0, int(len(ep["reward"]) - 1)) for ep in episodes]
-            collect_metrics = {
-                "collect/episodes": len(episodes),
-                "collect/steps": int(steps_collected),
-                "collect/mean_reward": float(np.mean(ep_rewards)) if ep_rewards else 0.0,
-                "collect/mean_length": float(np.mean(ep_lengths)) if ep_lengths else 0.0,
-                "collect/success_rate": float(np.mean(success_flags)) if success_flags else 0.0,
-            }
 
             logger.step = global_env_steps
             logger.scalar("update", update)
-            for k, v in collect_metrics.items():
-                logger.scalar(k, v)
-            for k, v in step_metrics.items():
-                logger.scalar(f"train/{k}", _to_float(v))
-
-            if (
-                getattr(config, "video_pred_log", False)
-                and eval_every > 0
-                and update % eval_every == 0
-            ):
-                try:
-                    with torch.no_grad():
-                        video_pred = wm.video_pred(batch)
-                    video_np = video_pred.detach().cpu().numpy()
-                    if video_np.ndim == 4:
-                        video_np = video_np[None]
-                    logger.video("rl_openl", video_np)
-                except Exception as exc:
-                    print(f"[video_pred] failed: {exc}")
-
+            logger.scalar("collect/episodes", len(episodes))
+            logger.scalar("collect/steps", int(steps_collected))
+            logger.scalar("collect/mean_reward", float(np.mean(ep_rewards)) if ep_rewards else 0.0)
+            logger.scalar("collect/mean_length", float(np.mean(ep_lengths)) if ep_lengths else 0.0)
+            logger.scalar(
+                "collect/success_rate", float(np.mean(success_flags)) if success_flags else 0.0
+            )
+            logger.scalar("train/train_batches_per_collect", float(batches_per_collect))
+            logger.scalar("train/mini_batch_size", float(mini_batch_size))
+            for name, value in train_metrics.items():
+                logger.scalar(f"train/{name}", value)
             logger.write(fps=False)
 
             if eval_every > 0 and update % eval_every == 0:
                 print(f"Evaluating online at update {update}...")
-                online_metrics = evaluate_online(
-                    wm,
-                    actor.actionMLP,
-                    config,
-                    global_env_steps,
-                    run,
-                    eval_envs,
-                )
-                logger.step = global_env_steps
-                for name, value in online_metrics.items():
+                for name, value in evaluate_online(wm, actor.actionMLP, config, eval_envs).items():
                     logger.scalar(name, value)
+                logger.step = global_env_steps
                 logger.write(fps=False)
                 actor.train()
 
@@ -593,14 +592,9 @@ def rl_train(config):
                     logdir / "rl_latest.pt",
                 )
                 print(f"Saved checkpoint at update {update}")
-
     finally:
         print("Closing environments...")
-        for env in collect_envs + eval_envs:
-            try:
-                env.close()
-            except Exception:
-                pass
+        _close_envs(collect_envs + eval_envs)
         if run is not None and wandb is not None:
             try:
                 wandb.finish()
@@ -610,61 +604,33 @@ def rl_train(config):
     print("RL online training finished.")
 
 
-# ---------------------------------------------------------------------------
-# Config parsing
-# ---------------------------------------------------------------------------
-
-def _load_env_block(name: str | None, configs):
-    if not name:
-        return {}
-    if name not in configs:
-        raise KeyError(f"Config block '{name}' not found in configs.yaml")
-    block = configs[name] or {}
-    if not hasattr(block, "items"):
-        raise TypeError(f"Config block '{name}' must be a mapping.")
-    return block
-
-
 def _parse_config(argv=None):
-    pre_parser = argparse.ArgumentParser(add_help=False)
-    pre_parser.add_argument("--configs", nargs="+")
-    pre_parser.add_argument("--env_config", type=str, default=None)
-    args, remaining = pre_parser.parse_known_args(argv)
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--configs", nargs="+", default=[])
+    pre.add_argument("--env_config", type=str, default=None)
+    known, remaining = pre.parse_known_args(argv)
 
     cfg_path = pathlib.Path(__file__).resolve().parent.parent / "configs.yaml"
-    if hasattr(yaml, "safe_load"):
-        try:
-            configs = yaml.safe_load(cfg_path.read_text())
-        except AttributeError:
-            parser = YAML(typ="safe", pure=True)
-            configs = parser.load(cfg_path.read_text())
-    else:
-        parser = YAML(typ="safe", pure=True)
-        configs = parser.load(cfg_path.read_text())
+    configs = YAML(typ="safe", pure=True).load(cfg_path.read_text())
 
-    def recursive_update(base, update):
-        for key, value in update.items():
-            if isinstance(value, dict) and key in base:
-                recursive_update(base[key], value)
+    def merge(dst, src):
+        for k, v in src.items():
+            if isinstance(v, dict) and isinstance(dst.get(k), dict):
+                merge(dst[k], v)
             else:
-                base[key] = value
+                dst[k] = v
 
-    name_list = ["defaults", *(args.configs or [])]
     defaults = {}
-    for name in name_list:
-        recursive_update(defaults, configs[name])
+    for name in ["defaults", *known.configs]:
+        merge(defaults, configs[name])
 
+    env_defaults = configs.get(known.env_config, {}) if known.env_config else {}
     complex_defaults = {}
-    env_defaults = {}
-    if args.env_config:
-        print(f"Loading env config block: {args.env_config}")
-        env_defaults = _load_env_block(args.env_config, configs)
-        if env_defaults:
-            for k, v in env_defaults.items():
-                if hasattr(v, "items") or isinstance(v, (list, tuple)):
-                    complex_defaults[k] = v
-                else:
-                    defaults[k] = v
+    for k, v in env_defaults.items():
+        if isinstance(v, (dict, list, tuple)):
+            complex_defaults[k] = v
+        else:
+            defaults[k] = v
 
     defaults.setdefault("rl_updates", defaults.get("rl_epochs", 200))
     defaults.setdefault("collect_steps", 2000)
@@ -675,34 +641,32 @@ def _parse_config(argv=None):
     defaults.setdefault("clip_actions", True)
     defaults.setdefault("checkpoint", "")
     defaults.setdefault("expert_dir", defaults.get("offline_traindir", ""))
-    defaults.setdefault("num_workers", 0)
-    defaults.setdefault("eval_only", False)
-
-    defaults.setdefault("load_actor_from_checkpoint", False)
     defaults.setdefault("policy_init", "random")
     defaults.setdefault("train_batches_per_collect", 1)
     defaults.setdefault("mini_batch_size", 0)
+    defaults.setdefault("rl_critic_pretrain_steps", 0)
+    defaults.setdefault("rl_critic_pretrain_log_every", defaults.get("log_every", 100))
+    defaults.setdefault("rl_critic_pretrain_dataset_size", defaults.get("dataset_size", 0))
+    defaults.setdefault("rl_critic_pretrain_dir", "")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--configs", nargs="+")
-    parser.add_argument("--env_config", type=str, default=None)
-
-    for key, value in sorted(defaults.items(), key=lambda x: x[0]):
+    parser.add_argument("--env_config", type=str, default=known.env_config)
+    for key, value in sorted(defaults.items()):
         if key in complex_defaults:
             continue
-        arg_type = tools.args_type(value)
-        parser.add_argument(f"--{key}", type=arg_type, default=arg_type(value))
+        typ = tools.args_type(value)
+        parser.add_argument(f"--{key}", type=typ, default=typ(value))
 
     config = parser.parse_args(remaining)
-    for k, v in complex_defaults.items():
-        setattr(config, k, v)
-    if args.env_config:
-        setattr(config, "env_config", args.env_config)
+    for key, value in complex_defaults.items():
+        setattr(config, key, value)
+    if known.env_config:
+        setattr(config, "env_config", known.env_config)
         if "controller_configs" in env_defaults:
             setattr(config, "controller_configs", env_defaults["controller_configs"])
     return config
 
 
 if __name__ == "__main__":
-    cfg = _parse_config()
-    rl_train(cfg)
+    rl_train(_parse_config())

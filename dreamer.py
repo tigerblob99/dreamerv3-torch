@@ -1,4 +1,5 @@
 import argparse
+import datetime
 import functools
 import os
 import pathlib
@@ -171,12 +172,23 @@ def count_steps(folder):
     return sum(int(str(n).split("-")[-1][:-4]) - 1 for n in folder.glob("*.npz"))
 
 
-def make_dataset(episodes, config=None, *, batch_size=None, batch_length=None):
+def make_dataset(
+    episodes,
+    config=None,
+    *,
+    batch_size=None,
+    batch_length=None,
+    episode_sampling=None,
+):
     if config is not None:
         if batch_size is None:
             batch_size = getattr(config, "batch_size", None)
         if batch_length is None:
             batch_length = getattr(config, "batch_length", None)
+        if episode_sampling is None:
+            episode_sampling = getattr(config, "dataset_episode_sampling", "shorter")
+    if episode_sampling is None:
+        episode_sampling = "shorter"
     if batch_size is None or batch_length is None:
         raise ValueError(
             "make_dataset requires either a config with batch_size and batch_length "
@@ -196,7 +208,9 @@ def make_dataset(episodes, config=None, *, batch_size=None, batch_length=None):
             device=(getattr(config, "device", None) if config is not None else None),
         )
         return dataset
-    generator = tools.sample_episodes(episodes, batch_length)
+    generator = tools.sample_episodes(
+        episodes, batch_length, sampling_mode=episode_sampling
+    )
     dataset = tools.from_generator(generator, batch_size)
     return dataset
 
@@ -247,9 +261,9 @@ def make_env(config, mode, id):
         env = crafter.Crafter(task, config.size, seed=config.seed + id)
         env = wrappers.OneHotAction(env)
     elif suite == "robosuite":
-        from envs.robosuite_env import make_lift_env
+        from envs.robosuite_env import make_Robosuite_env
 
-        env = make_lift_env(config, seed=config.seed + id)
+        env = make_Robosuite_env(config, seed=config.seed + id)
         env = wrappers.NormalizeActions(env)
     elif suite == "minecraft":
         import envs.minecraft as minecraft
@@ -285,6 +299,8 @@ def main(config):
     config.eval_every //= config.action_repeat
     config.log_every //= config.action_repeat
     config.time_limit //= config.action_repeat
+    if getattr(config, "env_restart_every", 0):
+        config.env_restart_every //= config.action_repeat
     if config.eval_only:
         config.eval_episode_num = 1
     config.dataset_backend = str(
@@ -299,6 +315,9 @@ def main(config):
     config.dataset_store_float_dtype = str(
         getattr(config, "dataset_store_float_dtype", "float32")
     )
+    config.dataset_episode_sampling = str(
+        getattr(config, "dataset_episode_sampling", "shorter")
+    ).lower()
 
     def _episode_stats(episodes):
         if not episodes:
@@ -319,10 +338,14 @@ def main(config):
 
     # --- Weights & Biases init; sync existing TensorBoard logs automatically ---
     os.environ.setdefault("WANDB_LOGDIR", str(logdir))
+    date_tag = datetime.datetime.now().strftime("%Y%m%d")
+    logdir_name = logdir.name or "logdir"
+    default_wandb_name = f"{config.task}-{logdir_name}-{date_tag}"
+    wandb_name = os.getenv("WANDB_NAME", default_wandb_name)
     run = wandb.init(
         project=os.getenv("WANDB_PROJECT", "dreamerv3_can"),
         entity=os.getenv("WANDB_ENTITY"),                 # optional
-        name=os.getenv("WANDB_NAME"),                     # optional
+        name=wandb_name,
         config=vars(config),                              # capture all flags
         dir=str(logdir),                                  # keep run files in logdir
         sync_tensorboard=True,                            # mirror TB scalars/images/videos to W&B
@@ -358,7 +381,7 @@ def main(config):
             raise ValueError(
                 "expert_data_fraction requires expert data, but config.exptdir is not set."
             )
-        expt_eps = tools.load_episodes(exptdir, limit=10000)
+        expt_eps = tools.load_episodes(exptdir, limit=30000)
         if not expt_eps:
             raise ValueError(f"No expert episodes found in {exptdir}.")
 
@@ -373,7 +396,8 @@ def main(config):
         "[startup] dataset backend="
         f"{config.dataset_backend}, gpu_fallback={config.dataset_gpu_fallback}, "
         f"store_image_dtype={config.dataset_store_image_dtype}, "
-        f"store_float_dtype={config.dataset_store_float_dtype}"
+        f"store_float_dtype={config.dataset_store_float_dtype}, "
+        f"episode_sampling={config.dataset_episode_sampling}"
     )
     print(
         "[startup] expert fraction="
@@ -451,25 +475,29 @@ def main(config):
         )
         return stats
 
-    make = lambda mode, id: make_env(config, mode, id)
-    if config.parallel:
-        train_envs = [
-            Parallel(
-                lambda cfg=config, mode="train", idx=i: make_env(cfg, mode, idx),
-                "process",
-            )
-            for i in range(config.envs)
-        ]
-        eval_envs = [
-            Parallel(
-                lambda cfg=config, mode="eval", idx=i: make_env(cfg, mode, idx),
-                "process",
-            )
-            for i in range(config.envs//2)
-        ]
-    else:
-        train_envs = [Damy(make("train", i)) for i in range(config.envs)]
-        eval_envs = [Damy(make("eval", i)) for i in range(config.envs//2)]
+    def _build_envs():
+        make = lambda mode, id: make_env(config, mode, id)
+        if config.parallel:
+            train = [
+                Parallel(
+                    lambda cfg=config, mode="train", idx=i: make_env(cfg, mode, idx),
+                    "process",
+                )
+                for i in range(config.envs)
+            ]
+            evals = [
+                Parallel(
+                    lambda cfg=config, mode="eval", idx=i: make_env(cfg, mode, idx),
+                    "process",
+                )
+                for i in range(config.envs // 2)
+            ]
+        else:
+            train = [Damy(make("train", i)) for i in range(config.envs)]
+            evals = [Damy(make("eval", i)) for i in range(config.envs)]
+        return train, evals
+
+    train_envs, eval_envs = _build_envs()
     acts = train_envs[0].action_space
     print("Action Space", acts)
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
@@ -516,13 +544,19 @@ def main(config):
         if expert_batch_size <= 0:
             source = replay_store if use_gpu_dataset else train_eps
             train_dataset = make_dataset(
-                source, batch_size=config.batch_size, batch_length=config.batch_length
+                source,
+                config=config,
+                batch_size=config.batch_size,
+                batch_length=config.batch_length,
             )
             print("[startup] train dataset source: replay only")
         elif expert_batch_size >= config.batch_size:
             source = expert_store if use_gpu_dataset else expt_eps
             train_dataset = make_dataset(
-                source, batch_size=config.batch_size, batch_length=config.batch_length
+                source,
+                config=config,
+                batch_size=config.batch_size,
+                batch_length=config.batch_length,
             )
             print("[startup] train dataset source: expert only")
         else:
@@ -530,11 +564,13 @@ def main(config):
             expert_source = expert_store if use_gpu_dataset else expt_eps
             train_dataset = make_dataset(
                 replay_source,
+                config=config,
                 batch_size=replay_batch_size,
                 batch_length=config.batch_length,
             )
             expt_dataset = make_dataset(
                 expert_source,
+                config=config,
                 batch_size=expert_batch_size,
                 batch_length=config.batch_length,
             )
@@ -544,6 +580,7 @@ def main(config):
             )
     eval_dataset = make_dataset(
         eval_eps,
+        config=config,
         batch_size=config.batch_size,
         batch_length=config.batch_length,
     )
@@ -610,6 +647,15 @@ def main(config):
         return
 
     # make sure eval will be executed once after config.steps
+    next_env_restart = None
+    if int(getattr(config, "env_restart_every", 0) or 0) > 0:
+        # agent._step may resume from a checkpoint / existing replay, so schedule
+        # restarts relative to the current step instead of assuming step=0.
+        next_env_restart = int(agent._step + int(config.env_restart_every))
+        print(
+            "[startup] env restarts enabled: "
+            f"every={int(config.env_restart_every)} next_at={int(next_env_restart)}"
+        )
     while agent._step < config.steps + config.eval_every:
         logger.write()
         if config.eval_episode_num > 0:
@@ -644,6 +690,18 @@ def main(config):
             action_repeat=config.action_repeat,
             on_episode_done=(_on_train_episode_done if use_gpu_dataset else None),
         )
+        if next_env_restart is not None and agent._step >= next_env_restart:
+            print(f"[runtime] restarting envs at step={agent._step}.")
+            for env in train_envs + eval_envs:
+                try:
+                    env.close()
+                except Exception:
+                    pass
+            train_envs, eval_envs = _build_envs()
+            state = None
+            if isinstance(train_cache, dict):
+                train_cache.clear()
+            next_env_restart = int(agent._step + int(config.env_restart_every))
         items_to_save = {
             "agent_state_dict": agent.state_dict(),
             "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),

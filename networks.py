@@ -664,7 +664,7 @@ class MLP(nn.Module):
                 self.mean_layer[name] = nn.Linear(inp_dim, np.prod(shape))
             self.mean_layer.apply(tools.uniform_weight_init(outscale))
             if self._std == "learned":
-                assert dist in ("tanh_normal", "normal", "trunc_normal", "huber"), dist
+                assert dist in ("tanh_normal", "normal", "trunc_normal", "huber", "faithful_normal"), dist
                 self.std_layer = nn.ModuleDict()
                 for name, shape in self._shape.items():
                     self.std_layer[name] = nn.Linear(inp_dim, np.prod(shape))
@@ -673,7 +673,7 @@ class MLP(nn.Module):
             self.mean_layer = nn.Linear(inp_dim, np.prod(self._shape))
             self.mean_layer.apply(tools.uniform_weight_init(outscale))
             if self._std == "learned":
-                assert dist in ("tanh_normal", "normal", "trunc_normal", "huber"), dist
+                assert dist in ("tanh_normal", "normal", "trunc_normal", "huber", "faithful_normal"), dist
                 self.std_layer = nn.Linear(units, np.prod(self._shape))
                 self.std_layer.apply(tools.uniform_weight_init(outscale))
 
@@ -690,7 +690,10 @@ class MLP(nn.Module):
             for name, shape in self._shape.items():
                 mean = self.mean_layer[name](out)
                 if self._std == "learned":
-                    std = self.std_layer[name](out)
+                    # Detach trunk features for std head so std loss
+                    # only updates std_layer (faithful heteroscedasticity)
+                    std_input = out.detach() if self._dist == "faithful_normal" else out
+                    std = self.std_layer[name](std_input)
                 else:
                     std = self._std
                 dists.update({name: self.dist(self._dist, mean, std, shape)})
@@ -698,7 +701,8 @@ class MLP(nn.Module):
         else:
             mean = self.mean_layer(out)
             if self._std == "learned":
-                std = self.std_layer(out)
+                std_input = out.detach() if self._dist == "faithful_normal" else out
+                std = self.std_layer(std_input)
             else:
                 std = self._std
             return self.dist(self._dist, mean, std, self._shape)
@@ -720,6 +724,13 @@ class MLP(nn.Module):
             dist = torchd.normal.Normal(torch.tanh(mean), std)
             dist = tools.ContDist(
                 torchd.independent.Independent(dist, 1), absmax=self._absmax
+            )
+        elif dist == "faithful_normal":
+            std = (self._max_std - self._min_std) * torch.sigmoid(
+                std + 2.0
+            ) + self._min_std
+            dist = tools.FaithfulContDist(
+                torch.tanh(mean), std, absmax=self._absmax
             )
         elif dist == "normal_std_fixed":
             dist = torchd.normal.Normal(mean, self._std)

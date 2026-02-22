@@ -6,6 +6,7 @@ import pathlib
 import sys
 from types import SimpleNamespace
 
+import matplotlib.pyplot as plt
 import numpy as np
 import ruamel.yaml as yaml
 import torch
@@ -16,8 +17,10 @@ from AC_RL.actor import Actor
 from AC_RL.critic import Critic
 from AC_RL.RlDataset import RlDataset
 from models import WorldModel
+from evals.EvalDataset import EvalDataset
 from joint_train import collate_episodes, EnvWorker, evaluate_online
 from parallel import Parallel
+from bc_mlp.BC_MLP_eval import _prepare_obs
 from rewards.DITTO import DittoReward
 from rewards.Gail import GailReward
 
@@ -43,9 +46,15 @@ def _make_batch_iter(dataset, config):
 
 def _build_reward_model(config, feat_size):
     name = str(getattr(config, "reward_model", "ditto")).lower()
+    reward_scale = float(getattr(config, "reward_scale", 1.0))
+    reward_shift = float(getattr(config, "reward_shift", 0.0))
     if name in {"ditto", "mse", "max_cos", "cos"}:
         metric = getattr(config, "reward_metric", "max_cos")
-        return DittoReward(metric=metric)
+        return DittoReward(
+            metric=metric,
+            reward_scale=reward_scale,
+            reward_shift=reward_shift,
+        )
     if name == "gail":
         return GailReward(
             input_dim=feat_size,
@@ -54,6 +63,8 @@ def _build_reward_model(config, feat_size):
             lr=float(getattr(config, "gail_lr", 1e-4)),
             act=str(getattr(config, "act", "SiLU")),
             use_transitions=bool(getattr(config, "gail_use_transitions", True)),
+            reward_scale=reward_scale,
+            reward_shift=reward_shift,
         )
     raise ValueError(f"Unknown reward_model: {name}")
 
@@ -148,6 +159,277 @@ def _imagine_policy(wm, actor, start_state, horizon):
     return feats, actions
 
 
+def _build_expert_sequence(batch, horizon: int):
+    horizon = int(horizon)
+    if horizon <= 0:
+        raise ValueError("ditto_verify_horizon must be > 0")
+
+    expert = {}
+    for warmup_key, warmup_value in batch.items():
+        if not warmup_key.startswith("warmup_"):
+            continue
+        base_key = warmup_key[len("warmup_") :]
+        target_key = f"target_{base_key}"
+        if target_key not in batch:
+            continue
+        if not torch.is_tensor(warmup_value):
+            continue
+        target_value = batch[target_key]
+        if not torch.is_tensor(target_value):
+            continue
+        warm = warmup_value[:, -1:]
+        if horizon > 1:
+            tail = target_value[:, : horizon - 1]
+            seq = torch.cat([warm, tail], dim=1)
+        else:
+            seq = warm
+        expert[base_key] = seq
+
+    required = ("image", "action", "is_first", "is_terminal")
+    missing = [k for k in required if k not in expert]
+    if missing:
+        raise KeyError(
+            "ditto_verify missing required expert keys from EvalDataset batch: "
+            + ", ".join(missing)
+        )
+
+    t = min(horizon, expert["action"].shape[1], expert["is_terminal"].shape[1])
+    for key in list(expert.keys()):
+        expert[key] = expert[key][:, :t]
+
+    expert_is_first = torch.zeros_like(expert["is_first"], dtype=torch.float32)
+    expert_is_first[:, 0] = 1.0
+    expert["is_first"] = expert_is_first
+    return expert, t
+
+
+def ditto_verify(wm, actor, reward_model, config, step, run, eval_envs):
+    if eval_envs is None or len(eval_envs) == 0:
+        print("Skipping ditto_verify: eval_envs unavailable.")
+        return
+    if not bool(getattr(config, "robosuite_reward_shaping", False)):
+        raise ValueError("ditto_verify requires robosuite_reward_shaping=True.")
+
+    hdf5_path = str(getattr(config, "ditto_verify_hdf5_path", "")).strip()
+    eval_dir = str(getattr(config, "ditto_verify_evaldir", "")).strip()
+    if not eval_dir:
+        eval_dir = str(
+            getattr(config, "offline_evaldir", "")
+            or getattr(config, "expert_dir", "")
+            or getattr(config, "offline_traindir", "")
+        ).strip()
+    if not hdf5_path:
+        raise ValueError("ditto_verify_hdf5_path must be set when ditto_verify=True.")
+    if not eval_dir:
+        raise ValueError(
+            "ditto_verify_evaldir (or offline_evaldir/expert_dir fallback) must be set "
+            "when ditto_verify=True."
+        )
+
+    horizon = int(getattr(config, "ditto_verify_horizon", 20))
+    max_batches = int(getattr(config, "ditto_verify_batches", 1))
+    warmup_len = int(getattr(config, "ditto_verify_warmup_len", 5))
+    if horizon <= 0 or max_batches <= 0:
+        return
+
+    dataset = EvalDataset(
+        hdf5_path=hdf5_path,
+        eval_dir=eval_dir,
+        config=config,
+        warmup_len=warmup_len,
+        horizon=horizon,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=len(eval_envs),
+        num_workers=0,
+        drop_last=True,
+    )
+
+    wm_mode = wm.training
+    actor_mode = actor.training
+    reward_mode = reward_model.training
+    wm.eval()
+    actor.eval()
+    reward_model.eval()
+
+    all_env_curves = []
+    all_ditto_curves = []
+
+    try:
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(loader):
+                if batch_idx >= max_batches:
+                    break
+
+                set_state_promises = [
+                    eval_envs[i].set_state(batch["env_state"][i]) for i in range(len(eval_envs))
+                ]
+                raw_obs_list = [p() for p in set_state_promises]
+
+                current_is_first = [True] * len(eval_envs)
+                current_is_terminal = [False] * len(eval_envs)
+                prev_action = torch.zeros(
+                    (len(eval_envs), config.num_actions), device=config.device
+                )
+                rssm_state = None
+
+                policy_feat_steps = []
+                env_reward_steps = []
+
+                for _ in range(horizon):
+                    processed_list = []
+                    for i in range(len(eval_envs)):
+                        processed_list.append(
+                            _prepare_obs(
+                                raw_obs_list[i],
+                                cnn_keys_order=config.bc_cnn_keys_order,
+                                mlp_keys_order=config.bc_mlp_keys_order,
+                                camera_keys=config.camera_obs_keys,
+                                flip_keys=config.flip_camera_keys,
+                                crop_height=config.image_crop_height
+                                if config.image_crop_height > 0
+                                else None,
+                                crop_width=config.image_crop_width
+                                if config.image_crop_width > 0
+                                else None,
+                                is_first=current_is_first[i],
+                                is_terminal=current_is_terminal[i],
+                                config=config,
+                            )
+                        )
+
+                    model_obs = {}
+                    keys = processed_list[0].keys()
+                    for key in keys:
+                        if key in ("is_first", "is_terminal"):
+                            model_obs[key] = np.asarray(
+                                [float(np.asarray(x[key]).reshape(-1)[0]) for x in processed_list],
+                                dtype=np.float32,
+                            )
+                        else:
+                            model_obs[key] = np.stack([np.asarray(x[key]) for x in processed_list])
+
+                    model_obs = wm.preprocess(model_obs)
+                    embed = wm.encoder(model_obs)
+                    post, _ = wm.dynamics.obs_step(
+                        rssm_state,
+                        prev_action,
+                        embed,
+                        model_obs["is_first"],
+                        sample=False,
+                    )
+                    rssm_state = post
+                    feat = wm.dynamics.get_feat(post)
+                    policy_feat_steps.append(feat)
+
+                    action = actor.generate_actions(feat, sample=False)
+                    if getattr(config, "clip_actions", False):
+                        action = torch.clamp(action, -1.0, 1.0)
+                    prev_action = action
+
+                    action_np = action.detach().cpu().numpy()
+                    step_promises = [
+                        eval_envs[i].step(action_np[i]) for i in range(len(eval_envs))
+                    ]
+                    step_results = [p() for p in step_promises]
+
+                    rewards = np.asarray([float(result[1]) for result in step_results], dtype=np.float32)
+                    dones = [bool(result[2]) for result in step_results]
+                    raw_obs_list = [result[0] for result in step_results]
+                    env_reward_steps.append(rewards)
+                    current_is_first = [False] * len(eval_envs)
+                    current_is_terminal = dones
+
+                if not policy_feat_steps or not env_reward_steps:
+                    continue
+
+                policy_feats = torch.stack(policy_feat_steps, dim=1)
+                env_rewards = np.stack(env_reward_steps, axis=1)
+
+                expert_seq, expert_t = _build_expert_sequence(batch, horizon=horizon)
+                t = min(policy_feats.shape[1], env_rewards.shape[1], expert_t)
+                if t <= 0:
+                    continue
+                policy_feats = policy_feats[:, :t]
+                for key in list(expert_seq.keys()):
+                    expert_seq[key] = expert_seq[key][:, :t]
+
+                expert_data = wm.preprocess(expert_seq)
+                expert_embed = wm.encoder(expert_data)
+                expert_post, _ = wm.dynamics.observe(
+                    expert_embed,
+                    expert_data["action"],
+                    expert_data["is_first"],
+                )
+                expert_feats = wm.dynamics.get_feat(expert_post)[:, :t]
+
+                ditto_rewards = reward_model.reward(policy_feats, expert_feats)
+                if ditto_rewards.dim() == 1:
+                    ditto_rewards = ditto_rewards.unsqueeze(1)
+                t = min(t, ditto_rewards.shape[1])
+                if t <= 0:
+                    continue
+
+                ditto_np = ditto_rewards[:, :t].detach().cpu().numpy()
+                env_np = env_rewards[:, :t]
+                for i in range(env_np.shape[0]):
+                    all_env_curves.append(env_np[i])
+                    all_ditto_curves.append(ditto_np[i])
+
+    finally:
+        dataset.close()
+        if wm_mode:
+            wm.train()
+        if actor_mode:
+            actor.train()
+        if reward_mode:
+            reward_model.train()
+
+    if not all_env_curves:
+        print("ditto_verify: no rollout curves collected.")
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    cmap = plt.get_cmap("tab20")
+    for i, (env_curve, ditto_curve) in enumerate(zip(all_env_curves, all_ditto_curves)):
+        color = cmap(i % 20)
+        t = np.arange(len(env_curve))
+        ax.plot(
+            t,
+            env_curve,
+            color=color,
+            linestyle="-",
+            alpha=0.70,
+            linewidth=1.5,
+            label="env_reward" if i == 0 else None,
+        )
+        ax.plot(
+            t,
+            ditto_curve,
+            color=color,
+            linestyle="--",
+            alpha=0.85,
+            linewidth=1.5,
+            label="ditto_reward" if i == 0 else None,
+        )
+    ax.set_xlabel("time step")
+    ax.set_ylabel("reward")
+    ax.set_title(f"DITTO Verify Rewards (step={step})")
+    ax.grid(alpha=0.2)
+    ax.legend(loc="best")
+    fig.tight_layout()
+
+    if run is not None and wandb is not None:
+        run.log(
+            {"ditto_verify/all_rollouts_reward_vs_time": wandb.Image(fig)},
+            commit=False,
+        )
+    else:
+        print("ditto_verify: wandb run not available; skipping plot logging.")
+    plt.close(fig)
+
+
 def rl_finetune(config):
 
     tools.set_seed_everywhere(int(config.seed))
@@ -234,15 +516,13 @@ def rl_finetune(config):
     amp_device = "cuda" if use_amp else "cpu"
     horizon_cfg = int(getattr(config, "imag_horizon", 0))
 
-    total_steps = int(getattr(config, "rl_steps", config.steps))
-    log_every = int(getattr(config, "rl_log_every", config.log_every))
-    save_every = int(getattr(config, "rl_save_every", config.save_every))
-    eval_every = int(getattr(config, "rl_eval_every", getattr(config, "eval_every", 0)))
+    total_steps = int(config.rl_steps)
+    log_every = int(config.rl_log_every)
+    save_every = int(config.rl_save_every)
+    eval_every = int(config.rl_eval_every)
     eval_envs = _init_eval_envs(config)
-    pretrain_steps = int(getattr(config, "rl_critic_pretrain_steps", 0))
-    pretrain_log_every = int(
-        getattr(config, "rl_critic_pretrain_log_every", log_every)
-    )
+    pretrain_steps = int(config.rl_critic_pretrain_steps)
+    pretrain_log_every = int(config.rl_critic_pretrain_log_every)
 
     if pretrain_steps > 0:
         pretrain_step_offset = 0
@@ -272,7 +552,7 @@ def rl_finetune(config):
             if getattr(config, "gail_use_transitions", True) and horizon < 2:
                 raise ValueError("Need at least 2 steps for transition rewards.")
 
-            rewards = reward_model(agent_feat, expert_feat)
+            rewards = reward_model.reward(agent_feat, expert_feat)
             #rewards = reward_model(expert_feat, expert_feat)
             #critic_metrics = critic.update(expert_feat, rewards)
             critic_metrics = critic.update(agent_feat, rewards)
@@ -315,7 +595,7 @@ def rl_finetune(config):
             if getattr(config, "gail_use_transitions", True) and horizon < 2:
                 raise ValueError("Need at least 2 steps for transition rewards.")
 
-            rewards = reward_model(agent_feat, expert_feat)
+            rewards = reward_model.reward(agent_feat, expert_feat)
 
             target, weights, value_seq, critic_metrics = critic.update(
                 agent_feat, rewards, return_targets=True
@@ -340,6 +620,8 @@ def rl_finetune(config):
                 online_metrics = evaluate_online(
                     wm, actor.actionMLP, config, step, run, eval_envs
                 )
+                if bool(getattr(config, "ditto_verify", False)):
+                    ditto_verify(wm, actor, reward_model, config, step, run, eval_envs)
                 for name, value in online_metrics.items():
                     logger.scalar(name, value)
                 logger.step = pretrain_steps + step
@@ -425,6 +707,12 @@ def _parse_config(argv=None):
     defaults.setdefault("checkpoint", "")
     defaults.setdefault("expert_dir", defaults.get("offline_traindir", ""))
     defaults.setdefault("num_workers", 0)
+    defaults.setdefault("ditto_verify", False)
+    defaults.setdefault("ditto_verify_hdf5_path", "")
+    defaults.setdefault("ditto_verify_evaldir", "")
+    defaults.setdefault("ditto_verify_warmup_len", 5)
+    defaults.setdefault("ditto_verify_horizon", 20)
+    defaults.setdefault("ditto_verify_batches", 1)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--configs", nargs="+")

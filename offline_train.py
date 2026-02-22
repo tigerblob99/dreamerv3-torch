@@ -299,6 +299,9 @@ def _setup_config(config):
     config.dataset_store_float_dtype = str(
         getattr(config, "dataset_store_float_dtype", "float32")
     )
+    config.dataset_episode_sampling = str(
+        getattr(config, "dataset_episode_sampling", "shorter")
+    ).lower()
     preserve_lengths = bool(getattr(config, "offline_eval_preserve_length", False))
     config.offline_eval_preserve_length = preserve_lengths
     if getattr(config, "eval_only", False) and config.offline_eval_batches <= 0 and not preserve_lengths:
@@ -416,7 +419,8 @@ def offline_train(config):
         "[startup] offline dataset backend="
         f"{config.dataset_backend}, gpu_fallback={config.dataset_gpu_fallback}, "
         f"store_image_dtype={config.dataset_store_image_dtype}, "
-        f"store_float_dtype={config.dataset_store_float_dtype}"
+        f"store_float_dtype={config.dataset_store_float_dtype}, "
+        f"episode_sampling={config.dataset_episode_sampling}"
     )
     print(
         f"[startup] loaded offline train episodes={len(train_eps)}, transitions={train_transitions}"
@@ -468,6 +472,7 @@ def offline_train(config):
             train_eps.clear()
         train_dataset = make_dataset(
             train_store,
+            config=config,
             batch_size=config.batch_size,
             batch_length=config.batch_length,
         )
@@ -635,6 +640,7 @@ if __name__ == "__main__":
     defaults.setdefault("image_crop_random", False)
     defaults.setdefault("dataset_backend", "cpu")
     defaults.setdefault("dataset_gpu_fallback", "hybrid")
+    defaults.setdefault("dataset_episode_sampling", "shorter")
     defaults.setdefault("dataset_store_image_dtype", "uint8")
     defaults.setdefault("dataset_store_float_dtype", "float32")
 

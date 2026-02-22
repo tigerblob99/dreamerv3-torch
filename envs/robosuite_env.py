@@ -37,6 +37,7 @@ class RobosuiteEnv(gym.Env):
         use_camera_obs: bool = True,
         camera_depths: bool = False,
         render_gpu_device: int = -1,
+        reward_scale: float = 1.0,
         reward_shift: float = 0.0,
         seed: int = 0,
     ) -> None:
@@ -81,6 +82,7 @@ class RobosuiteEnv(gym.Env):
             max_env_steps=int(horizon),
             ignore_done=ignore_done,
             seed=int(seed),
+            reward_scale=float(reward_scale),
         )
         self._env = _make_robomimic_env(env_cfg, (img_h, img_w))
 
@@ -175,11 +177,18 @@ class RobosuiteEnv(gym.Env):
     def step(self, action):  # type: ignore[override]
         action = np.asarray(action, dtype=np.float32)
         obs, reward, done, info = self._env.step(action)
-        processed = self._process_obs(obs, is_first=False, is_terminal=bool(done))
+        raw_done = bool(done)
+        env_success = bool(self._env._check_success())
+        episode_timeout = raw_done and not env_success
+        done = raw_done or env_success
+        processed = self._process_obs(obs, is_first=False, is_terminal=done)
         info = info or {}
+        info["success"] = env_success
+        info["task_success"] = env_success
+        info["episode_timeout"] = episode_timeout
         info.setdefault("discount", np.array(0.0 if done else 1.0, dtype=np.float32))
         reward = float(np.float32(reward) + self._reward_shift)
-        return processed, reward, bool(done), info
+        return processed, reward, done, info
 
     def render(self, mode="rgb_array", width=None, height=None):  # type: ignore[override]
         if mode != "rgb_array":
@@ -197,7 +206,7 @@ class RobosuiteEnv(gym.Env):
 RobosuiteLiftEnv = RobosuiteEnv
 
 
-def make_lift_env(config, seed: int):
+def make_Robosuite_env(config, seed: int):
     size = tuple(getattr(config, "size", (84, 84)))
     env = RobosuiteEnv(
         task_name=getattr(config, "robosuite_task", "Lift"),
@@ -231,6 +240,7 @@ def make_lift_env(config, seed: int):
         use_camera_obs=getattr(config, "use_camera_obs", True),
         camera_depths=getattr(config, "camera_depths", False),
         render_gpu_device=getattr(config, "robosuite_render_device", -1),
+        reward_scale=float(getattr(config, "robosuite_reward_scale", 1.0)),
         reward_shift=float(getattr(config, "robosuite_reward_shift", 0.0)),
         seed=seed,
     )

@@ -159,6 +159,7 @@ def _make_robomimic_env(cfg: EvalConfig, image_hw: Tuple[int, int]):
 		has_renderer=getattr(cfg, "has_renderer", cfg.render),
 		has_offscreen_renderer=getattr(cfg, "has_offscreen_renderer", True),
 		reward_shaping=cfg.robosuite_reward_shaping,
+		reward_scale=getattr(cfg, "reward_scale", 1.0),
 		control_freq=cfg.robosuite_control_freq,
 		horizon=cfg.max_env_steps,
 		ignore_done=getattr(cfg, "ignore_done", False),

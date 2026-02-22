@@ -36,8 +36,10 @@ class GailReward(BaseReward):
         lr: float = 1e-4,
         act: str = "SiLU",
         use_transitions: bool = True,
+        reward_scale: float = 1.0,
+        reward_shift: float = 0.0,
     ) -> None:
-        super().__init__()
+        super().__init__(reward_scale=reward_scale, reward_shift=reward_shift)
         self.use_transitions = use_transitions
         disc_input_dim = input_dim * 2 if use_transitions else input_dim
         self.discriminator = Discriminator(

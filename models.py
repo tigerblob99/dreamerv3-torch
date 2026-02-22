@@ -164,6 +164,13 @@ class WorldModel(nn.Module):
             metrics = self._model_opt(torch.mean(model_loss), self.parameters())
 
         metrics.update({f"{name}_loss": to_np(loss) for name, loss in losses.items()})
+        if "reward" in preds:
+            reward_pred = preds["reward"].mode()
+            reward_true = data["reward"]
+            # Align trailing singleton event dimension for scalar reward predictions.
+            if reward_pred.shape != reward_true.shape and reward_pred.shape[-1] == 1:
+                reward_pred = reward_pred.squeeze(-1)
+            metrics["reward_mae"] = to_np(torch.mean(torch.abs(reward_pred - reward_true)))
         metrics["kl_free"] = kl_free
         metrics["dyn_scale"] = dyn_scale
         metrics["rep_scale"] = rep_scale

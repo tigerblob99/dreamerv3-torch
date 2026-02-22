@@ -14,6 +14,7 @@ defaults:
   eval_episode_num: 10
   log_every: 1e4
   reset_every: 0
+  env_restart_every: 0
   device: 'cuda:0'
   compile: True
   precision: 32
@@ -76,9 +77,10 @@ defaults:
   model_lr: 1e-4
   opt_eps: 1e-8
   grad_clip: 1000
-  dataset_size: 100000
+  dataset_size: 300000
   dataset_backend: 'cpu'
   dataset_gpu_fallback: 'hybrid'
+  dataset_episode_sampling: 'shorter'  # 'shorter' (inverse-transition) or 'uniform'
   dataset_store_image_dtype: 'uint8'
   dataset_store_float_dtype: 'float32'
   opt: 'adam'
@@ -187,15 +189,21 @@ memorymaze:
   imag_gradient: 'reinforce'
   task: 'memorymaze_9x9'
 
-robosuite_lift:
-  prefill: 500
-  robosuite_reward_shift: -2.25
-  log_every: 500
-  logdir: logdir/robosuite_lift_run7
-  exptdir: logdir/robosuite_lift_run7/expt_eps
-  task: 'robosuite_Lift'
+robosuite:
+  units: 1024
+  env_restart_every: 5e4
+  batch_size: 32
+  train_ratio: 1024
+  prefill: 4800
+  robosuite_reward_scale: 1.0
+  robosuite_reward_shift: -1.0
+  log_every: 1000
+  dataset_episode_sampling: 'uniform'  # 'shorter' (inverse-transition) or 'uniform'
+  logdir: logdir/robosuite_can_reset_every_10k_run2
+  exptdir: datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1
+  task: 'robosuite_PickPlaceCan'
   size: [84, 84]
-  envs: 8
+  envs: 12
   action_repeat: 1
   parallel: True
   video_pred_log: true
@@ -203,7 +211,9 @@ robosuite_lift:
     {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel|aux_.*)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
   decoder:
     {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
-  robosuite_task: 'Lift'
+  actor:
+    {layers: 3, dist: 'normal', entropy: 3e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+  robosuite_task: 'PickPlaceCan'
   robosuite_robots: ['Panda']
   robosuite_controller: 'OSC_POSE'
   controller_configs:
@@ -249,7 +259,7 @@ robosuite_lift:
   dataset_gpu_fallback: 'hybrid'
   dataset_store_image_dtype: 'uint8'
   dataset_store_float_dtype: 'float32'
-  expert_data_fraction: 0.5
+  expert_data_fraction: 0.2
 
 debug:
   debug: True
@@ -429,6 +439,8 @@ joint_train:
   mlp_layers: 4          # Number of MLP layers for policy and value networks
   act: 'SiLU'              # Activation function
   norm: True               # Use layer normalization
+  action_mlp:
+      {layers: 4, units: 1024, act: 'SiLU', norm: True, dist: 'faithful_normal', std: 'learned', min_std: 0.1, max_std: 1.0, absmax: 1.0, temp: 0.1, unimix_ratio: 0.01, outscale: 1.0, symlog_inputs: False}
   actor:
       {layers: 4, dist: 'normal', entropy: 5e-2, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
   critic:
@@ -445,6 +457,8 @@ joint_train:
   grad_clip: 100.0          # Gradient clipping norm
   log_every: 100          # Logging frequency (steps)
   save_every: 10000
+  run_name: "faithful_actr_1"
+
 
   rl_critic_pretrain_steps: 3000
   rl_critic_pretrain_log_every: 50
@@ -501,7 +515,11 @@ rl_train:
 
   # --- Environment ---
   robosuite_task: 'PickPlaceCan'
-  robosuite_reward_shaping: False  # Dense shaped reward (not sparse)
+  robosuite_reward_shaping: True  # Dense shaped reward (not sparse)
+  robosuite_reward_scale: 1.0
+  robosuite_reward_shift: -1.0
+  reward_scale: 1.0
+  reward_shift: 0.0
   size: [84, 84]
   num_collect_envs: 8       # Parallel envs for experience collection
   num_eval_envs: 8          # Parallel envs for evaluation rollouts
@@ -529,6 +547,10 @@ rl_train:
   rl_updates: 200           # Number of collect-train updates
   collect_steps: 4000       # Fresh env steps collected per update
   train_batches_per_collect: 8  # Gradient updates sampled from each fresh collection
+  rl_critic_pretrain_steps: 10000   # Offline critic-only warmup steps before online rollouts
+  rl_critic_pretrain_log_every: 50
+  rl_critic_pretrain_dataset_size: 300000  # Transition cap for preload from pretrain dir
+  rl_critic_pretrain_dir: ''   # Empty -> use expert_dir / offline_traindir
 
   # --- Training ---
   policy_init: random   # checkpoint: load actor+WM, random: load WM only
@@ -549,3 +571,81 @@ rl_train:
   eval_episodes: 16         # Number of online eval episodes
   save_every: 10            # Save checkpoint every N updates
   video_pred_log: True       # Log open-loop reconstruction/prediction videos
+
+rl_finetune:
+  # --- RL_finetune.py specific run config ---
+  logdir: logdir/rl_finetune
+  checkpoint: 'logdir/joint_Play_faithful_actr_1/step_80000.pt'  # Path to pre-trained Dreamer/joint checkpoint
+  expert_dir: 'datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1'
+
+  encoder: *robomimic_encoder
+  decoder: *robomimic_decoder
+
+  # Reward model
+  reward_model: ditto
+  reward_metric: max_cos
+  reward_scale: 1.0
+  reward_shift: -1.0
+  gail_hidden_dim: 256
+  gail_layers: 2
+  gail_lr: 1e-4
+  gail_use_transitions: True
+
+  # Environment / eval env construction
+  robosuite_task: 'PickPlaceCan'
+  robosuite_reward_shaping: True
+  robosuite_reward_scale: 1.0
+  robosuite_reward_shift: -1.0
+  size: [84, 84]
+  max_env_steps: 500
+  clip_actions: True
+  num_envs: 8
+
+  # Observation keys (must match encoder)
+  camera_obs_keys: [agentview_image, robot0_eye_in_hand_image]
+  flip_camera_keys: [agentview_image, robot0_eye_in_hand_image]
+  bc_cnn_keys_order: [image]
+  bc_mlp_keys_order:
+    - robot0_joint_pos
+    - robot0_joint_vel
+    - robot0_gripper_qpos
+    - robot0_gripper_qvel
+    - aux_robot0_joint_pos_sin
+    - aux_robot0_joint_pos_cos
+  aux_key_map:
+    aux_robot0_joint_pos_sin: robot0_joint_pos_sin
+    aux_robot0_joint_pos_cos: robot0_joint_pos_cos
+  image_crop_height: 84
+  image_crop_width: 84
+
+  # Training
+  batch_size: 64
+  batch_length: 64
+  model_lr: 1e-4
+  actor:
+    {layers: 4, dist: 'normal', entropy: 5e-2, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+  critic:
+    {layers: 4, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+  discount: 0.997
+  discount_lambda: 0.95
+  num_workers: 0
+
+  # RL_finetune.py schedule keys
+  rl_steps: 50000
+  rl_log_every: 100
+  rl_save_every: 1000
+  rl_eval_every: 5000
+  eval_episodes: 16
+  rl_critic_pretrain_steps: 10000
+  rl_critic_pretrain_log_every: 100
+
+  # DITTO reward verification (state-aligned real-env rollouts)
+  ditto_verify: True
+  ditto_verify_hdf5_path: 'datasets/imagecanPH_v15.hdf5'
+  ditto_verify_evaldir: 'datasets/robomimic_data_MV/can_PH_eval'
+  ditto_verify_warmup_len: 5
+  ditto_verify_horizon: 20
+  ditto_verify_batches: 1
+
+  # Logging
+  video_pred_log: True

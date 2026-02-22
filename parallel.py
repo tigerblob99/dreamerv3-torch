@@ -14,6 +14,8 @@ import time
 import traceback
 import enum
 from functools import partial as bind
+import multiprocessing
+import cloudpickle
 
 
 class Parallel:
@@ -88,8 +90,6 @@ class Worker:
 
 class ProcessPipeWorker:
     def __init__(self, fn, initializers=(), daemon=False):
-        import multiprocessing
-        import cloudpickle
 
         self._context = multiprocessing.get_context("spawn")
         self._pipe, pipe = self._context.Pipe()
@@ -150,7 +150,6 @@ class ProcessPipeWorker:
         try:
             callid = None
             state = None
-            import cloudpickle
 
             initializers = cloudpickle.loads(initializers)
             function = cloudpickle.loads(function)
