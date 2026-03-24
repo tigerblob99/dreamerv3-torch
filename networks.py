@@ -151,7 +151,9 @@ class RSSM(nn.Module):
         prior = {k: swap(v) for k, v in prior.items()}
         return prior
 
-    def get_feat(self, state):
+    def get_feat(self, state, deterministic_only=False):
+        if deterministic_only:
+            return state["deter"]
         stoch = state["stoch"]
         if self._discrete:
             shape = list(stoch.shape[:-2]) + [self._stoch * self._discrete]

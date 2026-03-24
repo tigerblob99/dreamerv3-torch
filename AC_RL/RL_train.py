@@ -231,22 +231,17 @@ def _train_step(wm, actor, critic, batch, config):
         embed = wm.encoder(data)
         post, _ = wm.dynamics.observe(embed, data["action"], data["is_first"])
         feat = wm.dynamics.get_feat(post)
+        deter_feat = wm.dynamics.get_feat(post, deterministic_only=True)
 
     # Data format has a placeholder at t=0; learning targets start from t=1.
     rewards = data["reward"][:, 1:]
-    discounts = data.get("discount")
-    if discounts is None:
-        discounts = config.discount * (1.0 - data["is_terminal"]).unsqueeze(-1)
-    elif discounts.ndim == 2:
-        discounts = discounts.unsqueeze(-1)
-    discounts = discounts[:, 1:]
     actions = data["action"][:, 1:]
 
     # Update order is intentional: slow-target sync, then actor and critic updates.
     critic.update_slow_target()
-    target, weights, values = critic.compute_targets(feat, rewards, discounts=discounts)
-    actor_metrics = actor.update(feat, actions, target, weights, values)
-    critic_metrics = critic.update_from_targets(feat, target, weights)
+    target, values = critic.compute_targets(deter_feat, rewards)
+    actor_metrics = actor.update(feat, actions, target, values)
+    critic_metrics = critic.update_from_targets(deter_feat, target)
 
     out = {f"actor/{k}": v for k, v in actor_metrics.items()}
     out.update({f"critic/{k}": v for k, v in critic_metrics.items()})
@@ -259,19 +254,12 @@ def _critic_only_step(wm, critic, batch, config):
         data = wm.preprocess(dict(batch))
         embed = wm.encoder(data)
         post, _ = wm.dynamics.observe(embed, data["action"], data["is_first"])
-        feat = wm.dynamics.get_feat(post)
+        deter_feat = wm.dynamics.get_feat(post, deterministic_only=True)
 
     rewards = data["reward"][:, 1:]
-    discounts = data.get("discount")
-    if discounts is None:
-        discounts = config.discount * (1.0 - data["is_terminal"]).unsqueeze(-1)
-    elif discounts.ndim == 2:
-        discounts = discounts.unsqueeze(-1)
-    discounts = discounts[:, 1:]
-
     critic.update_slow_target()
-    target, weights, _ = critic.compute_targets(feat, rewards, discounts=discounts)
-    critic_metrics = critic.update_from_targets(feat, target, weights)
+    target, _ = critic.compute_targets(deter_feat, rewards)
+    critic_metrics = critic.update_from_targets(deter_feat, target)
 
     out = {f"critic/{k}": v for k, v in critic_metrics.items()}
     out.update(tools.tensorstats(rewards, "env_reward"))
@@ -462,8 +450,9 @@ def rl_train(config):
         if config.dyn_discrete
         else config.dyn_stoch + config.dyn_deter
     )
+    deter_size = int(config.dyn_deter)
     actor = Actor(config, feat_size, config.num_actions).to(config.device)
-    critic = Critic(config, feat_size).to(config.device)
+    critic = Critic(config, deter_size).to(config.device)
 
     ckpt_path = getattr(config, "checkpoint", "") or str(logdir / "latest.pt")
     if ckpt_path and pathlib.Path(ckpt_path).exists():

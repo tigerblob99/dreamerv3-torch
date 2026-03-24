@@ -313,6 +313,7 @@ def evaluate_online(wm, policy, config, step, run, envs):
     
     final_rewards = []
     final_successes = []
+    final_reward_per_step = []
     
     recorders = [
         EpisodeVideoRecorder(
@@ -422,6 +423,7 @@ def evaluate_online(wm, policy, config, step, run, envs):
             if env_done:
                 completed_episodes += 1
                 final_rewards.append(episode_rewards[i])
+                final_reward_per_step.append(episode_rewards[i] / episode_steps[i] if episode_steps[i] > 0 else 0.0)
                 final_successes.append(episode_success[i])
                 
                 vid_path = recorders[i].finish_episode() if recorders[i] else None
@@ -450,7 +452,8 @@ def evaluate_online(wm, policy, config, step, run, envs):
 
     metrics = {
         "eval_online/success_rate": np.mean(final_successes) if final_successes else 0.0,
-        "eval_online/mean_return": np.mean(final_rewards) if final_rewards else 0.0
+        "eval_online/mean_return": np.mean(final_rewards) if final_rewards else 0.0,
+        "eval_online/mean_return_per_step": np.mean(final_reward_per_step) if final_reward_per_step else 0.0
     }
     return metrics
 

@@ -55,7 +55,7 @@ defaults:
   image_crop_width: 0
   image_crop_random: False
   actor:
-    {layers: 2, dist: 'normal', entropy: 3e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+    {layers: 2, dist: 'normal', entropy: 3e-4, bc_kl_scale: 0.0, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
   critic:
     {layers: 2, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
   reward_head:
@@ -574,8 +574,10 @@ rl_train:
 
 rl_finetune:
   # --- RL_finetune.py specific run config ---
-  logdir: logdir/rl_finetune
-  checkpoint: 'logdir/joint_Play_faithful_actr_1/step_80000.pt'  # Path to pre-trained Dreamer/joint checkpoint
+  units: 512
+  logdir: logdir/rl_finetune_deter_latents_can_pretrained_wm_21_(exptklKL BC topstoc exptpretrain shorterdreams) #(wrap around dataset_less_pretrained_WM)  # Logging directory for RL fine-tuning runs
+  checkpoint: 'logdir/joint_Play_stoc_actr_2/step_50000.pt'  # Path to pre-trained Dreamer/joint checkpoint
+  dreamer_wm_checkpoint: '' #'logdir/robosuite_can_reset_every_10k_run2/latest.pt'  # Optional Dreamer checkpoint for WM override; when set, WM loads from here.
   expert_dir: 'datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1'
 
   encoder: *robomimic_encoder
@@ -597,7 +599,7 @@ rl_finetune:
   robosuite_reward_scale: 1.0
   robosuite_reward_shift: -1.0
   size: [84, 84]
-  max_env_steps: 500
+  max_env_steps: 250
   clip_actions: True
   num_envs: 8
 
@@ -619,33 +621,37 @@ rl_finetune:
   image_crop_width: 84
 
   # Training
-  batch_size: 64
-  batch_length: 64
-  model_lr: 1e-4
+  ac_batch_size: 1024
+  batch_length: 16
+  policy_units: 1024
   actor:
-    {layers: 4, dist: 'normal', entropy: 5e-2, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+    {layers: 4, dist: 'normal', entropy: 1e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 2e-4, eps: 1e-5, grad_clip: 100.0, outscale: 1.0, bc_kl_scale: 0.01}
   critic:
-    {layers: 4, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
-  discount: 0.997
+    {layers: 4, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-4, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+  discount: 0.98
   discount_lambda: 0.95
+  imag_gradient: 'dynamics'
+  imag_horizon: 16
+  reward_EMA: True
   num_workers: 0
 
   # RL_finetune.py schedule keys
-  rl_steps: 50000
+  rl_steps: 100000
   rl_log_every: 100
   rl_save_every: 1000
-  rl_eval_every: 5000
-  eval_episodes: 16
-  rl_critic_pretrain_steps: 10000
+  rl_eval_every: 1000
+  eval_episodes: 128
+  rl_critic_pretrain_steps: 2000
   rl_critic_pretrain_log_every: 100
 
   # DITTO reward verification (state-aligned real-env rollouts)
   ditto_verify: True
-  ditto_verify_hdf5_path: 'datasets/imagecanPH_v15.hdf5'
-  ditto_verify_evaldir: 'datasets/robomimic_data_MV/can_PH_eval'
+  ditto_verify_hdf5_path: 'datasets/imagecanPH_shaped.hdf5'
+  ditto_verify_evaldir: 'datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1'
   ditto_verify_warmup_len: 5
-  ditto_verify_horizon: 20
+  ditto_verify_horizon: 93
   ditto_verify_batches: 1
 
   # Logging
   video_pred_log: True
+  log_action_mse: True

@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import pathlib
 import sys
-from collections import OrderedDict
 
 import numpy as np
 import torch
@@ -26,6 +25,18 @@ sys.path.append(str(pathlib.Path(__file__).resolve().parent.parent))
 import tools
 
 _EXCLUDE_KEYS = {"action", "reward", "discount", "is_first", "is_terminal"}
+
+
+def _episode_start_weights(ep_len: int, batch_length: int) -> np.ndarray:
+    """Return uniform weights for all start indices.
+
+    With wrap-around windows every start ``0..ep_len-1`` is valid and equally
+    representative, so uniform weights suffice.
+    """
+    ep_len = int(ep_len)
+    if ep_len == 0:
+        return np.zeros((0,), dtype=np.float64)
+    return np.ones((ep_len,), dtype=np.float64)
 
 
 class RlDataset(Dataset):
@@ -72,19 +83,21 @@ class RlDataset(Dataset):
         self.num_episodes = len(self.episode_list)
 
         # Build a flat index of valid (episode_idx, start_step) pairs.
-        # Each pair identifies a contiguous window of ``batch_length`` steps
-        # that fits entirely within a single episode.
+        # With wrap-around windows every start 0..ep_len-1 is valid: when
+        # start + batch_length exceeds ep_len the window wraps to the
+        # beginning of the same episode.
         self.indices: list[tuple[int, int]] = []
+        self.sample_weights: list[float] = []
         total_steps = 0
         for ep_idx, ep in enumerate(self.episode_list):
             ep_len = len(ep["action"])
             total_steps += ep_len
-            if ep_len < self.batch_length:
+            if ep_len == 0:
                 continue
-            # The last valid start is (ep_len - batch_length).
-            max_start = ep_len - self.batch_length
-            for t in range(max_start + 1):
+            episode_weights = _episode_start_weights(ep_len, self.batch_length)
+            for t in range(ep_len):
                 self.indices.append((ep_idx, t))
+                self.sample_weights.append(float(episode_weights[t]))
 
         print(
             f"[RlDataset {mode}] Loaded {self.num_episodes} episodes, "
@@ -129,34 +142,43 @@ class RlDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         ep_idx, start = self.indices[idx]
         episode = self.episode_list[ep_idx]
-        sl = slice(start, start + self.batch_length)
+        ep_len = len(episode["action"])
+
+        # Wrap-around modular indices: when start + batch_length > ep_len
+        # the window wraps back to the beginning of the same episode.
+        indices = np.arange(start, start + self.batch_length) % ep_len
 
         # --- Image (with per-sample crop, consistent across timesteps) ---
-        raw_imgs = episode["image"][sl]
+        raw_imgs = episode["image"][indices]
         top, left = self._get_crop_coords()
         cropped_imgs = self._crop(raw_imgs, top, left)
 
         # --- Flags ---
-        is_first = episode["is_first"][sl].copy()
-        is_first[0] = True  # mark sequence boundary
+        # Compute is_first from scratch: position 0 is always a sequence
+        # boundary, and any wrap-around point (where index decreases) is
+        # also a boundary so the RSSM resets its recurrent state.
+        is_first = np.zeros(self.batch_length, dtype=np.float32)
+        is_first[0] = 1.0
+        wraps = indices[1:] <= indices[:-1]  # True wherever wrap occurs
+        is_first[1:][wraps] = 1.0
 
-        is_terminal = episode["is_terminal"][sl]
+        is_terminal = episode["is_terminal"][indices]
 
         # --- Action & reward ---
-        action = episode["action"][sl]
-        reward = episode["reward"][sl]
+        action = episode["action"][indices]
+        reward = episode["reward"][indices]
 
         # --- Discount (if present) ---
         discount = episode.get("discount")
         if discount is not None:
-            discount = discount[sl]
+            discount = discount[indices]
 
         # --- Assemble output dict ---
         out: dict[str, torch.Tensor] = {
             "image": torch.from_numpy(np.asarray(cropped_imgs)),
             "action": torch.from_numpy(np.asarray(action, dtype=np.float32)),
             "reward": torch.from_numpy(np.asarray(reward, dtype=np.float32)),
-            "is_first": torch.from_numpy(np.asarray(is_first, dtype=np.float32)),
+            "is_first": torch.from_numpy(is_first),
             "is_terminal": torch.from_numpy(np.asarray(is_terminal, dtype=np.float32)),
         }
         if discount is not None:
@@ -167,6 +189,6 @@ class RlDataset(Dataset):
         for k, v in episode.items():
             if k in skip_keys or k.startswith("log_"):
                 continue
-            out[k] = torch.from_numpy(np.asarray(v[sl], dtype=np.float32))
+            out[k] = torch.from_numpy(np.asarray(v[indices], dtype=np.float32))
 
         return out

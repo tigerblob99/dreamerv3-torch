@@ -71,47 +71,130 @@ class Actor(nn.Module):
                 return self.actionMLP(features, return_dist=True)
             return self.actionMLP(features, sample=sample)
 
-    def update(self, features, actions, target, weights, value_seq):
+    @staticmethod
+    def _normal_dist(dist, name):
+        if isinstance(dist, tools.ContDist):
+            normal = dist.base_dist
+        elif isinstance(dist, tools.FaithfulContDist):
+            normal = dist.base_dist.base_dist
+        else:
+            raise TypeError(
+                f"{name} must be ContDist or FaithfulContDist, got {type(dist).__name__}."
+            )
+        if type(normal) is not torch.distributions.Normal:
+            raise TypeError(
+                f"{name} must wrap the exact Normal used by actor dist='normal' or "
+                f"'faithful_normal', got {type(normal).__name__}."
+            )
+        if normal.loc.ndim != 3 or normal.loc.shape != normal.scale.shape:
+            raise ValueError(
+                f"{name} must have loc/scale shape [time, batch, action], got "
+                f"loc={tuple(normal.loc.shape)}, scale={tuple(normal.scale.shape)}."
+            )
+        return normal
+
+    @staticmethod
+    def _distribution_kl(policy, reference_policy, batch_size):
+        """Return a per-sample KL with shape [time, batch, 1]."""
+        policy_dist = Actor._normal_dist(policy, "policy")
+        reference_dist = Actor._normal_dist(reference_policy, "reference_policy")
+        if policy_dist.loc.shape != reference_dist.loc.shape:
+            raise ValueError(
+                "policy and reference_policy must have matching [time, batch, action] "
+                f"shapes, got {tuple(policy_dist.loc.shape)} and "
+                f"{tuple(reference_dist.loc.shape)}."
+            )
+        if policy_dist.loc.shape[1] != batch_size:
+            raise ValueError(
+                f"policy batch dimension must be {batch_size}, got "
+                f"{policy_dist.loc.shape[1]}."
+            )
+        kl = torch.distributions.kl_divergence(policy_dist, reference_dist)
+        return kl.sum(dim=-1, keepdim=True)
+
+    def _bc_kl(self, bc_actor, features):
+        feats_t = features.permute(1, 0, 2)
+        policy = self.actionMLP(feats_t.detach(), return_dist=True)
+        with torch.no_grad():
+            bc_policy = bc_actor.actionMLP(feats_t.detach(), return_dist=True)
+        return self._distribution_kl(policy, bc_policy, feats_t.shape[1])
+
+    def update(
+        self, features, actions, target, value_seq, bc_actor=None, bc_kl_features=None
+    ):
         feats_t = features.permute(1, 0, 2)
         actions_t = actions.permute(1, 0, 2)
         target_t = target
-        weights_t = weights
         baseline_t = value_seq
-        reward_len = target_t.shape[0]
-        baseline_t = baseline_t[:reward_len]
-        if weights_t.shape[0] != reward_len:
-            weights_t = weights_t[:reward_len]
+        mode = str(getattr(self._config, "imag_gradient", "reinforce")).lower()
         if target_t.ndim == 2:
             target_t = target_t.unsqueeze(-1)
-        if weights_t.ndim == 2:
-            weights_t = weights_t.unsqueeze(-1)
         if baseline_t.ndim == 2:
             baseline_t = baseline_t.unsqueeze(-1)
+        batch_size = feats_t.shape[1]
+        if target_t.ndim != 3 or target_t.shape[1:] != (batch_size, 1):
+            raise ValueError(
+                f"target must have shape [time, {batch_size}, 1], got "
+                f"{tuple(target_t.shape)}."
+            )
+        if baseline_t.ndim != 3 or baseline_t.shape[1:] != (batch_size, 1):
+            raise ValueError(
+                f"value_seq must have shape [time, {batch_size}, 1], got "
+                f"{tuple(baseline_t.shape)}."
+            )
+        reward_len = min(target_t.shape[0], feats_t.shape[0], actions_t.shape[0])
+        target_t = target_t[:reward_len]
+        baseline_t = baseline_t[:reward_len]
 
-        with tools.RequiresGrad(self.actionMLP):
-            with torch.amp.autocast(
-                device_type="cuda", enabled=self._use_amp, dtype=torch.float16
-            ):
-                policy = self.actionMLP(feats_t[:reward_len].detach(), return_dist=True)
-                log_prob = policy.log_prob(actions_t[:reward_len])[:, :, None]
-                entropy = policy.entropy()[:, :, None]
-                if self._use_reward_ema:
-                    offset, scale = self.reward_ema(target_t, self.ema_vals)
-                    normed_target = (target_t - offset) / scale
-                    normed_base = (baseline_t - offset) / scale
+        with torch.amp.autocast(
+            device_type="cuda", enabled=self._use_amp, dtype=torch.float16
+        ):
+            policy = self.actionMLP(feats_t[:reward_len].detach(), return_dist=True)
+            log_prob = policy.log_prob(actions_t[:reward_len])[:, :, None]
+            entropy = policy.entropy()[:, :, None]
+            bc_kl = None
+            bc_kl_scale = float(self._config.actor.get("bc_kl_scale", 0.0))
+            if bc_actor is not None and bc_kl_scale > 0.0:
+                kl_features = features if bc_kl_features is None else bc_kl_features
+                bc_kl = self._bc_kl(bc_actor, kl_features[:, :reward_len])
+            if self._use_reward_ema:
+                offset, scale = self.reward_ema(target_t, self.ema_vals)
+                normed_target = (target_t - offset) / scale
+                normed_base = (baseline_t - offset) / scale
+            else:
+                normed_target = None
+                normed_base = None
+
+            if mode == "dynamics":
+                dynamics_target = (
+                    normed_target if normed_target is not None else target_t
+                )
+                actor_loss = -dynamics_target
+            elif mode == "reinforce":
+                if normed_target is not None and normed_base is not None:
                     advantage = (normed_target - normed_base).detach()
                 else:
-                    normed_target = None
                     advantage = (target_t - baseline_t).detach()
-                actor_loss = -weights_t[:reward_len] * log_prob * advantage
-                actor_loss -= self._config.actor["entropy"] * entropy
-                actor_loss = torch.mean(actor_loss)
+                actor_loss = -log_prob * advantage
+            else:
+                raise NotImplementedError(
+                    "imag_gradient must be 'dynamics' or 'reinforce'."
+                )
+            actor_loss -= self._config.actor["entropy"] * entropy
+            if bc_kl is not None:
+                actor_loss += bc_kl_scale * bc_kl
+            actor_loss = torch.mean(actor_loss)
 
-        metrics = {"actor_entropy": to_np(torch.mean(entropy))}
+        metrics = {
+            "actor_entropy": to_np(torch.mean(entropy)),
+            "imag_gradient_mode": 1.0 if mode == "dynamics" else 0.0,
+        }
+        if bc_kl is not None:
+            metrics["actor_bc_kl"] = to_np(torch.mean(bc_kl))
+            metrics["actor_bc_kl_scale"] = bc_kl_scale
         if normed_target is not None:
             metrics.update(tools.tensorstats(normed_target, "normed_target"))
             metrics["EMA_005"] = to_np(self.ema_vals[0])
             metrics["EMA_095"] = to_np(self.ema_vals[1])
-        with tools.RequiresGrad(self):
-            metrics.update(self._actor_opt(actor_loss, self.actionMLP.parameters()))
+        metrics.update(self._actor_opt(actor_loss, self.actionMLP.parameters()))
         return metrics

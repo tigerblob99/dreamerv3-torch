@@ -1394,6 +1394,12 @@ class FaithfulContDist:
         self.absmax = absmax
 
     @property
+    def base_dist(self):
+        return torchd.independent.Independent(
+            torchd.normal.Normal(self._mean, self._std), 1
+        )
+
+    @property
     def mean(self):
         return self._mean
 
@@ -1405,20 +1411,14 @@ class FaithfulContDist:
         return out
 
     def sample(self, sample_shape=()):
-        dist = torchd.independent.Independent(
-            torchd.normal.Normal(self._mean, self._std), 1
-        )
-        out = dist.rsample(sample_shape)
+        out = self.base_dist.rsample(sample_shape)
         if self.absmax is not None:
             scale = (self.absmax / torch.clip(torch.abs(out), min=self.absmax)).detach()
             out = out * scale
         return out
 
     def entropy(self):
-        dist = torchd.independent.Independent(
-            torchd.normal.Normal(self._mean, self._std), 1
-        )
-        return dist.entropy()
+        return self.base_dist.entropy()
 
     def log_prob(self, x):
         # Mean term: unit variance → gradients are pure MSE for the mean/trunk
