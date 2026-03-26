@@ -1,5 +1,6 @@
 #
 run*
+!run_dreamer_sweep.sh
 logdir*
 vis_*
 result*
