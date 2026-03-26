@@ -181,12 +181,17 @@ class RobosuiteEnv(gym.Env):
         env_success = bool(self._env._check_success())
         episode_timeout = raw_done and not env_success
         done = raw_done or env_success
-        processed = self._process_obs(obs, is_first=False, is_terminal=done)
+        # Only true task completion is a real terminal; timeouts should
+        # keep discount=1 so the value function doesn't treat the horizon
+        # boundary as an absorbing state.
+        is_terminal = env_success
+        discount = 0.0 if env_success else 1.0
+        processed = self._process_obs(obs, is_first=False, is_terminal=is_terminal)
         info = info or {}
         info["success"] = env_success
         info["task_success"] = env_success
         info["episode_timeout"] = episode_timeout
-        info.setdefault("discount", np.array(0.0 if done else 1.0, dtype=np.float32))
+        info.setdefault("discount", np.array(discount, dtype=np.float32))
         reward = float(np.float32(reward) + self._reward_shift)
         return processed, reward, done, info
 
