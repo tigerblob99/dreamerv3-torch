@@ -1,0 +1,60 @@
+=== Testing container: container.sif ===
+=== Node: htc-g050, GPU: NVIDIA RTX A6000 ===
+
+== Python ==
+  [[92mPASS[0m] Python >= 3.11  (3.11.14 | packaged by conda-forge | (main, Oct 13 2025, 14:09:32) [GCC 14.3.0])
+
+== Module imports ==
+  [[92mPASS[0m] import numpy
+  [[92mPASS[0m] import scipy
+  [[92mPASS[0m] import h5py
+  [[92mPASS[0m] import numba
+  [[92mPASS[0m] import PIL
+  [[92mPASS[0m] import torch
+  [[92mPASS[0m] import torchvision
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+  [[92mPASS[0m] import gym
+  [[92mPASS[0m] import mujoco
+[robosuite WARNING] No private macro file found! (macros.py:57)
+[robosuite WARNING] It is recommended to use a private macro file (macros.py:58)
+[robosuite WARNING] To setup, run: python /opt/conda/lib/python3.11/site-packages/robosuite/scripts/setup_macros.py (macros.py:59)
+[robosuite WARNING] Could not load the mink-based whole-body IK. Make sure you install related import properly, otherwise you will not be able to use the default IK controller setting for GR1 robot. (__init__.py:40)
+  [[92mPASS[0m] import robosuite
+  [[92mPASS[0m] import robomimic
+  [[92mPASS[0m] import cv2
+  [[92mPASS[0m] import moviepy
+  [[92mPASS[0m] import imageio
+  [[92mPASS[0m] import matplotlib
+  [[92mPASS[0m] import tensorboard
+/opt/conda/lib/python3.11/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/opt/conda/lib/python3.11/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+  [[92mPASS[0m] import wandb
+  [[92mPASS[0m] import einops
+  [[92mPASS[0m] import ruamel.yaml
+  [[92mPASS[0m] import cloudpickle
+  [[92mPASS[0m] import tqdm
+
+== PyTorch ==
+  [[92mPASS[0m] torch version  (2.9.0+cu130)
+  [[92mPASS[0m] CUDA available  (1 device(s): NVIDIA RTX A6000)
+  [[92mPASS[0m] cuDNN enabled  (v91300)
+  [[92mPASS[0m] CUDA tensor ops  (matmul ok, dtype=torch.float32)
+  [[92mPASS[0m] autograd on CUDA  (backward pass ok)
+  [[92mPASS[0m] nn.Module on CUDA  (forward+backward ok)
+  [[92mPASS[0m] AMP autocast  (autocast dtype=torch.float16)
+  [[92mPASS[0m] GRUCell (RSSM)  (GRUCell ok (used by RSSM))
+
+== Environment ==
+  [[92mPASS[0m] MUJOCO_GL set  (osmesa)
+
+== MuJoCo ==
+  [[92mPASS[0m] MuJoCo simulation  (mujoco 3.3.7, sim step ok)
+
+========================================
+Results: 32/32 passed, 0 failed
+========================================
+
