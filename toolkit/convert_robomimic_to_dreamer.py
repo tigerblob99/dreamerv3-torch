@@ -3,8 +3,8 @@ Convert a RoboMimic HDF5 dataset into Dreamer-style episode `.npz` files.
 
 Example:
     python toolkit/convert_robomimic_to_dreamer.py \
-        --in_h5 datasets/imagecanPH_shaped.hdf5 \
-        --out_dir datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1 \
+        --in_h5 datasets/imageSquareMH_shaped.hdf5 \
+        --out_dir datasets/robomimic_data_MV/Square_MH_Shaped_shifted_0-1 \
         --reward_scale 1.0 \
         --reward_shift -1.0 \
         --img_keys agentview_image,robot0_eye_in_hand_image \

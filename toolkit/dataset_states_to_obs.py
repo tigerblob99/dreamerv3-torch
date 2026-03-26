@@ -29,9 +29,9 @@ Example usage:
     # extract low-dimensional observations
     python dataset_states_to_obs.py --dataset /path/to/demo.hdf5 --output_name low_dim.hdf5 --done_mode 2
     
-    # extract 84x84 image observations
-    python toolkit/dataset_states_to_obs.py --dataset datasets/liftMH_raw.hdf5 --output_name imageliftMH_shaped.hdf5 \
-        --done_mode 0 --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84 --shaped
+    # extract 84x84 image observations shaped
+    python toolkit/dataset_states_to_obs.py --dataset datasets/Square_PH_Raw.hdf5 --output_name imageSquarePH_shaped.hdf5 \
+        --done_mode 1 --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84 --shaped
 
     # extract 84x84 image and depth observations
     python dataset_states_to_obs.py --dataset /path/to/demo.hdf5 --output_name depth.hdf5 \

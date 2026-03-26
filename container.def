@@ -1,0 +1,85 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.9.0-cuda13.0-cudnn9-runtime
+
+%environment
+    export MUJOCO_GL=osmesa
+    export NUMBA_CACHE_DIR=/tmp
+    export PYTHONUNBUFFERED=1
+    export PIP_NO_CACHE_DIR=1
+    export TZ=Europe/London
+    # Singularity --nv injects host libglvnd libs (built against GLIBC 2.38)
+    # into /.singularity.d/libs/, overriding the container's copies.
+    # LD_PRELOAD forces the container's compatible versions to load first.
+    _glvnd_preload=""
+    for _lib in libGLdispatch.so.0 libGLX.so.0 libGL.so.1 libEGL.so.1 libGLESv2.so.2 libOpenGL.so.0; do
+        if [ -f "/usr/lib/x86_64-linux-gnu/$_lib" ]; then
+            _glvnd_preload="${_glvnd_preload:+$_glvnd_preload:}/usr/lib/x86_64-linux-gnu/$_lib"
+        fi
+    done
+    export LD_PRELOAD="${_glvnd_preload}${LD_PRELOAD:+:$LD_PRELOAD}"
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update && apt-get install -y \
+        vim git \
+        libgl1-mesa-glx libosmesa6 libgl1-mesa-dev \
+        wget unrar cmake g++ \
+        libx11-6 openjdk-8-jdk x11-xserver-utils xvfb \
+        && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+    pip install --upgrade pip
+    pip uninstall -y cmake || true
+
+    # ---------- Core scientific ----------
+    pip install \
+        numpy==1.26.4 \
+        scipy==1.15.3 \
+        h5py==3.15.1 \
+        pillow==11.3.0 \
+        numba==0.62.1
+
+    # ---------- RL / simulation ----------
+    pip install \
+        gym==0.22.0 \
+        mujoco==3.3.7 \
+        # dm-control==1.0.9 \
+        # memory-maze==1.0.3 \
+        # crafter==1.8.0 \
+        glfw==2.10.0 \
+        egl_probe==1.0.2 \
+        PyOpenGL==3.1.10
+
+    # ---------- Video / image ----------
+    pip install \
+        opencv-python-headless==4.7.0.72 \
+        moviepy==1.0.3 \
+        imageio==2.37.0 \
+        imageio-ffmpeg==0.6.0
+
+    # ---------- Logging / visualization ----------
+    pip install \
+        matplotlib==3.5.0 \
+        tensorboard==2.17.1 \
+        tensorboardX==2.6.4 \
+        wandb==0.22.2
+
+    # ---------- Config / serialization ----------
+    pip install \
+        einops==0.3.0 \
+        protobuf==3.20.0 \
+        ruamel.yaml==0.17.4 \
+        cloudpickle==3.1.2
+
+
+    # ---------- Robotics ----------
+    pip install \
+        robosuite_models==1.0.0
+
+    # ---------- robosuite & robomimic from source ----------
+    pip install "robosuite @ git+https://github.com/ARISE-Initiative/robosuite.git@cb25aae7cac84c10409b96827a6c8d5a21f48f3a"
+    pip install "robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git@0ca7ce74cf8f20be32029657ef9320db033d93e9"
+
+%labels
+    Author zhuoxuan-li
+    Description DreamerV3-torch with RoboSuite/RoboMimic support
