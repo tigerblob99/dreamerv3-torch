@@ -81,6 +81,7 @@ class RobosuiteEnv(gym.Env):
             robosuite_control_freq=control_freq,
             max_env_steps=int(horizon),
             ignore_done=ignore_done,
+            render_gpu_device_id=int(render_gpu_device),
             seed=int(seed),
             reward_scale=float(reward_scale),
         )

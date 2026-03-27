@@ -20,6 +20,7 @@ SCRIPT_DIR="${SLURM_SUBMIT_DIR:-.}"
 TASK="${TASK:-robosuite_NutAssemblySquare}"
 BASE_LOGDIR="${BASE_LOGDIR:-logdir/sweep}"
 EXPTDIR="${EXPTDIR:-datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1}"
+ROBOSUITE_RENDER_DEVICE="${ROBOSUITE_RENDER_DEVICE:-0}"
 WANDB_ENV_FILE="${WANDB_ENV_FILE:-$HOME/.secrets/wandb.env}"
 
 if [[ ! -f "$SIF" ]]; then
@@ -73,6 +74,7 @@ echo "=== Node: $(hostname) ==="
 echo "=== GPU:  $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A') ==="
 echo "=== Task: $TASK ==="
 echo "=== Runs: ${#RUN_LIST[@]} ==="
+echo "=== RoboSuite render device: $ROBOSUITE_RENDER_DEVICE ==="
 
 for entry in "${RUN_LIST[@]}"; do
     IFS='|' read -r RUN_NAME EXTRA_FLAGS <<< "$entry"
@@ -94,6 +96,7 @@ for entry in "${RUN_LIST[@]}"; do
             --task "$TASK" \
             --logdir "$LOGDIR" \
             --exptdir "$EXPTDIR" \
+            --robosuite_render_device "$ROBOSUITE_RENDER_DEVICE" \
             $EXTRA_FLAGS
 
     echo "  Run '$RUN_NAME' finished with exit code $?."

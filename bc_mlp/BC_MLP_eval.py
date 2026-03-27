@@ -163,6 +163,7 @@ def _make_robomimic_env(cfg: EvalConfig, image_hw: Tuple[int, int]):
 		control_freq=cfg.robosuite_control_freq,
 		horizon=cfg.max_env_steps,
 		ignore_done=getattr(cfg, "ignore_done", False),
+		render_gpu_device_id=getattr(cfg, "render_gpu_device_id", -1),
 	)
 
 	try:
