@@ -190,6 +190,55 @@ check("MuJoCo offscreen render (egl)", lambda: _test_mujoco_render_backend("egl"
 check("MuJoCo offscreen render (osmesa)", lambda: _test_mujoco_render_backend("osmesa"))
 
 
+def _test_robosuite_env_backend(backend):
+    env = dict(os.environ)
+    env["MUJOCO_GL"] = backend
+    env["PYOPENGL_PLATFORM"] = backend
+    env.setdefault("ROBOSUITE_RENDER_DEVICE", "0")
+    code = """
+import os
+import pathlib
+import sys
+from types import SimpleNamespace
+
+from ruamel.yaml import YAML
+
+repo_root = pathlib.Path.cwd()
+sys.path.insert(0, str(repo_root))
+
+from envs.robosuite_env import make_Robosuite_env
+
+yaml = YAML(typ="safe")
+with (repo_root / "configs.yaml").open("r") as f:
+    data = yaml.load(f)
+
+cfg = dict(data["defaults"])
+cfg.update(data["robosuite"])
+cfg["parallel"] = False
+cfg["robosuite_render_device"] = int(os.environ.get("ROBOSUITE_RENDER_DEVICE", cfg.get("robosuite_render_device", 0)))
+
+env = make_Robosuite_env(SimpleNamespace(**cfg), seed=int(cfg.get("seed", 0)))
+obs = env.reset()
+print(f"{os.environ['MUJOCO_GL']}:{obs['image'].shape}:{env.action_space.shape}")
+env.close()
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        cwd=os.getcwd(),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        raise RuntimeError(detail or f"{backend} robosuite subprocess failed")
+    return proc.stdout.strip()
+
+
+check("RoboSuite env init/reset (egl)", lambda: _test_robosuite_env_backend("egl"))
+check("RoboSuite env init/reset (osmesa)", lambda: _test_robosuite_env_backend("osmesa"))
+
+
 # ── Summary ────────────────────────────────────────────────────────
 total = results["passed"] + results["failed"]
 print(f"\n{'='*40}")
