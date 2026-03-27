@@ -161,6 +161,8 @@ def _test_mujoco_render_backend(backend):
     env = dict(os.environ)
     env["MUJOCO_GL"] = backend
     env["PYOPENGL_PLATFORM"] = backend
+    if backend == "egl":
+        env["LD_PRELOAD"] = ""
     code = """
 import os
 import mujoco
@@ -194,6 +196,8 @@ def _test_robosuite_env_backend(backend):
     env = dict(os.environ)
     env["MUJOCO_GL"] = backend
     env["PYOPENGL_PLATFORM"] = backend
+    if backend == "egl":
+        env["LD_PRELOAD"] = ""
     env.setdefault("ROBOSUITE_RENDER_DEVICE", "0")
     code = """
 import os

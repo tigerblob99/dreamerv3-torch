@@ -43,6 +43,10 @@ fi
 MUJOCO_GL="${MUJOCO_GL:-egl}"
 PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-$MUJOCO_GL}"
 
+if [[ "${MUJOCO_GL,,}" == "egl" ]]; then
+    export APPTAINERENV_LD_PRELOAD=""
+fi
+
 for env_name in MUJOCO_GL PYOPENGL_PLATFORM WANDB_API_KEY WANDB_PROJECT WANDB_ENTITY WANDB_MODE; do
     if [[ -n "${!env_name:-}" ]]; then
         export "APPTAINERENV_${env_name}=${!env_name}"
