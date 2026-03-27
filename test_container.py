@@ -1,7 +1,9 @@
 """Smoke-test for the Apptainer container environment."""
 
-import sys
 import importlib
+import os
+import subprocess
+import sys
 import traceback
 
 PASS = "\033[92mPASS\033[0m"
@@ -133,8 +135,6 @@ check("GRUCell (RSSM)", _test_gru)
 
 
 # ── 4. Environment variable ───────────────────────────────────────
-import os
-
 print("\n== Environment ==")
 check("MUJOCO_GL set", lambda: (
     None if os.environ.get("MUJOCO_GL")
@@ -155,6 +155,38 @@ def _test_mujoco():
 
 
 check("MuJoCo simulation", _test_mujoco)
+
+
+def _test_mujoco_render_backend(backend):
+    env = dict(os.environ)
+    env["MUJOCO_GL"] = backend
+    code = """
+import os
+import mujoco
+
+xml = "<mujoco><worldbody><light/><geom type='sphere' size='0.1'/></worldbody></mujoco>"
+model = mujoco.MjModel.from_xml_string(xml)
+data = mujoco.MjData(model)
+mujoco.mj_forward(model, data)
+renderer = mujoco.Renderer(model, height=64, width=64)
+renderer.update_scene(data)
+frame = renderer.render()
+print(f"{os.environ['MUJOCO_GL']}:{mujoco.__version__}:{frame.shape}")
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        raise RuntimeError(detail or f"{backend} render subprocess failed")
+    return proc.stdout.strip()
+
+
+check("MuJoCo offscreen render (egl)", lambda: _test_mujoco_render_backend("egl"))
+check("MuJoCo offscreen render (osmesa)", lambda: _test_mujoco_render_backend("osmesa"))
 
 
 # ── Summary ────────────────────────────────────────────────────────

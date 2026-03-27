@@ -39,7 +39,9 @@ if [[ "${WANDB_MODE,,}" == "online" && -z "${WANDB_API_KEY:-}" ]]; then
     exit 1
 fi
 
-for env_name in WANDB_API_KEY WANDB_PROJECT WANDB_ENTITY WANDB_MODE; do
+MUJOCO_GL="${MUJOCO_GL:-egl}"
+
+for env_name in MUJOCO_GL WANDB_API_KEY WANDB_PROJECT WANDB_ENTITY WANDB_MODE; do
     if [[ -n "${!env_name:-}" ]]; then
         export "APPTAINERENV_${env_name}=${!env_name}"
     fi
