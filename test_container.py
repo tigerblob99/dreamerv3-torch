@@ -199,6 +199,7 @@ def _test_robosuite_env_backend(backend):
     if backend == "egl":
         env["LD_PRELOAD"] = ""
     env.setdefault("ROBOSUITE_RENDER_DEVICE", "0")
+    env.setdefault("MUJOCO_EGL_DEVICE_ID", env["ROBOSUITE_RENDER_DEVICE"])
     code = """
 import os
 import pathlib
@@ -223,7 +224,7 @@ cfg["robosuite_render_device"] = int(os.environ.get("ROBOSUITE_RENDER_DEVICE", c
 
 env = make_Robosuite_env(SimpleNamespace(**cfg), seed=int(cfg.get("seed", 0)))
 obs = env.reset()
-print(f"{os.environ['MUJOCO_GL']}:{obs['image'].shape}:{env.action_space.shape}")
+print(f"{os.environ['MUJOCO_GL']}:{os.environ.get('MUJOCO_EGL_DEVICE_ID', 'unset')}:{obs['image'].shape}:{env.action_space.shape}")
 env.close()
 """
     proc = subprocess.run(
