@@ -160,6 +160,7 @@ check("MuJoCo simulation", _test_mujoco)
 def _test_mujoco_render_backend(backend):
     env = dict(os.environ)
     env["MUJOCO_GL"] = backend
+    env["PYOPENGL_PLATFORM"] = backend
     code = """
 import os
 import mujoco
