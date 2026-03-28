@@ -1,13 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=dreamer-sweep
-#SBATCH --gres=gpu:1
-#SBATCH --partition=short
+#SBATCH --gres=rtx8000:1
+#SBATCH --partition=medium
+#SBATCH --time=36:00:00
 #SBATCH --account=engs-a2i
 #SBATCH --qos=engs-a2i
 #SBATCH --reservation=a2i2025
-#SBATCH --cpus-per-task=6
+#SBATCH --cpus-per-task=16
 #SBATCH --array=0-3
-#SBATCH --mem=56G
+#SBATCH --mem=85G
 #SBATCH --output=logdir/sweep/slurm-%A_%a.out
 #SBATCH --error=logdir/sweep/slurm-%A_%a.err
 #SBATCH --mail-type=BEGIN,END
