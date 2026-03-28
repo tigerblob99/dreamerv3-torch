@@ -6,6 +6,51 @@ import pathlib
 import sys
 
 os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
+
+
+def _split_env_paths(value):
+    return [item for item in value.split(":") if item]
+
+
+def _running_under_apptainer():
+    return (
+        "/.singularity.d/libs" in _split_env_paths(os.environ.get("LD_LIBRARY_PATH", ""))
+        or "APPTAINER_NAME" in os.environ
+        or "SINGULARITY_NAME" in os.environ
+    )
+
+
+def _prepare_osmesa_env_for_apptainer():
+    if os.environ.get("MUJOCO_GL", "").lower() != "osmesa" or not _running_under_apptainer():
+        return
+
+    env = os.environ.copy()
+    preload_paths = set(_split_env_paths(env.get("APPTAINER_CONTAINER_GLVND_PRELOAD", "")))
+    kept_preload = [path for path in _split_env_paths(env.get("LD_PRELOAD", "")) if path not in preload_paths]
+    if kept_preload:
+        env["LD_PRELOAD"] = ":".join(kept_preload)
+    else:
+        env.pop("LD_PRELOAD", None)
+
+    kept_library_paths = [
+        path for path in _split_env_paths(env.get("LD_LIBRARY_PATH", "")) if path != "/.singularity.d/libs"
+    ]
+    if kept_library_paths:
+        env["LD_LIBRARY_PATH"] = ":".join(kept_library_paths)
+    else:
+        env.pop("LD_LIBRARY_PATH", None)
+
+    if (
+        env.get("LD_PRELOAD") == os.environ.get("LD_PRELOAD")
+        and env.get("LD_LIBRARY_PATH") == os.environ.get("LD_LIBRARY_PATH")
+    ):
+        return
+
+    os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
+
+
+_prepare_osmesa_env_for_apptainer()
 
 import numpy as np
 import ruamel.yaml as yaml
