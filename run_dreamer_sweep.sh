@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=dreamer-sweep
-#SBATCH --gres=rtx8000:1
+#SBATCH --gres=gpu:1
+#SBATCH --constraint="gpu_mem:32GB|gpu_mem:40GB|gpu_mem:48GB|gpu_mem:80GB|gpu_mem:94GB"
 #SBATCH --partition=medium
 #SBATCH --time=36:00:00
 #SBATCH --account=engs-a2i
