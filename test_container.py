@@ -157,12 +157,27 @@ def _test_mujoco():
 check("MuJoCo simulation", _test_mujoco)
 
 
-def _test_mujoco_render_backend(backend):
-    env = dict(os.environ)
+def _configure_render_backend_env(env, backend):
     env["MUJOCO_GL"] = backend
     env["PYOPENGL_PLATFORM"] = backend
     if backend == "egl":
-        env["LD_PRELOAD"] = ""
+        preload = env.get("APPTAINER_CONTAINER_GLVND_PRELOAD")
+        if preload:
+            env["LD_PRELOAD"] = preload
+    else:
+        env.pop("LD_PRELOAD", None)
+        ld_library_path = env.get("LD_LIBRARY_PATH", "")
+        paths = [p for p in ld_library_path.split(":") if p and p != "/.singularity.d/libs"]
+        if paths:
+            env["LD_LIBRARY_PATH"] = ":".join(paths)
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
+def _test_mujoco_render_backend(backend):
+    env = dict(os.environ)
+    _configure_render_backend_env(env, backend)
     code = """
 import os
 import mujoco
@@ -194,10 +209,7 @@ check("MuJoCo offscreen render (osmesa)", lambda: _test_mujoco_render_backend("o
 
 def _test_robosuite_env_backend(backend):
     env = dict(os.environ)
-    env["MUJOCO_GL"] = backend
-    env["PYOPENGL_PLATFORM"] = backend
-    if backend == "egl":
-        env["LD_PRELOAD"] = ""
+    _configure_render_backend_env(env, backend)
     env.setdefault("ROBOSUITE_RENDER_DEVICE", "0")
     env.setdefault("MUJOCO_EGL_DEVICE_ID", env["ROBOSUITE_RENDER_DEVICE"])
     code = """

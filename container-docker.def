@@ -5,6 +5,7 @@ From: pytorch/pytorch:2.9.0-cuda13.0-cudnn9-runtime
     export MUJOCO_GL="${MUJOCO_GL:-osmesa}"
     export NUMBA_CACHE_DIR=/tmp
     export PYTHONUNBUFFERED=1
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
     export PIP_NO_CACHE_DIR=1
     export TZ=Europe/London
     # Apptainer --nv injects host GLVND libraries into /.singularity.d/libs.
@@ -20,7 +21,6 @@ From: pytorch/pytorch:2.9.0-cuda13.0-cudnn9-runtime
     if [ -n "${APPTAINER_CONTAINER_GLVND_PRELOAD}" ]; then
         export LD_PRELOAD="${APPTAINER_CONTAINER_GLVND_PRELOAD}${LD_PRELOAD:+:$LD_PRELOAD}"
     fi
-
 
 %post
     export DEBIAN_FRONTEND=noninteractive
@@ -40,7 +40,6 @@ From: pytorch/pytorch:2.9.0-cuda13.0-cudnn9-runtime
     pip install --upgrade pip
     pip uninstall -y cmake || true
 
-    # ---------- Core scientific ----------
     pip install \
         numpy==1.26.4 \
         scipy==1.15.3 \
@@ -48,11 +47,6 @@ From: pytorch/pytorch:2.9.0-cuda13.0-cudnn9-runtime
         pillow==11.3.0 \
         numba==0.62.1
 
-    # ---------- RL / simulation ----------
-    # Optional extras kept disabled for this image:
-    #   dm-control==1.0.9
-    #   memory-maze==1.0.3
-    #   crafter==1.8.0
     pip install \
         gym==0.22.0 \
         mujoco==3.3.7 \
@@ -60,36 +54,28 @@ From: pytorch/pytorch:2.9.0-cuda13.0-cudnn9-runtime
         egl_probe==1.0.2 \
         PyOpenGL==3.1.10
 
-    # ---------- Video / image ----------
     pip install \
         opencv-python-headless==4.7.0.72 \
         moviepy==1.0.3 \
         imageio==2.37.0 \
         imageio-ffmpeg==0.6.0
 
-    # ---------- Logging / visualization ----------
     pip install \
         matplotlib==3.5.0 \
         tensorboard==2.17.1 \
         tensorboardX==2.6.4 \
         wandb==0.22.2
 
-    # ---------- Config / serialization ----------
     pip install \
         einops==0.3.0 \
         protobuf==3.20.0 \
         ruamel.yaml==0.17.4 \
         cloudpickle==3.1.2
 
-
-    # ---------- Robotics ----------
-    pip install \
-        robosuite_models==1.0.0
-
-    # ---------- robosuite & robomimic from source ----------
+    pip install robosuite_models==1.0.0
     pip install "robosuite @ git+https://github.com/ARISE-Initiative/robosuite.git@cb25aae7cac84c10409b96827a6c8d5a21f48f3a"
     pip install "robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git@0ca7ce74cf8f20be32029657ef9320db033d93e9"
 
 %labels
     Author zhuoxuan-li
-    Description DreamerV3-torch with RoboSuite/RoboMimic support
+    Description DreamerV3-torch Singularity image mirrored from Dockerfile.container-test

@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-SIF="${CONTAINER:-container.sif}"
+SIF="${CONTAINER:-container-fixed.sif}"
 SCRIPT_DIR="${SLURM_SUBMIT_DIR:-.}"
 TASK="${TASK:-robosuite_NutAssemblySquare}"
 BASE_LOGDIR="${BASE_LOGDIR:-logdir/sweep}"
@@ -43,10 +43,6 @@ fi
 
 MUJOCO_GL="${MUJOCO_GL:-egl}"
 PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-$MUJOCO_GL}"
-
-if [[ "${MUJOCO_GL,,}" == "egl" ]]; then
-    export APPTAINERENV_LD_PRELOAD=""
-fi
 
 for env_name in MUJOCO_GL MUJOCO_EGL_DEVICE_ID PYOPENGL_PLATFORM WANDB_API_KEY WANDB_PROJECT WANDB_ENTITY WANDB_MODE; do
     if [[ -n "${!env_name:-}" ]]; then

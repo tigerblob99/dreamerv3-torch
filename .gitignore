@@ -4,7 +4,7 @@ run*
 logdir*
 vis_*
 result*
-container.sif
+*.sif
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
