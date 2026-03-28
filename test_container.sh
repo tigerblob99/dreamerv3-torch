@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=container-test
 #SBATCH --time=00:10:00
-#SBATCH --gres=gpu:1 --constraint='gpu_mem:20GB'
+#SBATCH --gres=gpu:1
 #SBATCH --partition=short
 #SBATCH --account=engs-a2i
 #SBATCH --qos=engs-a2i
