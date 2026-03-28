@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-SIF="${1:-container.sif}"
+SIF="${1:-containerv4.sif}"
 SCRIPT_DIR="$SLURM_SUBMIT_DIR"
 
 if [[ ! -f "$SIF" ]]; then
@@ -20,4 +20,8 @@ fi
 echo "=== Testing container: $SIF ==="
 echo "=== Node: $(hostname), GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader) ==="
 
-apptainer exec --nv --bind "$PWD":"$PWD" --pwd "$PWD" "$SIF" python "$SCRIPT_DIR/test_container.py"
+# Uncomment for old SIF images that bake in LD_PRELOAD workaround:
+# --env 'LD_PRELOAD='
+apptainer exec --nv \
+    --bind "$PWD":"$PWD" --pwd "$PWD" \
+    "$SIF" python "$SCRIPT_DIR/test_container.py"

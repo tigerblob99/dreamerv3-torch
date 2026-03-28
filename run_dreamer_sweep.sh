@@ -15,13 +15,12 @@
 
 set -euo pipefail
 
-SIF="${CONTAINER:-container-fixed.sif}"
+SIF="${CONTAINER:-containerv4.sif}"
 SCRIPT_DIR="${SLURM_SUBMIT_DIR:-.}"
 TASK="${TASK:-robosuite_NutAssemblySquare}"
 BASE_LOGDIR="${BASE_LOGDIR:-logdir/sweep}"
 EXPTDIR="${EXPTDIR:-datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1}"
 ROBOSUITE_RENDER_DEVICE="${ROBOSUITE_RENDER_DEVICE:-0}"
-MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-$ROBOSUITE_RENDER_DEVICE}"
 WANDB_ENV_FILE="${WANDB_ENV_FILE:-$HOME/.secrets/wandb.env}"
 
 if [[ ! -f "$SIF" ]]; then
@@ -41,10 +40,7 @@ if [[ "${WANDB_MODE,,}" == "online" && -z "${WANDB_API_KEY:-}" ]]; then
     exit 1
 fi
 
-MUJOCO_GL="${MUJOCO_GL:-osmesa}"
-PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-$MUJOCO_GL}"
-
-for env_name in MUJOCO_GL MUJOCO_EGL_DEVICE_ID PYOPENGL_PLATFORM WANDB_API_KEY WANDB_PROJECT WANDB_ENTITY WANDB_MODE; do
+for env_name in WANDB_API_KEY WANDB_PROJECT WANDB_ENTITY WANDB_MODE; do
     if [[ -n "${!env_name:-}" ]]; then
         export "APPTAINERENV_${env_name}=${!env_name}"
     fi
@@ -76,7 +72,6 @@ echo "=== GPU:  $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null 
 echo "=== Task: $TASK ==="
 echo "=== Runs: ${#RUN_LIST[@]} ==="
 echo "=== RoboSuite render device: $ROBOSUITE_RENDER_DEVICE ==="
-echo "=== MUJOCO_EGL_DEVICE_ID: $MUJOCO_EGL_DEVICE_ID ==="
 
 for entry in "${RUN_LIST[@]}"; do
     IFS='|' read -r RUN_NAME EXTRA_FLAGS <<< "$entry"
@@ -89,6 +84,8 @@ for entry in "${RUN_LIST[@]}"; do
     echo "  Extra flags: ${EXTRA_FLAGS:-<none>}"
     echo "────────────────────────────────────────"
 
+    # Uncomment for old SIF images that bake in LD_PRELOAD workaround:
+    # --env 'LD_PRELOAD='
     apptainer exec --nv \
         --bind "$PWD":"$PWD" \
         --pwd "$PWD" \

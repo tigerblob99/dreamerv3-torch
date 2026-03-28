@@ -160,18 +160,6 @@ check("MuJoCo simulation", _test_mujoco)
 def _configure_render_backend_env(env, backend):
     env["MUJOCO_GL"] = backend
     env["PYOPENGL_PLATFORM"] = backend
-    if backend == "egl":
-        preload = env.get("APPTAINER_CONTAINER_GLVND_PRELOAD")
-        if preload:
-            env["LD_PRELOAD"] = preload
-    else:
-        env.pop("LD_PRELOAD", None)
-        ld_library_path = env.get("LD_LIBRARY_PATH", "")
-        paths = [p for p in ld_library_path.split(":") if p and p != "/.singularity.d/libs"]
-        if paths:
-            env["LD_LIBRARY_PATH"] = ":".join(paths)
-        else:
-            env.pop("LD_LIBRARY_PATH", None)
     return env
 
 
