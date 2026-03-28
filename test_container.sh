@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-SIF="${1:-containerv4.sif}"
+SIF="${1:-containerv5.sif}"
 SCRIPT_DIR="$SLURM_SUBMIT_DIR"
 
 if [[ ! -f "$SIF" ]]; then

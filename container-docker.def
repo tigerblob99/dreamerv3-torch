@@ -69,6 +69,14 @@ From: pytorch/pytorch:2.9.0-cuda13.0-cudnn9-runtime
     pip install "robosuite @ git+https://github.com/ARISE-Initiative/robosuite.git@cb25aae7cac84c10409b96827a6c8d5a21f48f3a"
     pip install "robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git@0ca7ce74cf8f20be32029657ef9320db033d93e9"
 
+    # NVIDIA EGL vendor JSON for GLVND dispatch.
+    # --nv injects libEGL_nvidia.so.0 into /.singularity.d/libs/ but does
+    # NOT inject vendor JSON files. Without this, GLVND falls back to Mesa
+    # EGL which requires /dev/dri access (usually denied on HPC clusters).
+    mkdir -p /usr/share/glvnd/egl_vendor.d
+    printf '{\n    "file_format_version" : "1.0.0",\n    "ICD" : {\n        "library_path" : "libEGL_nvidia.so.0"\n    }\n}\n' \
+        > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
 %labels
     Author zhuoxuan-li
     Description DreamerV3-torch Singularity image mirrored from Dockerfile.container-test

@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-SIF="${CONTAINER:-containerv4.sif}"
+SIF="${CONTAINER:-containerv5.sif}"
 SCRIPT_DIR="${SLURM_SUBMIT_DIR:-.}"
 TASK="${TASK:-robosuite_NutAssemblySquare}"
 BASE_LOGDIR="${BASE_LOGDIR:-logdir/sweep}"
