@@ -46,6 +46,16 @@ _EXCLUDE_KEYS = {"action", "reward", "discount", "is_first", "is_terminal", "pol
 def to_np(tensor):
     return tensor.detach().cpu().numpy()
 
+
+def _apply_action_mlp_overrides(config):
+    action_cfg = getattr(config, "action_mlp", None)
+    if action_cfg is None:
+        return
+    if hasattr(config, "action_mlp_layers"):
+        action_cfg = dict(action_cfg)
+        action_cfg["layers"] = int(config.action_mlp_layers)
+        config.action_mlp = action_cfg
+
 # --- Custom Action MLP (Distribution Wrapper) ---
 class ActionMLP(nn.Module):
     def __init__(
@@ -777,6 +787,8 @@ if __name__ == "__main__":
     defaults.setdefault('camera_depths', False)
     defaults.setdefault('ignore_done', False)
     defaults.setdefault('clip_actions', False)
+    if isinstance(defaults.get("action_mlp"), dict):
+        defaults.setdefault("action_mlp_layers", int(defaults["action_mlp"].get("layers", 4)))
 
     # 5. Build Final Parser
     parser = argparse.ArgumentParser()
@@ -795,5 +807,6 @@ if __name__ == "__main__":
     # 6. Inject Complex Defaults
     for k, v in complex_defaults.items():
         setattr(config, k, v)
+    _apply_action_mlp_overrides(config)
 
     joint_train(config)

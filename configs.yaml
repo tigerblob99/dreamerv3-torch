@@ -190,6 +190,7 @@ memorymaze:
   task: 'memorymaze_9x9'
 
 robosuite:
+  steps: 2e6
   units: 1024
   env_restart_every: 5e4
   batch_size: 32
@@ -198,8 +199,10 @@ robosuite:
   robosuite_reward_scale: 1.0
   robosuite_reward_shift: -1.0
   log_every: 1000
+  eval_every: 1e5
+  eval_episode_num: 100
   dataset_episode_sampling: 'uniform'  # 'shorter' (inverse-transition) or 'uniform'
-  logdir: logdir/robosuite_square_reset_every_5e4_run1
+  logdir: logdir/robosuite_square_reset_every_5e4_run2 (larger latent)
   exptdir: datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1
   task: 'robosuite_NutAssemblySquare'
   size: [84, 84]
@@ -207,6 +210,12 @@ robosuite:
   action_repeat: 1
   parallel: True
   video_pred_log: true
+
+  #model architecture details
+  dyn_deter: 1024
+  dyn_stoch: 32
+  dyn_discrete: 32
+  
   encoder:
     {mlp_keys: '^(robot0_joint_pos|robot0_joint_vel|robot0_gripper_qpos|robot0_gripper_qvel|aux_.*)$', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
   decoder:
@@ -253,7 +262,7 @@ robosuite:
     aux_robot0_joint_pos_cos: robot0_joint_pos_cos
   robosuite_reward_shaping: True
   robosuite_control_freq: 20
-  max_env_steps: 300
+  max_env_steps: 400
   robosuite_render_device: -1
   dataset_backend: 'gpu'
   dataset_gpu_fallback: 'hybrid'
@@ -432,22 +441,75 @@ can_env_eval:
         gripper:
           type: GRIP
 
+square_env_eval:
+  robosuite_task: NutAssemblySquare
+  #robosuite_robots:
+  #  - Panda
+  #robosuite_controller: OSC_POSE
+  #robosuite_reward_shaping: false
+  #robosuite_control_freq: 20
+  #has_renderer: false
+  #has_offscreen_renderer: true
+  #ignore_done: true
+  #use_camera_obs: true
+  #camera_depths: false
+  #camera_heights: 84
+  #camera_widths: 84
+  #camera_obs_keys:
+  #  - agentview_image
+  #  - robot0_eye_in_hand_image
+  #bc_cnn_keys_order:
+  #  - image
+  #bc_mlp_keys_order:
+  #  - robot0_joint_pos
+  #  - robot0_joint_vel
+  #  - robot0_gripper_qpos
+  #  - robot0_gripper_qvel
+  #  - aux_robot0_joint_pos_sin
+  #  - aux_robot0_joint_pos_cos
+  controller_configs:
+    type: BASIC
+    body_parts:
+      right:
+        type: OSC_POSE
+        input_max: 1
+        input_min: -1
+        output_max: [0.05, 0.05, 0.05, 0.5, 0.5, 0.5]
+        output_min: [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5]
+        kp: 150
+        damping: 1
+        impedance_mode: fixed
+        kp_limits: [0, 300]
+        damping_limits: [0, 10]
+        position_limits: null
+        orientation_limits: null
+        uncouple_pos_ori: true
+        control_delta: true
+        interpolation: null
+        ramp_ratio: 0.2
+        input_ref_frame: world
+        gripper:
+          type: GRIP
+
 joint_train:
-  # --- model definition ---
+  # World Model
+  dyn_hidden: 512
+  dyn_deter: 512
+  dyn_stoch: 32
+  dyn_discrete: 32
+  # --- actor model definition ---
   encoder: *robomimic_encoder
   decoder: *robomimic_decoder
   mlp_layers: 4          # Number of MLP layers for policy and value networks
   act: 'SiLU'              # Activation function
   norm: True               # Use layer normalization
   action_mlp:
-      {layers: 4, units: 1024, act: 'SiLU', norm: True, dist: 'faithful_normal', std: 'learned', min_std: 0.1, max_std: 1.0, absmax: 1.0, temp: 0.1, unimix_ratio: 0.01, outscale: 1.0, symlog_inputs: False}
-  actor:
-      {layers: 4, dist: 'normal', entropy: 5e-2, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+      {layers: 4, units: 1024, act: 'SiLU', norm: True, dist: 'normal', std: 'learned', min_std: 0.1, max_std: 1.0, absmax: 1.0, temp: 0.1, unimix_ratio: 0.01, outscale: 1.0, symlog_inputs: False}  # Action MLP config with faithful_normal distribution, can use normal for standard Gaussian output
   critic:
       {layers: 4, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
 
   # --- Training Loop ---
-  steps: 80000             # Total training steps
+  steps: 60000             # Total training steps
   model_lr: 5e-4            # Learning rate for joint optimizer
   weight_decay: 1e-5        # Weight decay for joint optimizer
 
@@ -457,12 +519,13 @@ joint_train:
   grad_clip: 100.0          # Gradient clipping norm
   log_every: 100          # Logging frequency (steps)
   save_every: 10000
-  run_name: "faithful_actr_1"
+  run_name: "square_baseline_actr_1"
+  logdir: logdir/square_baseline_actr_1_(joint_train)
+  offline_traindir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1_train'
+  offline_evaldir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1_eval'
+  offline_playdir: 'datasets/robomimic_data_MV/Square_MH_Shaped_shifted_0-1'
 
 
-  rl_critic_pretrain_steps: 3000
-  rl_critic_pretrain_log_every: 50
-  discount_lambda: 1.0  # No TD-lambda, pure Monte Carlo returns for critic 
   
   # --- Loss Scales ---
   wm_loss_scale: 0.1        # Scale for World Model loss (Recon + KL + Reward)
@@ -478,9 +541,9 @@ joint_train:
   eval_every: 5000         # Frequency of evaluation (steps)
   offline_eval_batches: 64  # Number of batches to calculate validation loss on
   eval_episodes: 50          # Number of online episodes to run in Robosuite
-  max_env_steps: 500        # Max steps per online episode
-  num_envs: 15            # Number of parallel environments for online eval
-  robosuite_task: 'PickPlaceCan'  # Robosuite task name
+  max_env_steps: 300        # Max steps per online episode
+  num_envs: 4            # Number of parallel environments for online eval
+  robosuite_task: ''  # Robosuite task name
   
   # --- Observation Handling (Robosuite Defaults) ---
   # These ensure the environment matches the encoder input structure
