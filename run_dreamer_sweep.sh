@@ -1,13 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=dreamer-sweep
 #SBATCH --gres=gpu:1
-#SBATCH --constraint='gpu&gpu_mem:32GB|gpu_mem:40GB|gpu_mem:48GB|gpu_mem:80GB|gpu_mem:94GB'
-#SBATCH --partition=medium
-#SBATCH --time=36:00:00
+#SBATCH --constraint='gpu_sku:RTX-A6000'
+#SBATCH --time=12:00:00
+#SBATCH --partition=short
 #SBATCH --account=engs-a2i
-#SBATCH --qos=engs-a2i
 #SBATCH --reservation=a2i2025
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --array=0-3
 #SBATCH --mem=85G
 #SBATCH --output=logdir/sweep/slurm-%A_%a.out
