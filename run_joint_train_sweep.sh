@@ -18,7 +18,7 @@
 set -euo pipefail
 
 SIF="${CONTAINER:-containerv5.sif}"
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="${SLURM_SUBMIT_DIR:-.}"
 BASE_LOGDIR="${BASE_LOGDIR:-logdir/joint_train_sweep}"
 ENV_CONFIG="${ENV_CONFIG:-square_env_eval}"
 WANDB_ENV_FILE="${WANDB_ENV_FILE:-$HOME/.secrets/wandb.env}"
