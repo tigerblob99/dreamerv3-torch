@@ -8,7 +8,7 @@
 #SBATCH --qos=engs-a2i
 #SBATCH --reservation=a2i2025
 #SBATCH --cpus-per-task=8
-#SBATCH --array=0-5
+#SBATCH --array=0-8
 #SBATCH --mem=85G
 #SBATCH --output=logdir/joint_train_sweep/joint_train_sweep-%A_%a.out
 #SBATCH --error=logdir/joint_train_sweep/joint_train_sweep-%A_%a.err
@@ -44,14 +44,18 @@ done
 
 mkdir -p "$BASE_LOGDIR"
 
-RUNS=(
-    "dyn256_layers2|256|2"
-    "dyn256_layers4|256|4"
-    "dyn512_layers2|512|2"
-    "dyn512_layers4|512|4"
-    "dyn1024_layers2|1024|2"
-    "dyn1024_layers4|1024|4"
-)
+MODEL_LRS=("1e-4" "5e-4" "1e-3")
+WM_LOSS_SCALES=("1" "0.1" "0.01")
+
+RUNS=()
+for MODEL_LR in "${MODEL_LRS[@]}"; do
+    SAFE_MODEL_LR="${MODEL_LR//./p}"
+    for WM_LOSS_SCALE in "${WM_LOSS_SCALES[@]}"; do
+        SAFE_WM_LOSS_SCALE="${WM_LOSS_SCALE//./p}"
+        RUN_NAME="lr${SAFE_MODEL_LR}_wm${SAFE_WM_LOSS_SCALE}"
+        RUNS+=("${RUN_NAME}|${MODEL_LR}|${WM_LOSS_SCALE}")
+    done
+done
 
 if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
     IDX=$SLURM_ARRAY_TASK_ID
@@ -94,7 +98,7 @@ echo "=== Base logdir: $BASE_LOGDIR ==="
 echo "=== Env config: ${ENV_CONFIG:-<none>} ==="
 
 for entry in "${RUN_LIST[@]}"; do
-    IFS='|' read -r RUN_NAME DYN_HIDDEN ACTION_MLP_LAYERS <<< "$entry"
+    IFS='|' read -r RUN_NAME MODEL_LR WM_LOSS_SCALE <<< "$entry"
     LOGDIR="${BASE_LOGDIR}/${RUN_NAME}"
 
     CMD=(
@@ -102,8 +106,8 @@ for entry in "${RUN_LIST[@]}"; do
         --configs joint_train robomimic
         --logdir "$LOGDIR"
         --run_name "$RUN_NAME"
-        --dyn_hidden "$DYN_HIDDEN"
-        --action_mlp_layers "$ACTION_MLP_LAYERS"
+        --model_lr "$MODEL_LR"
+        --wm_loss_scale "$WM_LOSS_SCALE"
     )
 
     if [[ -n "$ENV_CONFIG" ]]; then
@@ -117,8 +121,8 @@ for entry in "${RUN_LIST[@]}"; do
     echo "────────────────────────────────────────"
     echo "  Run: $RUN_NAME"
     echo "  Logdir: $LOGDIR"
-    echo "  dyn_hidden: $DYN_HIDDEN"
-    echo "  action_mlp.layers: $ACTION_MLP_LAYERS"
+    echo "  model_lr: $MODEL_LR"
+    echo "  wm_loss_scale: $WM_LOSS_SCALE"
     echo "────────────────────────────────────────"
 
     "${CMD[@]}"
