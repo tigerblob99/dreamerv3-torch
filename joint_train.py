@@ -114,7 +114,23 @@ class JointDataset(Dataset):
     def __init__(self, directory, config, mode='train', bc_mask_value=1.0):
         self.config = config
         self.mode = mode
-        self.directory = pathlib.Path(directory).expanduser()
+        if directory is None:
+            self.directories = []
+        elif isinstance(directory, str):
+            self.directories = [
+                pathlib.Path(part.strip()).expanduser()
+                for part in directory.split(",")
+                if part.strip()
+            ]
+        elif isinstance(directory, (list, tuple)):
+            self.directories = [
+                pathlib.Path(part).expanduser()
+                for part in directory
+                if str(part).strip()
+            ]
+        else:
+            self.directories = [pathlib.Path(directory).expanduser()]
+        self.directory = self.directories[0] if len(self.directories) == 1 else self.directories
         self.batch_length = config.batch_length
         self.bc_mask_value = float(bc_mask_value)
         self.crop_h = config.image_crop_height
@@ -123,16 +139,27 @@ class JointDataset(Dataset):
         self.orig_h = 84
         self.orig_w = 84
 
-        if not self.directory.exists():
-            print(f"Warning: Dataset directory {self.directory} does not exist.")
-            self.episodes = {}
-            self.episode_list = []
-        else:
-            self.episodes = tools.load_episodes(self.directory, limit=config.dataset_size)
-            self.episode_list = list(self.episodes.values())
+        self.episodes = {}
+        total_steps = 0
+        total_transitions = 0
+        for dataset_dir in self.directories:
+            if not dataset_dir.exists():
+                print(f"Warning: Dataset directory {dataset_dir} does not exist.")
+                continue
+            episodes = tools.load_episodes(dataset_dir, limit=None)
+            for episode_name, episode in episodes.items():
+                key = episode_name if len(self.directories) == 1 else f"{dataset_dir}::{episode_name}"
+                self.episodes[key] = episode
+                total_steps += len(episode["action"])
+                total_transitions += len(episode["reward"]) - 1
+                if config.dataset_size and total_transitions >= config.dataset_size:
+                    break
+            if config.dataset_size and total_transitions >= config.dataset_size:
+                break
+
+        self.episode_list = list(self.episodes.values())
 
         self.num_episodes = len(self.episode_list)
-        total_steps = sum(len(ep['action']) for ep in self.episode_list) if self.episode_list else 0
         self.epoch_size = (total_steps // self.batch_length) if self.batch_length else 0
         
         print(f"[{mode}] Loaded {self.num_episodes} episodes, {total_steps} steps.")
@@ -570,8 +597,22 @@ def joint_train(config):
     print(f"World Model Params: {sum(p.numel() for p in wm.parameters()):,}")
     print(f"-----------------------")
 
+    # When wm and bc cropping produce identical images (cropping disabled, or
+    # both branches use center crop), the BC-branch encoder + RSSM pass is a
+    # pure duplicate of the WM pass. Detect that case once and reuse feat_wm
+    # for the policy to halve the encoder/RSSM cost per step.
+    do_crop = (config.image_crop_height > 0 and config.image_crop_width > 0)
+    crops_match = (not do_crop) or (
+        not getattr(config, 'wm_random_crop', False)
+        and not getattr(config, 'bc_random_crop', False)
+    )
+    if crops_match:
+        print("Crops match (image_wm == image_bc) — sharing WM features with BC branch.")
+    else:
+        print("Crops differ — running separate WM and BC encoder passes.")
+
     optimizer = torch.optim.Adam(
-        list(wm.parameters()) + list(policy.parameters()), 
+        list(wm.parameters()) + list(policy.parameters()),
         lr=config.model_lr, weight_decay=config.weight_decay
     )
 
@@ -626,45 +667,48 @@ def joint_train(config):
             data_wm['image'] = data_wm.pop('image_wm')
             data_wm = wm.preprocess(data_wm)
             
-            # 2. BC Data Preparation
-            img_bc = torch.tensor(raw_batch['image_bc'], device=config.device, dtype=torch.float32) / 255.0
-            if config.image_standardize and 'image_mean' in data_wm:
-                 img_bc = (img_bc - data_wm['image_mean']) / data_wm['image_std']
-            
-            # 3. Forward World Model
-            embed_wm = wm.encoder(data_wm) 
+            # 2. Forward World Model
+            embed_wm = wm.encoder(data_wm)
             post_wm, prior_wm = wm.dynamics.observe(embed_wm, data_wm['action'], data_wm['is_first'])
-            
+
             # Calculate KL Loss
             kl_loss, kl_val, _, _ = wm.dynamics.kl_loss(
                 post_wm, prior_wm, config.kl_free, config.dyn_scale, config.rep_scale
             )
-            
+
             # Calculate Reconstruction Losses
             feat_wm = wm.dynamics.get_feat(post_wm)
             recon_losses = 0
             for name, head in wm.heads.items():
                 pred = head(feat_wm)
                 if isinstance(pred, dict):
-                    for k, v in pred.items(): 
+                    for k, v in pred.items():
                         recon_losses -= v.log_prob(data_wm[k])
                 else:
                     recon_losses -= pred.log_prob(data_wm[name])
-            
+
             wm_loss = (recon_losses + kl_loss).mean()
-            
-            # 4. Forward BC Branch
-            data_bc = data_wm.copy()
-            data_bc['image'] = img_bc
-            embed_bc = wm.encoder(data_bc)
-            post_bc, _ = wm.dynamics.observe(embed_bc, data_bc['action'], data_bc['is_first'])
-            feat_bc = wm.dynamics.get_feat(post_bc)
+
+            # 3. BC Branch — reuse WM latents when crops are identical
+            if crops_match:
+                feat_bc = feat_wm
+            else:
+                img_bc = raw_batch['image_bc'].to(config.device, dtype=torch.float32, non_blocking=True) / 255.0
+                if config.image_standardize and 'image_mean' in data_wm:
+                     img_bc = (img_bc - data_wm['image_mean']) / data_wm['image_std']
+                data_bc = data_wm.copy()
+                data_bc['image'] = img_bc
+                embed_bc = wm.encoder(data_bc)
+                post_bc, _ = wm.dynamics.observe(embed_bc, data_bc['action'], data_bc['is_first'])
+                feat_bc = wm.dynamics.get_feat(post_bc)
             
             # --- BC Loss (masked negative log-likelihood; only joint data updates BC) ---
-            target = torch.tensor(raw_batch['policy_target'], device=config.device, dtype=torch.float32)
+            # raw_batch['policy_target'] / ['bc_mask'] are already pinned CPU tensors
+            # from the DataLoader — use .to() instead of re-wrapping with torch.tensor().
+            target = raw_batch['policy_target'].to(config.device, dtype=torch.float32, non_blocking=True)
             pred_dist = policy(feat_bc, return_dist=True)
             per_step_nll = -pred_dist.log_prob(target)
-            bc_mask = torch.tensor(raw_batch['bc_mask'], device=config.device, dtype=torch.float32)
+            bc_mask = raw_batch['bc_mask'].to(config.device, dtype=torch.float32, non_blocking=True)
             bc_mask_sum = bc_mask.sum()
             if bc_mask_sum > 0:
                 bc_loss = (per_step_nll * bc_mask).sum() / bc_mask_sum

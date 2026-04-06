@@ -509,7 +509,7 @@ joint_train:
       {layers: 4, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
 
   # --- Training Loop ---
-  steps: 60000             # Total training steps
+  steps: 150000             # Total training steps
   model_lr: 5e-4            # Learning rate for joint optimizer
   weight_decay: 1e-5        # Weight decay for joint optimizer
 
@@ -519,11 +519,11 @@ joint_train:
   grad_clip: 100.0          # Gradient clipping norm
   log_every: 100          # Logging frequency (steps)
   save_every: 10000
-  run_name: "square_baseline_actr_1"
-  logdir: logdir/square_baseline_actr_1_(joint_train)
+  run_name: "square_baseline_actr_6_(code_efficiency_test)"
+  logdir: logdir/square_baseline_actr_6_(code_efficiency_joint_train)
   offline_traindir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1_train'
   offline_evaldir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1_eval'
-  offline_playdir: 'datasets/robomimic_data_MV/Square_MH_Shaped_shifted_0-1'
+  offline_playdir: ['datasets/robomimic_data_MV/Square_MH_Shaped_shifted_0-1','datasets/robomimic_data_MV/lift_MH_train']
 
 
   
@@ -540,9 +540,9 @@ joint_train:
   # --- Evaluation Settings ---
   eval_every: 5000         # Frequency of evaluation (steps)
   offline_eval_batches: 64  # Number of batches to calculate validation loss on
-  eval_episodes: 50          # Number of online episodes to run in Robosuite
+  eval_episodes: 100          # Number of online episodes to run in Robosuite
   max_env_steps: 300        # Max steps per online episode
-  num_envs: 4            # Number of parallel environments for online eval
+  num_envs: 12            # Number of parallel environments for online eval
   robosuite_task: ''  # Robosuite task name
   
   # --- Observation Handling (Robosuite Defaults) ---
