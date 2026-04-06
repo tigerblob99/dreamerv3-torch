@@ -504,7 +504,7 @@ joint_train:
   act: 'SiLU'              # Activation function
   norm: True               # Use layer normalization
   action_mlp:
-      {layers: 4, units: 1024, act: 'SiLU', norm: True, dist: 'normal', std: 'learned', min_std: 0.1, max_std: 1.0, absmax: 1.0, temp: 0.1, unimix_ratio: 0.01, outscale: 1.0, symlog_inputs: False}  # Action MLP config with faithful_normal distribution, can use normal for standard Gaussian output
+      {layers: 4, units: 1024, act: 'SiLU', norm: True, dist: 'faithful_normal', std: 'learned', min_std: 0.1, max_std: 1.0, absmax: 1.0, temp: 0.1, unimix_ratio: 0.01, outscale: 1.0, symlog_inputs: False}  # Action MLP config with faithful_normal distribution, can use normal for standard Gaussian output
   critic:
       {layers: 4, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
 
@@ -519,11 +519,11 @@ joint_train:
   grad_clip: 100.0          # Gradient clipping norm
   log_every: 100          # Logging frequency (steps)
   save_every: 10000
-  run_name: "square_baseline_actr_6_(code_efficiency_test)"
-  logdir: logdir/square_baseline_actr_6_(code_efficiency_joint_train)
+  run_name: "square_baseline_actr_7_(mse mean faithful_normal)"  # Name for this training run (used in logging and checkpointing)
+  logdir: logdir/square_baseline_actr_7_(mse mean faithful_normal)
   offline_traindir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1_train'
   offline_evaldir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1_eval'
-  offline_playdir: ['datasets/robomimic_data_MV/Square_MH_Shaped_shifted_0-1','datasets/robomimic_data_MV/lift_MH_train']
+  offline_playdir: 'datasets/robomimic_data_MV/Square_MH_Shaped_shifted_0-1' #['datasets/robomimic_data_MV/Square_MH_Shaped_shifted_0-1','datasets/robomimic_data_MV/lift_MH_train']
 
 
   
@@ -706,6 +706,8 @@ rl_finetune:
   eval_episodes: 128
   rl_critic_pretrain_steps: 2000
   rl_critic_pretrain_log_every: 100
+  foc_lambda: 0.0              # Weight for FOC loss (0.0 = disabled)
+  foc_gamma: -1.0              # Discount for FOC Q-surrogate (-1.0 = use config.discount)
 
   # DITTO reward verification (state-aligned real-env rollouts)
   ditto_verify: True

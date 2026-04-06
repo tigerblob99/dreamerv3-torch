@@ -287,6 +287,68 @@ def _imagine_policy(wm, actor, start_state, horizon, is_first=None, post=None):
     return deter_feats, feats, actions
 
 
+def _compute_foc_loss(
+    wm, critic, reward_model, post, expert_deter,
+    expert_actions, horizon, is_first_horizon,
+    gamma, use_amp, amp_device,
+):
+    """First-Order Optimality Condition loss: ||dQ/da||^2 at expert actions.
+
+    Encourages the critic's implied Q-function to have zero gradient at expert
+    actions (i.e. expert actions are stationary points of Q).
+
+    Runs a single batched ``img_step`` over all (B, T) state-action pairs
+    (flattened to B*T) so the computation is GPU-efficient.
+    """
+    T = horizon - 1  # need t and t+1, so t in [0, horizon-2]
+    B = expert_deter.shape[0]
+
+    # Detach posterior states for timesteps 0..T-1 and flatten to (B*T, ...)
+    states_flat = {}
+    for k, v in post.items():
+        sliced = v[:, :T].detach().contiguous()
+        states_flat[k] = sliced.reshape(B * T, *v.shape[2:])
+
+    # Expert actions at timesteps 0..T-1, requires_grad for autograd.grad
+    actions_flat = (
+        expert_actions[:, :T].detach().clone().reshape(B * T, -1).requires_grad_(True)
+    )
+
+    # Expert next-deter at timesteps 1..T for ditto reward reference
+    expert_next_deter_flat = expert_deter[:, 1 : T + 1].reshape(B * T, -1).detach()
+
+    # Continuation mask: zero out FOC at episode splice boundaries
+    cont_mask = (1.0 - is_first_horizon[:, 1 : T + 1]).reshape(B * T)
+
+    with torch.amp.autocast(
+        device_type=amp_device, enabled=use_amp, dtype=torch.float16
+    ):
+        next_state = wm.dynamics.img_step(states_flat, actions_flat, sample=True)
+        next_deter = wm.dynamics.get_feat(next_state, deterministic_only=True)
+
+        # Ditto reward: similarity of predicted next state to expert next state
+        r = reward_model.reward(next_deter, expert_next_deter_flat)  # (B*T,)
+
+        # Value of predicted next state
+        V_next = critic.value(next_deter).mode().squeeze(-1)  # (B*T,)
+
+        q = r + gamma * V_next  # (B*T,)
+
+    # Differentiate Q w.r.t. actions in float32 for numerical stability
+    dq_da = torch.autograd.grad(
+        outputs=q.float().sum(),
+        inputs=actions_flat,
+        create_graph=True,
+    )[0]  # (B*T, action_dim)
+
+    foc_per_step = dq_da.pow(2).sum(dim=-1)  # (B*T,)
+    foc_per_step = foc_per_step * cont_mask
+    num_valid = cont_mask.sum().clamp(min=1.0)
+    foc_loss = foc_per_step.sum() / num_valid
+
+    return foc_loss
+
+
 def _build_expert_sequence(batch, horizon: int):
     horizon = int(horizon)
     if horizon <= 0:
@@ -849,6 +911,10 @@ def rl_finetune(config):
     eval_envs = _init_eval_envs(config)
     pretrain_steps = int(config.rl_critic_pretrain_steps)
     pretrain_log_every = int(config.rl_critic_pretrain_log_every)
+    foc_lambda = float(getattr(config, "foc_lambda", 0.0))
+    foc_gamma = float(getattr(config, "foc_gamma", -1.0))
+    if foc_gamma < 0:
+        foc_gamma = float(config.discount)
 
     if pretrain_steps > 0:
         pretrain_step_offset = 0
@@ -881,20 +947,42 @@ def rl_finetune(config):
             if getattr(config, "gail_use_transitions", True) and horizon < 2:
                 raise ValueError("Need at least 2 steps for transition rewards.")
 
-            
-            rewards = reward_model.reward(expert_deter, expert_deter)
-            critic_metrics = critic.update(expert_deter, rewards, is_first=is_first_horizon,)
-            rewards = reward_model.reward(agent_deter, expert_deter)
-            critic_metrics = critic.update(
-                agent_deter, rewards, is_first=is_first_horizon
+            critic_metrics = {}
+
+            # ---------- Loss block 1: expert-vs-expert ----------
+            rewards_ee = reward_model.reward(expert_deter, expert_deter)
+            critic_metrics.update(
+                critic.update(expert_deter, rewards_ee, is_first=is_first_horizon)
             )
+
+            # ---------- Loss block 2: agent-vs-expert ----------
+            rewards_ae = reward_model.reward(agent_deter, expert_deter)
+            critic_metrics.update(
+                critic.update(agent_deter, rewards_ae, is_first=is_first_horizon)
+            )
+
+            # ---------- Loss block 3: FOC regularizer ----------
+            if foc_lambda > 0:
+                foc_loss = _compute_foc_loss(
+                    wm, critic, reward_model, post, expert_deter,
+                    data_wm["action"], horizon, is_first_horizon,
+                    foc_gamma, use_amp, amp_device,
+                )
+                with tools.RequiresGrad(critic):
+                    foc_opt_metrics = critic._value_opt(
+                        foc_lambda * foc_loss, critic.value.parameters()
+                    )
+                critic_metrics["foc_loss"] = float(foc_loss.detach())
+                critic_metrics.update(
+                    {f"foc_{k}": v for k, v in foc_opt_metrics.items()}
+                )
 
             if pretrain_log_every > 0 and (pre_step % pretrain_log_every == 0):
                 logger.step = pretrain_step_offset + pre_step
                 metrics = {}
                 metrics.update({f"pretrain/{k}": v for k, v in critic_metrics.items()})
-                metrics["pretrain/reward_mean"] = float(rewards.mean().item())
-                metrics["pretrain/reward_std"] = float(rewards.std().item())
+                metrics["pretrain/reward_mean"] = float(rewards_ae.mean().item())
+                metrics["pretrain/reward_std"] = float(rewards_ae.std().item())
                 for name, value in metrics.items():
                     logger.scalar(name, value)
                 logger.write(fps=False)
@@ -969,15 +1057,15 @@ def rl_finetune(config):
 
             log_action_mse = log_every > 0 and (step % log_every == 0) and bool(getattr(config, "log_action_mse", False))
             bc_action_mse = None
-            mean_nllh = None
+            mean_bc_loss = None
             if log_action_mse:
                 with torch.no_grad():
                     with torch.amp.autocast(
                         device_type=amp_device, enabled=use_amp, dtype=torch.float16
                     ):
                         bc_dist = frozen_BC.generate_actions(agent_feat.detach(), return_dist=True)
-                        nllh = -bc_dist.log_prob(agent_actions)
-                        mean_nllh = nllh.float().mean()
+                        bc_loss_metric = tools.regression_loss(bc_dist, agent_actions)
+                        mean_bc_loss = bc_loss_metric.float().mean()
                         BC_actions = bc_dist.mode()
                         bc_action_mse = torch.nn.functional.mse_loss(
                             agent_actions.detach().float(),
@@ -1021,7 +1109,7 @@ def rl_finetune(config):
                 metrics["train/reward_std"] = float(rewards.std().item())
                 if log_action_mse:
                     metrics["train/action_mse"] = float(bc_action_mse.item())
-                    metrics["train/mean_nllh"] = float(mean_nllh.item())
+                    metrics["train/mean_bc_loss"] = float(mean_bc_loss.item())
                 for name, value in metrics.items():
                     logger.scalar(name, value)
                 logger.write(fps=False)
@@ -1116,6 +1204,8 @@ def _parse_config(argv=None):
     defaults.setdefault(
         "rl_critic_pretrain_log_every", defaults.get("rl_log_every", 1e4)
     )
+    defaults.setdefault("foc_lambda", 0.0)
+    defaults.setdefault("foc_gamma", -1.0)
     defaults.setdefault("reward_model", "ditto")
     defaults.setdefault("reward_metric", "max_cos")
     defaults.setdefault("gail_hidden_dim", 256)

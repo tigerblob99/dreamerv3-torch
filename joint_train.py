@@ -286,10 +286,10 @@ def evaluate_offline(wm, policy, eval_loader, config, step):
             post_bc, _ = wm.dynamics.observe(embed_bc, data_bc['action'], data_bc['is_first'])
             feat_bc = wm.dynamics.get_feat(post_bc)
             
-            # --- BC Loss (negative log-likelihood) ---
+            # --- BC Loss (exact faithful loss when available, otherwise NLL) ---
             target = torch.tensor(raw_batch['policy_target'], device=config.device, dtype=torch.float32)
             pred_dist = policy(feat_bc, return_dist=True)
-            bc_loss = (-pred_dist.log_prob(target)).mean()
+            bc_loss = tools.regression_loss(pred_dist, target).mean()
             metrics['eval/bc_loss'].append(bc_loss.item())
 
     agg_metrics = {k: np.mean(v) for k, v in metrics.items()}
@@ -702,16 +702,16 @@ def joint_train(config):
                 post_bc, _ = wm.dynamics.observe(embed_bc, data_bc['action'], data_bc['is_first'])
                 feat_bc = wm.dynamics.get_feat(post_bc)
             
-            # --- BC Loss (masked negative log-likelihood; only joint data updates BC) ---
+            # --- BC Loss (masked exact faithful loss when available; only joint data updates BC) ---
             # raw_batch['policy_target'] / ['bc_mask'] are already pinned CPU tensors
             # from the DataLoader — use .to() instead of re-wrapping with torch.tensor().
             target = raw_batch['policy_target'].to(config.device, dtype=torch.float32, non_blocking=True)
             pred_dist = policy(feat_bc, return_dist=True)
-            per_step_nll = -pred_dist.log_prob(target)
+            per_step_bc_loss = tools.regression_loss(pred_dist, target)
             bc_mask = raw_batch['bc_mask'].to(config.device, dtype=torch.float32, non_blocking=True)
             bc_mask_sum = bc_mask.sum()
             if bc_mask_sum > 0:
-                bc_loss = (per_step_nll * bc_mask).sum() / bc_mask_sum
+                bc_loss = (per_step_bc_loss * bc_mask).sum() / bc_mask_sum
             else:
                 bc_loss = torch.tensor(0.0, device=config.device)
             

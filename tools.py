@@ -1379,12 +1379,11 @@ class ContDist:
 class FaithfulContDist:
     """Faithful heteroscedastic normal (Stirn et al.).
 
-    Splits the NLL into two terms so that:
-      - The mean is trained with unit-variance log_prob (equivalent to MSE).
-      - The std is trained with its own log_prob using a detached mean,
-        so std gradients only update the std head.
-    Requires that the trunk features are already detached before the std head
-    (handled in MLP.forward).
+    `faithful_loss()` implements the paper objective used for supervised BC:
+      - MSE for the mean/trunk.
+      - Heteroscedastic NLL with a detached mean for the std head.
+    `log_prob()` is kept as the legacy approximate score so existing policy code
+    paths remain unchanged on this branch.
     """
 
     def __init__(self, mean, std, absmax=None):
@@ -1420,6 +1419,13 @@ class FaithfulContDist:
     def entropy(self):
         return self.base_dist.entropy()
 
+    def faithful_loss(self, x):
+        mse = torch.square(x - self._mean).sum(dim=-1)
+        std_dist = torchd.independent.Independent(
+            torchd.normal.Normal(self._mean.detach(), self._std), 1
+        )
+        return mse - std_dist.log_prob(x)
+
     def log_prob(self, x):
         # Mean term: unit variance → gradients are pure MSE for the mean/trunk
         mean_dist = torchd.independent.Independent(
@@ -1430,6 +1436,13 @@ class FaithfulContDist:
             torchd.normal.Normal(self._mean.detach(), self._std), 1
         )
         return mean_dist.log_prob(x) + std_dist.log_prob(x)
+
+
+def regression_loss(dist, target):
+    faithful_loss = getattr(dist, "faithful_loss", None)
+    if callable(faithful_loss):
+        return faithful_loss(target)
+    return -dist.log_prob(target)
 
 
 class Bernoulli:
