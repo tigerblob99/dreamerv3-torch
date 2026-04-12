@@ -90,6 +90,7 @@ class Dreamer(nn.Module):
             self._logger.step = self._config.action_repeat * self._step
         return policy_output, state
 
+    @torch.no_grad()
     def _policy(self, obs, state, training):
         if state is None:
             latent = action = None
@@ -111,8 +112,6 @@ class Dreamer(nn.Module):
             actor = self._task_behavior.actor(feat)
             action = actor.sample()
         logprob = actor.log_prob(action)
-        latent = {k: v.detach() for k, v in latent.items()}
-        action = action.detach()
         if self._config.actor["dist"] == "onehot_gumble":
             action = torch.one_hot(
                 torch.argmax(action, dim=-1), self._config.num_actions
