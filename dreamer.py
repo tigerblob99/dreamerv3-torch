@@ -284,6 +284,8 @@ def main(config):
     tools.set_seed_everywhere(config.seed)
     if config.deterministic_run:
         tools.enable_deterministic_run()
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
     logdir = pathlib.Path(config.logdir).expanduser()
     config.traindir = (
         pathlib.Path(config.traindir).expanduser()
