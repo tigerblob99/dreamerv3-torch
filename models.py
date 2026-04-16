@@ -328,7 +328,7 @@ class ImagBehavior(nn.Module):
             feat_size,
             (config.num_actions,),
             config.actor["layers"],
-            config.units,
+            config.actor.get("units", config.units),
             config.act,
             config.norm,
             config.actor["dist"],

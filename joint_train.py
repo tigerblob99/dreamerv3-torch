@@ -146,7 +146,10 @@ class JointDataset(Dataset):
             if not dataset_dir.exists():
                 print(f"Warning: Dataset directory {dataset_dir} does not exist.")
                 continue
-            episodes = tools.load_episodes(dataset_dir, limit=None)
+            remaining = None if not config.dataset_size else max(int(config.dataset_size) - total_transitions, 0)
+            if remaining == 0:
+                break
+            episodes = tools.load_episodes(dataset_dir, limit=remaining)
             for episode_name, episode in episodes.items():
                 key = episode_name if len(self.directories) == 1 else f"{dataset_dir}::{episode_name}"
                 self.episodes[key] = episode
@@ -195,15 +198,11 @@ class JointDataset(Dataset):
             if total_ep_len <= 1: continue 
 
             needed = self.batch_length - current_len
-            valid_pairs = total_ep_len - 1
-            if valid_pairs < 1: continue
-
-            start_idx = np.random.randint(0, valid_pairs)
-            take = min(needed, valid_pairs - start_idx)
+            start_idx = np.random.randint(0, total_ep_len)
+            take = min(needed, total_ep_len - start_idx)
             if take <= 0: continue
 
             input_slice = slice(start_idx, start_idx + take)
-            target_slice = slice(start_idx + 1, start_idx + take + 1)
 
             raw_imgs = episode['image'][input_slice]
             
@@ -217,13 +216,18 @@ class JointDataset(Dataset):
             if current_len == 0: first_chunk[0] = True 
             else: first_chunk[0] = True 
 
-            collected['action'].append(episode['action'][input_slice])
-            collected['policy_target'].append(episode['action'][target_slice])
+            action_chunk = episode['action'][input_slice]
+            next_actions = episode['action'][start_idx + 1 : min(start_idx + take + 1, total_ep_len)]
+            policy_target = np.zeros_like(action_chunk)
+            policy_target[: len(next_actions)] = next_actions
+            bc_mask = np.full((take,), self.bc_mask_value, dtype=np.float32)
+            bc_mask[len(next_actions) :] = 0.0
+
+            collected['action'].append(action_chunk)
+            collected['policy_target'].append(policy_target)
             collected['is_first'].append(first_chunk)
             collected['is_terminal'].append(episode['is_terminal'][input_slice])
-            collected['bc_mask'].append(
-                np.full((take,), self.bc_mask_value, dtype=np.float32)
-            )
+            collected['bc_mask'].append(bc_mask)
 
             skip_keys = ['image', 'action', 'is_first', 'is_terminal', 'log_']
             for k, v in episode.items():
@@ -330,10 +334,11 @@ def evaluate_online(wm, policy, config, step, run, envs):
     
     num_envs = len(envs)
     total_episodes = config.eval_episodes
+    max_video_episodes = max(0, int(getattr(config, "eval_video_episodes", 3)))
     
     # Handle optional video recording (skip if logdir is None)
     video_dir = None
-    if config.logdir is not None:
+    if config.logdir is not None and max_video_episodes > 0:
         video_dir = pathlib.Path(config.logdir) / "eval_videos" / f"step_{step}"
     
     # We use the envs passed in, we do NOT create/close them here.
@@ -364,13 +369,16 @@ def evaluate_online(wm, policy, config, step, run, envs):
 
     global_ep_idx = 0
     env_episode_ids = [0] * num_envs
+
+    def _should_record(episode_idx):
+        return video_dir is not None and episode_idx < max_video_episodes
     
     # Initial Reset
     print(f"Starting Online Eval ({total_episodes} episodes)...")
     for i in range(num_envs):
         if global_ep_idx < total_episodes:
             obs_batch[i] = envs[i].reset()() 
-            if recorders[i]:
+            if _should_record(global_ep_idx):
                 recorders[i].start_episode(global_ep_idx)
                 recorders[i].add_frame(obs_batch[i])
             env_episode_ids[i] = global_ep_idx
@@ -452,7 +460,7 @@ def evaluate_online(wm, policy, config, step, run, envs):
             episode_rewards[i] += reward
             episode_steps[i] += 1
             episode_success[i] = (episode_success[i] or success)
-            if recorders[i]:
+            if _should_record(env_episode_ids[i]):
                 recorders[i].add_frame(obs)
             
             env_done = done or (episode_steps[i] >= getattr(config, "max_env_steps", 500)) or success
@@ -463,14 +471,18 @@ def evaluate_online(wm, policy, config, step, run, envs):
                 final_reward_per_step.append(episode_rewards[i] / episode_steps[i] if episode_steps[i] > 0 else 0.0)
                 final_successes.append(episode_success[i])
                 
-                vid_path = recorders[i].finish_episode() if recorders[i] else None
-                if vid_path and env_episode_ids[i] < 3:
+                vid_path = (
+                    recorders[i].finish_episode()
+                    if _should_record(env_episode_ids[i])
+                    else None
+                )
+                if vid_path and env_episode_ids[i] < max_video_episodes:
                     if run: 
                         run.log({f"eval_online/video_{env_episode_ids[i]}": wandb.Video(str(vid_path), fps=20, format="mp4")}, commit=False)
                 
                 if global_ep_idx < total_episodes:
                     obs_batch[i] = envs[i].reset()()
-                    if recorders[i]:
+                    if _should_record(global_ep_idx):
                         recorders[i].start_episode(global_ep_idx)
                         recorders[i].add_frame(obs_batch[i])
                     episode_rewards[i] = 0.0
@@ -498,7 +510,9 @@ def evaluate_online(wm, policy, config, step, run, envs):
 
 def joint_train(config):
     tools.set_seed_everywhere(config.seed)
-    
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
     logdir = pathlib.Path(config.logdir).expanduser()
     logdir.mkdir(parents=True, exist_ok=True)
     
@@ -523,7 +537,9 @@ def joint_train(config):
         pin_memory=True, drop_last=True
     )
 
-    eval_dataset = JointDataset(config.offline_evaldir, config, mode='eval')
+    eval_config = SimpleNamespace(**vars(config))
+    eval_config.dataset_size = int(getattr(config, "eval_dataset_size", config.dataset_size) or 0)
+    eval_dataset = JointDataset(config.offline_evaldir, eval_config, mode='eval')
     eval_loader = DataLoader(
         eval_dataset, batch_size=total_batch_size, shuffle=False, 
         num_workers=0, collate_fn=collate_episodes, pin_memory=True
@@ -611,9 +627,11 @@ def joint_train(config):
     else:
         print("Crops differ — running separate WM and BC encoder passes.")
 
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         list(wm.parameters()) + list(policy.parameters()),
-        lr=config.model_lr, weight_decay=config.weight_decay
+        lr=config.model_lr,
+        eps=config.opt_eps,
+        weight_decay=config.weight_decay,
     )
 
     # --- SETUP EVAL ENVS ONCE ---
@@ -672,20 +690,36 @@ def joint_train(config):
             post_wm, prior_wm = wm.dynamics.observe(embed_wm, data_wm['action'], data_wm['is_first'])
 
             # Calculate KL Loss
-            kl_loss, kl_val, _, _ = wm.dynamics.kl_loss(
+            kl_loss, kl_val, dyn_loss, rep_loss = wm.dynamics.kl_loss(
                 post_wm, prior_wm, config.kl_free, config.dyn_scale, config.rep_scale
             )
 
-            # Calculate Reconstruction Losses
+            # Calculate Reconstruction Losses (with per-head loss_scale from config;
+            # matches the scaling dict that models.WorldModel._train uses).
             feat_wm = wm.dynamics.get_feat(post_wm)
+            head_scales = {
+                "reward": config.reward_head["loss_scale"],
+                "cont": config.cont_head["loss_scale"],
+            }
             recon_losses = 0
+            head_loss_means = {}
+            head_loss_scaled_means = {}
             for name, head in wm.heads.items():
+                scale = head_scales.get(name, 1.0)
+                if scale == 0.0:
+                    continue  # skip forward pass entirely — head contributes no loss/grad
                 pred = head(feat_wm)
                 if isinstance(pred, dict):
                     for k, v in pred.items():
-                        recon_losses -= v.log_prob(data_wm[k])
+                        loss = -v.log_prob(data_wm[k])
+                        recon_losses += scale * loss
+                        head_loss_means[k] = loss.mean()
+                        head_loss_scaled_means[k] = (scale * loss).mean()
                 else:
-                    recon_losses -= pred.log_prob(data_wm[name])
+                    loss = -pred.log_prob(data_wm[name])
+                    recon_losses += scale * loss
+                    head_loss_means[name] = loss.mean()
+                    head_loss_scaled_means[name] = (scale * loss).mean()
 
             wm_loss = (recon_losses + kl_loss).mean()
 
@@ -706,6 +740,8 @@ def joint_train(config):
             # raw_batch['policy_target'] / ['bc_mask'] are already pinned CPU tensors
             # from the DataLoader — use .to() instead of re-wrapping with torch.tensor().
             target = raw_batch['policy_target'].to(config.device, dtype=torch.float32, non_blocking=True)
+            if config.bc_sg_wm:
+                feat_bc = feat_bc.detach()
             pred_dist = policy(feat_bc, return_dist=True)
             per_step_bc_loss = tools.regression_loss(pred_dist, target)
             bc_mask = raw_batch['bc_mask'].to(config.device, dtype=torch.float32, non_blocking=True)
@@ -714,24 +750,53 @@ def joint_train(config):
                 bc_loss = (per_step_bc_loss * bc_mask).sum() / bc_mask_sum
             else:
                 bc_loss = torch.tensor(0.0, device=config.device)
+
+            with torch.no_grad():
+                policy_entropy = pred_dist.entropy().mean()
+                bc_valid_frac = (bc_mask > 0).float().mean()
+                pred_action = pred_dist.mode()
+                per_step_action_mse = torch.mean(torch.square(pred_action - target), dim=-1)
+                per_step_action_mae = torch.mean(torch.abs(pred_action - target), dim=-1)
+                if bc_mask_sum > 0:
+                    action_mse = (per_step_action_mse * bc_mask).sum() / bc_mask_sum
+                    action_mae = (per_step_action_mae * bc_mask).sum() / bc_mask_sum
+                else:
+                    action_mse = torch.tensor(0.0, device=config.device)
+                    action_mae = torch.tensor(0.0, device=config.device)
             
             # 5. Optimization
             total_loss = (config.wm_loss_scale * wm_loss) + (config.bc_loss_scale * bc_loss)
             
             optimizer.zero_grad()
             total_loss.backward()
-            nn.utils.clip_grad_norm_(list(wm.parameters()) + list(policy.parameters()), config.grad_clip)
+            grad_norm = nn.utils.clip_grad_norm_(
+                list(wm.parameters()) + list(policy.parameters()), config.grad_clip
+            )
             optimizer.step()
             
             step += 1
             
             if step % config.log_every == 0:
-                wandb.log({
+                log_data = {
                     "train/total_loss": total_loss.item(),
                     "train/wm_loss": wm_loss.item(),
+                    "train/wm_recon_loss": recon_losses.mean().item(),
                     "train/bc_loss": bc_loss.item(),
-                    "train/kl": kl_val.mean().item()
-                }, step=step)
+                    "train/kl": kl_val.mean().item(),
+                    "train/dyn_loss": dyn_loss.mean().item(),
+                    "train/rep_loss": rep_loss.mean().item(),
+                    "train/policy_entropy": policy_entropy.item(),
+                    "train/action_mse": action_mse.item(),
+                    "train/action_mae": action_mae.item(),
+                    "train/bc_valid_frac": bc_valid_frac.item(),
+                    "train/bc_valid_steps": bc_mask_sum.item(),
+                    "train/grad_norm": float(grad_norm),
+                }
+                for name, value in head_loss_means.items():
+                    log_data[f"train/{name}_loss"] = value.item()
+                for name, value in head_loss_scaled_means.items():
+                    log_data[f"train/{name}_loss_scaled"] = value.item()
+                wandb.log(log_data, step=step)
                 
             if step % config.eval_every == 0:
                 print(f"Evaluating at step {step}...")
@@ -831,6 +896,7 @@ if __name__ == "__main__":
     defaults.setdefault('camera_depths', False)
     defaults.setdefault('ignore_done', False)
     defaults.setdefault('clip_actions', False)
+    defaults.setdefault('bc_sg_wm', False)
     if isinstance(defaults.get("action_mlp"), dict):
         defaults.setdefault("action_mlp_layers", int(defaults["action_mlp"].get("layers", 4)))
 

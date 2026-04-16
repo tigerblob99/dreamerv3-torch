@@ -39,6 +39,7 @@ def _make_batch_iter(dataset, config):
         raise RuntimeError(
             "RlDataset has no valid windows. Check batch_length vs episode lengths."
         )
+    pin_memory = bool(torch.cuda.is_available() and "cuda" in str(config.device))
     sampler = WeightedRandomSampler(
         weights=dataset.sample_weights,
         num_samples=len(dataset),
@@ -50,6 +51,7 @@ def _make_batch_iter(dataset, config):
         sampler=sampler,
         num_workers=int(getattr(config, "num_workers", 0)),
         collate_fn=collate_episodes,
+        pin_memory=pin_memory,
         drop_last=True,
     )
 
@@ -325,12 +327,13 @@ def _compute_foc_loss(
     ):
         next_state = wm.dynamics.img_step(states_flat, actions_flat, sample=True)
         next_deter = wm.dynamics.get_feat(next_state, deterministic_only=True)
+        next_feat = wm.dynamics.get_feat(next_state)
 
         # Ditto reward: similarity of predicted next state to expert next state
         r = reward_model.reward(next_deter, expert_next_deter_flat)  # (B*T,)
 
-        # Value of predicted next state
-        V_next = critic.value(next_deter).mode().squeeze(-1)  # (B*T,)
+        # Critic values are defined on the full RSSM feature, not deter-only.
+        V_next = critic.value(next_feat).mode().squeeze(-1)  # (B*T,)
 
         q = r + gamma * V_next  # (B*T,)
 
@@ -459,6 +462,7 @@ def ditto_verify(
         batch_size=len(eval_envs),
         shuffle=True,
         num_workers=0,
+        pin_memory=bool(torch.cuda.is_available() and "cuda" in str(config.device)),
         drop_last=True,
     )
 
@@ -778,6 +782,8 @@ def ditto_verify(
 def rl_finetune(config):
 
     tools.set_seed_everywhere(int(config.seed))
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
     if "cuda" not in str(config.device) or not torch.cuda.is_available():
         config.precision = 32
@@ -840,10 +846,9 @@ def rl_finetune(config):
         if config.dyn_discrete
         else config.dyn_stoch + config.dyn_deter
     )
-    deter_size = int(config.dyn_deter)
     actor = Actor(config, feat_size, config.num_actions).to(config.device)
     random_actor = Actor(config, feat_size, config.num_actions).to(config.device)
-    critic = Critic(config, deter_size).to(config.device)
+    critic = Critic(config, feat_size).to(config.device)
 
     ckpt_path = getattr(config, "checkpoint", "")
     if not ckpt_path:
@@ -852,7 +857,14 @@ def rl_finetune(config):
             ckpt_path = str(candidate)
     if not ckpt_path:
         raise FileNotFoundError("No checkpoint provided and no latest.pt found.")
-    _load_actor_only(actor, ckpt_path, config.device)
+    policy_init = str(getattr(config, "policy_init", "checkpoint")).strip().lower() or "checkpoint"
+    print(f"Loading checkpoint ({policy_init}) from {ckpt_path}")
+    if policy_init == "checkpoint":
+        _load_actor_only(actor, ckpt_path, config.device)
+    elif policy_init != "random":
+        raise ValueError(
+            "policy_init must be 'checkpoint' or 'random' for RL_finetune."
+        )
 
     dreamer_wm_checkpoint = str(getattr(config, "dreamer_wm_checkpoint", "")).strip()
     if dreamer_wm_checkpoint:
@@ -868,7 +880,7 @@ def rl_finetune(config):
         print(f"Loaded world model weights from checkpoint: {ckpt_path}")
     
     frozen_BC = Actor(config, feat_size, config.num_actions).to(config.device)
-    frozen_BC.load_state_dict(actor.state_dict())
+    _load_actor_only(frozen_BC, ckpt_path, config.device)
 
     frozen_BC.eval()
     frozen_BC.requires_grad_(False)
@@ -952,37 +964,37 @@ def rl_finetune(config):
             # ---------- Loss block 1: expert-vs-expert ----------
             rewards_ee = reward_model.reward(expert_deter, expert_deter)
             critic_metrics.update(
-                critic.update(expert_deter, rewards_ee, is_first=is_first_horizon)
+                critic.update(expert_feat, rewards_ee, is_first=is_first_horizon)
             )
 
             # ---------- Loss block 2: agent-vs-expert ----------
-            rewards_ae = reward_model.reward(agent_deter, expert_deter)
-            critic_metrics.update(
-                critic.update(agent_deter, rewards_ae, is_first=is_first_horizon)
-            )
+            #rewards_ae = reward_model.reward(agent_deter, expert_deter)
+            #critic_metrics.update(
+            #    critic.update(agent_feat, rewards_ae, is_first=is_first_horizon)
+            #)
 
             # ---------- Loss block 3: FOC regularizer ----------
             if foc_lambda > 0:
-                foc_loss = _compute_foc_loss(
-                    wm, critic, reward_model, post, expert_deter,
-                    data_wm["action"], horizon, is_first_horizon,
-                    foc_gamma, use_amp, amp_device,
-                )
                 with tools.RequiresGrad(critic):
+                    foc_loss = _compute_foc_loss(
+                        wm, critic, reward_model, post, expert_deter,
+                        data_wm["action"], horizon, is_first_horizon,
+                        foc_gamma, use_amp, amp_device,
+                    )
                     foc_opt_metrics = critic._value_opt(
                         foc_lambda * foc_loss, critic.value.parameters()
                     )
                 critic_metrics["foc_loss"] = float(foc_loss.detach())
                 critic_metrics.update(
-                    {f"foc_{k}": v for k, v in foc_opt_metrics.items()}
+                   {f"foc_{k}": v for k, v in foc_opt_metrics.items()}
                 )
 
             if pretrain_log_every > 0 and (pre_step % pretrain_log_every == 0):
                 logger.step = pretrain_step_offset + pre_step
                 metrics = {}
                 metrics.update({f"pretrain/{k}": v for k, v in critic_metrics.items()})
-                metrics["pretrain/reward_mean"] = float(rewards_ae.mean().item())
-                metrics["pretrain/reward_std"] = float(rewards_ae.std().item())
+            #    metrics["pretrain/reward_mean"] = float(rewards_ae.mean().item())
+            #    metrics["pretrain/reward_std"] = float(rewards_ae.std().item())
                 for name, value in metrics.items():
                     logger.scalar(name, value)
                 logger.write(fps=False)
@@ -1082,7 +1094,7 @@ def rl_finetune(config):
             # then update critic to avoid in-place version bumps before actor backward.
             critic.update_slow_target()
             target, value_seq = critic.compute_targets(
-                agent_deter,
+                agent_feat,
                 rewards,
                 stop_gradient=(imag_gradient != "dynamics"),
                 is_first=is_first_horizon,
@@ -1098,7 +1110,7 @@ def rl_finetune(config):
                 )
             else:
                 actor_metrics = actor.update(agent_feat, agent_actions, target, value_seq)
-            critic_metrics = critic.update_from_targets(agent_deter, target)
+            critic_metrics = critic.update_from_targets(agent_feat, target)
 
             if log_every > 0 and (step % log_every == 0):
                 logger.step = pretrain_steps + step
@@ -1218,6 +1230,7 @@ def _parse_config(argv=None):
     defaults.setdefault("clip_actions", False)
     defaults.setdefault("checkpoint", "")
     defaults.setdefault("dreamer_wm_checkpoint", "")
+    defaults.setdefault("policy_init", "checkpoint")
     defaults.setdefault("expert_dir", defaults.get("offline_traindir", ""))
     defaults.setdefault("num_workers", 0)
     defaults.setdefault("ditto_verify", False)

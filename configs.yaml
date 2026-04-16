@@ -191,6 +191,10 @@ memorymaze:
 
 robosuite:
   steps: 2e6
+  model_lr: 3e-4
+  opt: 'adamw'
+  weight_decay: 5e-2
+  opt_eps: 1e-5
   units: 1024
   env_restart_every: 5e4
   batch_size: 32
@@ -202,7 +206,7 @@ robosuite:
   eval_every: 1e5
   eval_episode_num: 100
   dataset_episode_sampling: 'uniform'  # 'shorter' (inverse-transition) or 'uniform'
-  logdir: logdir/robosuite_square_reset_every_5e4_run2 (larger latent)
+  logdir: logdir/robosuite_square_reset_every_5e4_run3 (adamw and weight decay)  # Logging directory for this set of runs
   exptdir: datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1
   task: 'robosuite_NutAssemblySquare'
   size: [84, 84]
@@ -493,8 +497,8 @@ square_env_eval:
 
 joint_train:
   # World Model
-  dyn_hidden: 512
-  dyn_deter: 512
+  dyn_hidden: 1024
+  dyn_deter: 1024
   dyn_stoch: 32
   dyn_discrete: 32
   # --- actor model definition ---
@@ -504,32 +508,41 @@ joint_train:
   act: 'SiLU'              # Activation function
   norm: True               # Use layer normalization
   action_mlp:
-      {layers: 4, units: 1024, act: 'SiLU', norm: True, dist: 'faithful_normal', std: 'learned', min_std: 0.1, max_std: 1.0, absmax: 1.0, temp: 0.1, unimix_ratio: 0.01, outscale: 1.0, symlog_inputs: False}  # Action MLP config with faithful_normal distribution, can use normal for standard Gaussian output
+      {layers: 4, units: 1024, act: 'SiLU', norm: True, dist: 'normal', std: 'learned', min_std: 0.1, max_std: 1.0, absmax: 1.0, temp: 0.1, unimix_ratio: 0.01, outscale: 1.0, symlog_inputs: False}  # Action MLP config with faithful_normal distribution, can use normal for standard Gaussian output
   critic:
       {layers: 4, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+  reward_head:
+      {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  cont_head:
+      {layers: 2, loss_scale: 1.0, outscale: 1.0}
 
   # --- Training Loop ---
   steps: 150000             # Total training steps
-  model_lr: 5e-4            # Learning rate for joint optimizer
-  weight_decay: 1e-5        # Weight decay for joint optimizer
+  model_lr: 3e-4           # Learning rate for joint optimizer
+  opt_eps: 1e-5             # Adam epsilon for joint optimizer
+  weight_decay: 5e-2        # Weight decay for joint optimizer
+  dyn_scale: 0.24           # KL beta * delta = 0.3 * 0.8
+  rep_scale: 0.06           # KL beta * (1 - delta) = 0.3 * 0.2
 
   batch_size: 64            # Batch size
   batch_length: 64          # Sequence length
-  expert_data_fraction: 0.67  # Fraction of expert data in each batch (e.g., 0.67 for 2/3 expert, 1/3 play)
+  eval_dataset_size: 10000  # Cap eval transitions loaded into RAM
+  expert_data_fraction: 0.25  # Fraction of expert data in each batch (e.g., 0.67 for 2/3 expert, 1/3 play)
   grad_clip: 100.0          # Gradient clipping norm
   log_every: 100          # Logging frequency (steps)
   save_every: 10000
-  run_name: "square_baseline_actr_7_(mse mean faithful_normal)"  # Name for this training run (used in logging and checkpointing)
-  logdir: logdir/square_baseline_actr_7_(mse mean faithful_normal)
+  run_name: "square_baseline_actr_12_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG)"  # Name for this training run (used in logging and checkpointing)
+  logdir: logdir/square_baseline_actr_12_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG)  # Base logging directory for this run
   offline_traindir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1_train'
-  offline_evaldir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1_eval'
-  offline_playdir: 'datasets/robomimic_data_MV/Square_MH_Shaped_shifted_0-1' #['datasets/robomimic_data_MV/Square_MH_Shaped_shifted_0-1','datasets/robomimic_data_MV/lift_MH_train']
+  offline_evaldir: 'logdir/robosuite_square_reset_every_5e4_run2 (larger latent)/eval_eps'
+  offline_playdir: 'logdir/robosuite_square_reset_every_5e4_run2 (larger latent)/train_eps' #['datasets/robomimic_data_MV/Square_MH_Shaped_shifted_0-1','datasets/robomimic_data_MV/lift_MH_train']
 
 
   
   # --- Loss Scales ---
-  wm_loss_scale: 0.1        # Scale for World Model loss (Recon + KL + Reward)
+  wm_loss_scale: 1.0       # Scale for World Model loss (Recon + KL + Reward)
   bc_loss_scale: 1.0        # Scale for Behavior Cloning loss
+  bc_sg_wm: True           # Detach BC features before the policy so BC loss does not update the world model
   
   # --- Data Augmentation (Dual Cropping) ---
   image_crop_height: 84     # Target crop height (from 84x84 source)
@@ -541,8 +554,8 @@ joint_train:
   eval_every: 5000         # Frequency of evaluation (steps)
   offline_eval_batches: 64  # Number of batches to calculate validation loss on
   eval_episodes: 100          # Number of online episodes to run in Robosuite
-  max_env_steps: 300        # Max steps per online episode
-  num_envs: 12            # Number of parallel environments for online eval
+  max_env_steps: 350        # Max steps per online episode
+  num_envs: 6            # Number of parallel environments for online eval
   robosuite_task: ''  # Robosuite task name
   
   # --- Observation Handling (Robosuite Defaults) ---
@@ -610,13 +623,13 @@ rl_train:
   rl_updates: 200           # Number of collect-train updates
   collect_steps: 4000       # Fresh env steps collected per update
   train_batches_per_collect: 8  # Gradient updates sampled from each fresh collection
-  rl_critic_pretrain_steps: 10000   # Offline critic-only warmup steps before online rollouts
-  rl_critic_pretrain_log_every: 50
+  rl_critic_pretrain_steps: 5000   # Offline critic-only warmup steps before online rollouts
+  rl_critic_pretrain_log_every: 100
   rl_critic_pretrain_dataset_size: 300000  # Transition cap for preload from pretrain dir
   rl_critic_pretrain_dir: ''   # Empty -> use expert_dir / offline_traindir
 
   # --- Training ---
-  policy_init: random   # checkpoint: load actor+WM, random: load WM only
+  policy_init: checkpoint   # checkpoint: load actor+WM, random: load WM only
   batch_size: 64
   mini_batch_size: 64       # Per-update sampled mini-batch size (<=0 uses batch_size)
   batch_length: 64
@@ -637,14 +650,24 @@ rl_train:
 
 rl_finetune:
   # --- RL_finetune.py specific run config ---
+  #model parameters
   units: 512
-  logdir: logdir/rl_finetune_deter_latents_can_pretrained_wm_21_(exptklKL BC topstoc exptpretrain shorterdreams) #(wrap around dataset_less_pretrained_WM)  # Logging directory for RL fine-tuning runs
-  checkpoint: 'logdir/joint_Play_stoc_actr_2/step_50000.pt'  # Path to pre-trained Dreamer/joint checkpoint
+  dyn_deter: 1024
+  dyn_hidden: 1024
+  dyn_stoch: 32
+  dyn_discrete: 32
+  # file paths
+  logdir: logdir/rl_finetune_deter_latents_square_pretrained_wm_33_(square_baseline_actr_12_10k) #(wrap around dataset_less_pretrained_WM)  # Logging directory for RL fine-tuning runs
+  checkpoint: 'logdir/square_baseline_actr_12_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG)/step_10000.pt'  # Path to pre-trained Dreamer/joint checkpoint
   dreamer_wm_checkpoint: '' #'logdir/robosuite_can_reset_every_10k_run2/latest.pt'  # Optional Dreamer checkpoint for WM override; when set, WM loads from here.
-  expert_dir: 'datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1'
+  expert_dir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1'
 
   encoder: *robomimic_encoder
   decoder: *robomimic_decoder
+  reward_head:
+      {layers: 2, dist: 'symlog_disc', loss_scale: 0.1, outscale: 0.0}
+  cont_head:
+      {layers: 2, loss_scale: 0.0, outscale: 1.0}
 
   # Reward model
   reward_model: ditto
@@ -657,12 +680,12 @@ rl_finetune:
   gail_use_transitions: True
 
   # Environment / eval env construction
-  robosuite_task: 'PickPlaceCan'
+  robosuite_task: 'NutAssemblySquare'
   robosuite_reward_shaping: True
   robosuite_reward_scale: 1.0
   robosuite_reward_shift: -1.0
   size: [84, 84]
-  max_env_steps: 250
+  max_env_steps: 400
   clip_actions: True
   num_envs: 8
 
@@ -684,39 +707,136 @@ rl_finetune:
   image_crop_width: 84
 
   # Training
-  ac_batch_size: 1024
-  batch_length: 16
+  ac_batch_size: 900
+  batch_length: 17
+  policy_init: checkpoint   # checkpoint: load actor+WM, random: load WM only
   policy_units: 1024
   actor:
-    {layers: 4, dist: 'normal', entropy: 1e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 2e-4, eps: 1e-5, grad_clip: 100.0, outscale: 1.0, bc_kl_scale: 0.01}
+    {layers: 4, dist: 'normal', entropy: 5e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 2e-4, eps: 1e-5, grad_clip: 100.0, outscale: 1.0, bc_kl_scale: 0.01}
   critic:
     {layers: 4, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-4, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
-  discount: 0.98
+  discount: 0.95
   discount_lambda: 0.95
   imag_gradient: 'dynamics'
-  imag_horizon: 16
+  imag_horizon: 17
   reward_EMA: True
   num_workers: 0
 
   # RL_finetune.py schedule keys
   rl_steps: 100000
-  rl_log_every: 100
-  rl_save_every: 1000
-  rl_eval_every: 1000
-  eval_episodes: 128
-  rl_critic_pretrain_steps: 2000
+  rl_log_every: 500
+  rl_save_every: 10000
+  rl_eval_every: 5000
+  eval_episodes: 100
+  rl_critic_pretrain_steps: 500
   rl_critic_pretrain_log_every: 100
-  foc_lambda: 0.0              # Weight for FOC loss (0.0 = disabled)
+  foc_lambda: 0.01           # Weight for FOC loss (0.0 = disabled)
   foc_gamma: -1.0              # Discount for FOC Q-surrogate (-1.0 = use config.discount)
 
   # DITTO reward verification (state-aligned real-env rollouts)
-  ditto_verify: True
-  ditto_verify_hdf5_path: 'datasets/imagecanPH_shaped.hdf5'
-  ditto_verify_evaldir: 'datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1'
+  ditto_verify: False
+  ditto_verify_hdf5_path: 'datasets/imageSquarePH_shaped.hdf5'
+  ditto_verify_evaldir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1'
   ditto_verify_warmup_len: 5
   ditto_verify_horizon: 93
   ditto_verify_batches: 1
 
   # Logging
-  video_pred_log: True
-  log_action_mse: True
+  video_pred_log: False
+  log_action_mse: False
+
+dreamer_finetune:
+  units: 512
+  dyn_deter: 1024
+  dyn_hidden: 1024
+  dyn_stoch: 32
+  dyn_discrete: 32
+  norm: True
+  act: 'SiLU'
+
+  encoder: *robomimic_encoder
+  decoder: *robomimic_decoder
+  reward_head:
+    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  cont_head:
+    {layers: 2, loss_scale: 1.0, outscale: 1.0}
+
+  # Actor layers/dist must match joint_train action_mlp (layers:4, dist:normal).
+  actor:
+    {layers: 4, units: 1024, dist: 'normal', entropy: 3e-4, unimix_ratio: 0.01, std: 'learned',
+     min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 2e-4, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+  critic:
+    {layers: 4, dist: 'symlog_disc', slow_target: True, slow_target_update: 1,
+     slow_target_fraction: 0.02, lr: 3e-4, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+
+  imag_horizon: 15
+  imag_gradient: 'dynamics'
+  imag_gradient_mix: 0.0
+  reward_EMA: True
+  discount: 0.95
+  discount_lambda: 0.95
+  bc_kl_scale: 0.0  # KL(actor || frozen_BC) penalty; 0.0 disables entirely
+
+  # Paths
+  logdir: logdir/dreamer_finetune/run1
+  checkpoint: 'logdir/square_baseline_actr_11_(DiWA params, LARGE play dataset,smaller lr,cont and reward)/latest.pt'
+  offline_traindir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1'
+  freeze_wm: True  # False to allow joint WM+actor updates
+
+  # Training
+  steps: 100000
+  batch_size: 64
+  batch_length: 64
+  num_workers: 0
+
+  # Eval
+  log_every: 500
+  eval_every: 5000
+  save_every: 10000
+  eval_episodes: 50
+  max_env_steps: 350
+  num_envs: 6
+  clip_actions: True
+  robosuite_task: 'NutAssemblySquare'
+  robosuite_robots: ['Panda']
+  robosuite_controller: 'OSC_POSE'
+  robosuite_reward_shaping: True
+  controller_configs:
+    type: BASIC
+    body_parts:
+      right:
+        type: OSC_POSE
+        input_max: 1
+        input_min: -1
+        output_max: [0.05, 0.05, 0.05, 0.5, 0.5, 0.5]
+        output_min: [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5]
+        kp: 150
+        damping: 1
+        impedance_mode: fixed
+        kp_limits: [0, 300]
+        damping_limits: [0, 10]
+        position_limits: null
+        orientation_limits: null
+        uncouple_pos_ori: true
+        control_delta: true
+        interpolation: null
+        ramp_ratio: 0.2
+        input_ref_frame: world
+        gripper:
+          type: GRIP
+
+  camera_obs_keys: [agentview_image, robot0_eye_in_hand_image]
+  flip_camera_keys: [agentview_image, robot0_eye_in_hand_image]
+  bc_cnn_keys_order: [image]
+  bc_mlp_keys_order:
+    - robot0_joint_pos
+    - robot0_joint_vel
+    - robot0_gripper_qpos
+    - robot0_gripper_qvel
+    - aux_robot0_joint_pos_sin
+    - aux_robot0_joint_pos_cos
+  aux_key_map:
+    aux_robot0_joint_pos_sin: robot0_joint_pos_sin
+    aux_robot0_joint_pos_cos: robot0_joint_pos_cos
+  image_crop_height: 84
+  image_crop_width: 84
