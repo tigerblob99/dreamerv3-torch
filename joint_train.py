@@ -161,9 +161,46 @@ class JointDataset(Dataset):
                 break
 
         self.episode_list = list(self.episodes.values())
+        self.sampleable_episodes = [
+            episode for episode in self.episode_list if len(episode["action"]) > 1
+        ]
 
         self.num_episodes = len(self.episode_list)
+        self.num_sampleable_episodes = len(self.sampleable_episodes)
         self.epoch_size = (total_steps // self.batch_length) if self.batch_length else 0
+        if self.sampleable_episodes:
+            sample_episode = self.sampleable_episodes[0]
+            image_tail = sample_episode["image"].shape[1:]
+            if self.do_crop:
+                image_tail = (self.crop_h, self.crop_w, image_tail[-1])
+            self.image_shape = (self.batch_length, *image_tail)
+            self.image_dtype = sample_episode["image"].dtype
+            self.action_shape = (self.batch_length, *sample_episode["action"].shape[1:])
+            self.action_dtype = sample_episode["action"].dtype
+            self.is_first_dtype = sample_episode["is_first"].dtype
+            self.is_terminal_dtype = sample_episode["is_terminal"].dtype
+            self.extra_keys = [
+                key
+                for key in sample_episode.keys()
+                if key not in {"image", "action", "is_first", "is_terminal"}
+                and not key.startswith("log_")
+            ]
+            self.extra_specs = {
+                key: (
+                    (self.batch_length, *sample_episode[key].shape[1:]),
+                    sample_episode[key].dtype,
+                )
+                for key in self.extra_keys
+            }
+        else:
+            self.image_shape = None
+            self.image_dtype = None
+            self.action_shape = None
+            self.action_dtype = None
+            self.is_first_dtype = None
+            self.is_terminal_dtype = None
+            self.extra_keys = []
+            self.extra_specs = {}
         
         print(f"[{mode}] Loaded {self.num_episodes} episodes, {total_steps} steps.")
 
@@ -171,8 +208,8 @@ class JointDataset(Dataset):
         return self.epoch_size
 
     def _sample_episode(self):
-        idx = np.random.randint(0, self.num_episodes)
-        return self.episode_list[idx]
+        idx = np.random.randint(0, self.num_sampleable_episodes)
+        return self.sampleable_episodes[idx]
 
     def _get_crop_coords(self, use_random_crop):
         if not self.do_crop: return 0, 0
@@ -189,54 +226,88 @@ class JointDataset(Dataset):
         return img[:, top : top + self.crop_h, left : left + self.crop_w, :]
 
     def __getitem__(self, _):
-        collected = defaultdict(list)
+        dreamer_like = bool(
+            getattr(self.config, "dreamer_like_sequence_sampling", False)
+        )
+        image_wm = np.empty(self.image_shape, dtype=self.image_dtype)
+        share_crop = (not self.do_crop) or (
+            self.mode != "train"
+            or (
+                not getattr(self.config, "wm_random_crop", False)
+                and not getattr(self.config, "bc_random_crop", False)
+            )
+        )
+        image_bc = image_wm if share_crop else np.empty(self.image_shape, dtype=self.image_dtype)
+        action = np.empty(self.action_shape, dtype=self.action_dtype)
+        policy_target = np.zeros(self.action_shape, dtype=self.action_dtype)
+        is_first = np.empty((self.batch_length,), dtype=self.is_first_dtype)
+        is_terminal = np.empty((self.batch_length,), dtype=self.is_terminal_dtype)
+        bc_mask = np.zeros((self.batch_length,), dtype=np.float32)
+        extra = {
+            key: np.empty(shape, dtype=dtype)
+            for key, (shape, dtype) in self.extra_specs.items()
+        }
         current_len = 0
         
         while current_len < self.batch_length:
             episode = self._sample_episode()
             total_ep_len = len(episode['action'])
-            if total_ep_len <= 1: continue 
 
             needed = self.batch_length - current_len
-            start_idx = np.random.randint(0, total_ep_len)
+            if dreamer_like and current_len > 0:
+                start_idx = 0
+            else:
+                start_idx = np.random.randint(0, total_ep_len)
             take = min(needed, total_ep_len - start_idx)
             if take <= 0: continue
 
             input_slice = slice(start_idx, start_idx + take)
+            out_slice = slice(current_len, current_len + take)
 
             raw_imgs = episode['image'][input_slice]
             
             t_wm, l_wm = self._get_crop_coords(getattr(self.config, 'wm_random_crop', False))
-            collected['image_wm'].append(self._crop(raw_imgs, t_wm, l_wm))
-
-            t_bc, l_bc = self._get_crop_coords(getattr(self.config, 'bc_random_crop', False))
-            collected['image_bc'].append(self._crop(raw_imgs, t_bc, l_bc))
-
-            first_chunk = episode['is_first'][input_slice].copy()
-            if current_len == 0: first_chunk[0] = True 
-            else: first_chunk[0] = True 
+            image_wm[out_slice] = self._crop(raw_imgs, t_wm, l_wm)
+            if not share_crop:
+                t_bc, l_bc = self._get_crop_coords(getattr(self.config, 'bc_random_crop', False))
+                image_bc[out_slice] = self._crop(raw_imgs, t_bc, l_bc)
 
             action_chunk = episode['action'][input_slice]
             next_actions = episode['action'][start_idx + 1 : min(start_idx + take + 1, total_ep_len)]
-            policy_target = np.zeros_like(action_chunk)
-            policy_target[: len(next_actions)] = next_actions
-            bc_mask = np.full((take,), self.bc_mask_value, dtype=np.float32)
-            bc_mask[len(next_actions) :] = 0.0
+            action[out_slice] = action_chunk
+            if len(next_actions):
+                policy_target[current_len : current_len + len(next_actions)] = next_actions
+            bc_mask[out_slice] = self.bc_mask_value
+            bc_mask[current_len + len(next_actions) : current_len + take] = 0.0
 
-            collected['action'].append(action_chunk)
-            collected['policy_target'].append(policy_target)
-            collected['is_first'].append(first_chunk)
-            collected['is_terminal'].append(episode['is_terminal'][input_slice])
-            collected['bc_mask'].append(bc_mask)
+            is_first[out_slice] = episode['is_first'][input_slice]
+            is_first[current_len] = True
+            is_terminal[out_slice] = episode['is_terminal'][input_slice]
 
-            skip_keys = ['image', 'action', 'is_first', 'is_terminal', 'log_']
-            for k, v in episode.items():
-                if any(x in k for x in skip_keys): continue
-                collected[k].append(v[input_slice])
+            for key in self.extra_keys:
+                extra[key][out_slice] = episode[key][input_slice]
 
             current_len += take
 
-        return {k: torch.from_numpy(np.concatenate(v, axis=0)) for k, v in collected.items()}
+        out = {
+            'image_wm': torch.from_numpy(image_wm),
+            'image_bc': torch.from_numpy(image_bc),
+            'action': torch.from_numpy(action),
+            'policy_target': torch.from_numpy(policy_target),
+            'is_first': torch.from_numpy(is_first),
+            'is_terminal': torch.from_numpy(is_terminal),
+            'bc_mask': torch.from_numpy(bc_mask),
+        }
+        for key, value in extra.items():
+            out[key] = torch.from_numpy(value)
+        if dreamer_like and out["policy_target"].shape[0] > 0:
+            boundary_mask = torch.zeros(out["bc_mask"].shape[0], dtype=torch.bool)
+            if boundary_mask.numel() > 1:
+                boundary_mask[:-1] = out["is_first"][1:] > 0
+            boundary_mask[-1] = True
+            out["policy_target"][boundary_mask] = 0
+            out["bc_mask"][boundary_mask] = 0
+        return out
 
 class PlayDataDataset(JointDataset):
     def __init__(self, directory, config, mode='train'):
@@ -248,9 +319,10 @@ def collate_episodes(batch):
 
 # --- Evaluation Functions ---
 
-def evaluate_offline(wm, policy, eval_loader, config, step):
+def evaluate_offline(wm, policy, eval_loader, config, step, bc_eval=True, prefix="eval"):
     wm.eval()
-    policy.eval()
+    if bc_eval:
+        policy.eval()
     metrics = defaultdict(list)
     
     with torch.no_grad():
@@ -268,33 +340,34 @@ def evaluate_offline(wm, policy, eval_loader, config, step):
             kl_loss, kl_value, _, _ = wm.dynamics.kl_loss(
                 post, prior, config.kl_free, config.dyn_scale, config.rep_scale
             )
-            metrics['eval/kl'].append(kl_value.mean().item())
+            metrics[f"{prefix}/kl"].append(kl_value.mean().item())
             
             for name, head in wm.heads.items():
                 pred = head(feat)
                 if isinstance(pred, dict):
                     for k, v in pred.items():
                         loss = -v.log_prob(data_wm[k])
-                        metrics[f'eval/{k}_loss'].append(loss.mean().item())
+                        metrics[f"{prefix}/{k}_loss"].append(loss.mean().item())
                 else:
                     loss = -pred.log_prob(data_wm[name])
-                    metrics[f'eval/{name}_loss'].append(loss.mean().item())
+                    metrics[f"{prefix}/{name}_loss"].append(loss.mean().item())
 
-            img_bc = torch.tensor(raw_batch['image_bc'], device=config.device, dtype=torch.float32) / 255.0
-            if config.image_standardize and 'image_mean' in data_wm:
-                 img_bc = (img_bc - data_wm['image_mean']) / data_wm['image_std']
-            
-            data_bc = data_wm.copy()
-            data_bc['image'] = img_bc
-            embed_bc = wm.encoder(data_bc)
-            post_bc, _ = wm.dynamics.observe(embed_bc, data_bc['action'], data_bc['is_first'])
-            feat_bc = wm.dynamics.get_feat(post_bc)
-            
-            # --- BC Loss (exact faithful loss when available, otherwise NLL) ---
-            target = torch.tensor(raw_batch['policy_target'], device=config.device, dtype=torch.float32)
-            pred_dist = policy(feat_bc, return_dist=True)
-            bc_loss = tools.regression_loss(pred_dist, target).mean()
-            metrics['eval/bc_loss'].append(bc_loss.item())
+            if bc_eval:
+                img_bc = raw_batch['image_bc'].to(config.device, dtype=torch.float32, non_blocking=True) / 255.0
+                if config.image_standardize and 'image_mean' in data_wm:
+                     img_bc = (img_bc - data_wm['image_mean']) / data_wm['image_std']
+                
+                data_bc = data_wm.copy()
+                data_bc['image'] = img_bc
+                embed_bc = wm.encoder(data_bc)
+                post_bc, _ = wm.dynamics.observe(embed_bc, data_bc['action'], data_bc['is_first'])
+                feat_bc = wm.dynamics.get_feat(post_bc)
+                
+                # --- BC Loss (exact faithful loss when available, otherwise NLL) ---
+                target = raw_batch['policy_target'].to(config.device, dtype=torch.float32, non_blocking=True)
+                pred_dist = policy(feat_bc, return_dist=True)
+                bc_loss = tools.regression_loss(pred_dist, target).mean()
+                metrics[f"{prefix}/bc_loss"].append(bc_loss.item())
 
     agg_metrics = {k: np.mean(v) for k, v in metrics.items()}
     return agg_metrics
@@ -627,75 +700,177 @@ def joint_train(config):
     else:
         print("Crops differ — running separate WM and BC encoder passes.")
 
-    optimizer = torch.optim.AdamW(
-        list(wm.parameters()) + list(policy.parameters()),
+    wm_optimizer = torch.optim.AdamW(
+        list(wm.parameters()),
+        lr=config.model_lr,
+        eps=config.opt_eps,
+        weight_decay=config.weight_decay,
+    )
+    policy_optimizer = torch.optim.AdamW(
+        list(policy.parameters()),
         lr=config.model_lr,
         eps=config.opt_eps,
         weight_decay=config.weight_decay,
     )
 
-    # --- SETUP EVAL ENVS ONCE ---
-    print(f"Initializing {config.num_envs} persistent Eval Envs...")
-    crop_h = config.image_crop_height
-    crop_w = config.image_crop_width
-    image_hw = (crop_h, crop_w) if (crop_h > 0 and crop_w > 0) else (84, 84)
+    def next_batch():
+        raw_batch = next(train_iter)
+        if play_iter is not None:
+            raw_play = next(play_iter)
+            raw_batch = concat_batches(raw_batch, raw_play)
+        return raw_batch
 
-    env_config = SimpleNamespace(
-        robosuite_task=getattr(config, "robosuite_task", "PickPlaceCan"),
-        robosuite_robots=getattr(config, "robosuite_robots", ["Panda"]),
-        robosuite_controller=getattr(config, "robosuite_controller", "OSC_POSE"),
-        robosuite_reward_shaping=getattr(config, "robosuite_reward_shaping", False),
-        robosuite_control_freq=getattr(config, "robosuite_control_freq", 20),
-        max_env_steps=getattr(config, "max_env_steps", 500),
-        ignore_done=getattr(config, "ignore_done", False),
-        has_renderer=getattr(config, "has_renderer", False),
-        has_offscreen_renderer=getattr(config, "has_offscreen_renderer", True),
-        use_camera_obs=getattr(config, "use_camera_obs", True),
-        camera_depths=getattr(config, "camera_depths", False),
-        camera_obs_keys=tuple(config.camera_obs_keys),
-        seed=config.seed,
-        render=getattr(config, "render", False)
-    )
-    if hasattr(config, "controller_configs"):
-        env_config.controller_configs = config.controller_configs
+    def save_ckpt(path, phase, global_step, joint_step):
+        torch.save(
+            {
+                'wm': wm.state_dict(),
+                'policy': policy.state_dict(),
+                'wm_optimizer': wm_optimizer.state_dict(),
+                'policy_optimizer': policy_optimizer.state_dict(),
+                'phase': phase,
+                'global_step': global_step,
+                'joint_step': joint_step,
+            },
+            path,
+        )
 
-    eval_envs = []
-    try:
-        # Create envs once
+    def init_eval_envs():
+        print(f"Initializing {config.num_envs} persistent Eval Envs...")
+        crop_h = config.image_crop_height
+        crop_w = config.image_crop_width
+        image_hw = (crop_h, crop_w) if (crop_h > 0 and crop_w > 0) else (84, 84)
+
+        env_config = SimpleNamespace(
+            robosuite_task=getattr(config, "robosuite_task", "PickPlaceCan"),
+            robosuite_robots=getattr(config, "robosuite_robots", ["Panda"]),
+            robosuite_controller=getattr(config, "robosuite_controller", "OSC_POSE"),
+            robosuite_reward_shaping=getattr(config, "robosuite_reward_shaping", False),
+            robosuite_control_freq=getattr(config, "robosuite_control_freq", 20),
+            max_env_steps=getattr(config, "max_env_steps", 500),
+            ignore_done=getattr(config, "ignore_done", False),
+            has_renderer=getattr(config, "has_renderer", False),
+            has_offscreen_renderer=getattr(config, "has_offscreen_renderer", True),
+            use_camera_obs=getattr(config, "use_camera_obs", True),
+            camera_depths=getattr(config, "camera_depths", False),
+            camera_obs_keys=tuple(config.camera_obs_keys),
+            seed=config.seed,
+            render=getattr(config, "render", False)
+        )
+        if hasattr(config, "controller_configs"):
+            env_config.controller_configs = config.controller_configs
+
+        envs = []
         for _ in range(config.num_envs):
-            # Create envs inside the worker process; avoid pickling live ctypes objects.
-            eval_envs.append(
+            envs.append(
                 Parallel(lambda cfg=env_config, hw=image_hw: EnvWorker(cfg, hw), "process")
             )
+        return envs
+
+    eval_envs = None
+    try:
+        global_step = 0
+        joint_step = 0
+
+        wm_pretrain_steps = int(getattr(config, "wm_pretrain_steps", 0))
+        if wm_pretrain_steps > 0:
+            print("Starting World Model Pretraining...")
+            for _ in range(wm_pretrain_steps):
+                wm.train()
+
+                raw_batch = next_batch()
+                data_wm = raw_batch.copy()
+                data_wm['image'] = data_wm.pop('image_wm')
+                data_wm = wm.preprocess(data_wm)
+
+                embed_wm = wm.encoder(data_wm)
+                post_wm, prior_wm = wm.dynamics.observe(embed_wm, data_wm['action'], data_wm['is_first'])
+
+                kl_loss, kl_val, dyn_loss, rep_loss = wm.dynamics.kl_loss(
+                    post_wm, prior_wm, config.kl_free, config.dyn_scale, config.rep_scale
+                )
+
+                feat_wm = wm.dynamics.get_feat(post_wm)
+                head_scales = {
+                    "reward": config.reward_head["loss_scale"],
+                    "cont": config.cont_head["loss_scale"],
+                }
+                recon_losses = 0
+                head_loss_means = {}
+                head_loss_scaled_means = {}
+                for name, head in wm.heads.items():
+                    scale = head_scales.get(name, 1.0)
+                    if scale == 0.0:
+                        continue
+                    pred = head(feat_wm)
+                    if isinstance(pred, dict):
+                        for k, v in pred.items():
+                            loss = -v.log_prob(data_wm[k])
+                            recon_losses += scale * loss
+                            head_loss_means[k] = loss.mean()
+                            head_loss_scaled_means[k] = (scale * loss).mean()
+                    else:
+                        loss = -pred.log_prob(data_wm[name])
+                        recon_losses += scale * loss
+                        head_loss_means[name] = loss.mean()
+                        head_loss_scaled_means[name] = (scale * loss).mean()
+
+                wm_loss = (recon_losses + kl_loss).mean()
+
+                wm_optimizer.zero_grad()
+                wm_loss.backward()
+                grad_norm = nn.utils.clip_grad_norm_(list(wm.parameters()), config.grad_clip)
+                wm_optimizer.step()
+
+                global_step += 1
+
+                if global_step % config.log_every == 0:
+                    log_data = {
+                        "wm_pretrain/train/total_loss": wm_loss.item(),
+                        "wm_pretrain/train/wm_loss": wm_loss.item(),
+                        "wm_pretrain/train/wm_recon_loss": recon_losses.mean().item(),
+                        "wm_pretrain/train/kl": kl_val.mean().item(),
+                        "wm_pretrain/train/dyn_loss": dyn_loss.mean().item(),
+                        "wm_pretrain/train/rep_loss": rep_loss.mean().item(),
+                        "wm_pretrain/train/grad_norm": float(grad_norm),
+                    }
+                    for name, value in head_loss_means.items():
+                        log_data[f"wm_pretrain/train/{name}_loss"] = value.item()
+                    for name, value in head_loss_scaled_means.items():
+                        log_data[f"wm_pretrain/train/{name}_loss_scaled"] = value.item()
+                    wandb.log(log_data, step=global_step)
+
+                if global_step % config.eval_every == 0:
+                    print(f"Evaluating at step {global_step}...")
+                    off_metrics = evaluate_offline(
+                        wm, policy, eval_loader, config, global_step, bc_eval=False, prefix="wm_pretrain/eval"
+                    )
+                    wandb.log(off_metrics, step=global_step)
+                    save_ckpt(logdir / "latest.pt", "wm_pretrain", global_step, joint_step)
+
+                if global_step % config.save_every == 0:
+                    save_ckpt(logdir / f"step_{global_step}.pt", "wm_pretrain", global_step, joint_step)
+
+            save_ckpt(logdir / "wm_pretrain_end.pt", "wm_pretrain", global_step, joint_step)
+            save_ckpt(logdir / "latest.pt", "wm_pretrain", global_step, joint_step)
 
         print("Starting Joint Pretraining...")
-        step = 0
-        
         for _ in range(int(config.steps)):
             wm.train()
             policy.train()
-            
-            raw_batch = next(train_iter)
-            if play_iter is not None:
-                raw_play = next(play_iter)
-                raw_batch = concat_batches(raw_batch, raw_play)
-            
-            # 1. WM Branch
+
+            raw_batch = next_batch()
+
             data_wm = raw_batch.copy()
             data_wm['image'] = data_wm.pop('image_wm')
             data_wm = wm.preprocess(data_wm)
-            
-            # 2. Forward World Model
+
             embed_wm = wm.encoder(data_wm)
             post_wm, prior_wm = wm.dynamics.observe(embed_wm, data_wm['action'], data_wm['is_first'])
 
-            # Calculate KL Loss
             kl_loss, kl_val, dyn_loss, rep_loss = wm.dynamics.kl_loss(
                 post_wm, prior_wm, config.kl_free, config.dyn_scale, config.rep_scale
             )
 
-            # Calculate Reconstruction Losses (with per-head loss_scale from config;
-            # matches the scaling dict that models.WorldModel._train uses).
             feat_wm = wm.dynamics.get_feat(post_wm)
             head_scales = {
                 "reward": config.reward_head["loss_scale"],
@@ -707,7 +882,7 @@ def joint_train(config):
             for name, head in wm.heads.items():
                 scale = head_scales.get(name, 1.0)
                 if scale == 0.0:
-                    continue  # skip forward pass entirely — head contributes no loss/grad
+                    continue
                 pred = head(feat_wm)
                 if isinstance(pred, dict):
                     for k, v in pred.items():
@@ -723,7 +898,6 @@ def joint_train(config):
 
             wm_loss = (recon_losses + kl_loss).mean()
 
-            # 3. BC Branch — reuse WM latents when crops are identical
             if crops_match:
                 feat_bc = feat_wm
             else:
@@ -735,10 +909,7 @@ def joint_train(config):
                 embed_bc = wm.encoder(data_bc)
                 post_bc, _ = wm.dynamics.observe(embed_bc, data_bc['action'], data_bc['is_first'])
                 feat_bc = wm.dynamics.get_feat(post_bc)
-            
-            # --- BC Loss (masked exact faithful loss when available; only joint data updates BC) ---
-            # raw_batch['policy_target'] / ['bc_mask'] are already pinned CPU tensors
-            # from the DataLoader — use .to() instead of re-wrapping with torch.tensor().
+
             target = raw_batch['policy_target'].to(config.device, dtype=torch.float32, non_blocking=True)
             if config.bc_sg_wm:
                 feat_bc = feat_bc.detach()
@@ -763,20 +934,22 @@ def joint_train(config):
                 else:
                     action_mse = torch.tensor(0.0, device=config.device)
                     action_mae = torch.tensor(0.0, device=config.device)
-            
-            # 5. Optimization
+
             total_loss = (config.wm_loss_scale * wm_loss) + (config.bc_loss_scale * bc_loss)
-            
-            optimizer.zero_grad()
+
+            wm_optimizer.zero_grad()
+            policy_optimizer.zero_grad()
             total_loss.backward()
             grad_norm = nn.utils.clip_grad_norm_(
                 list(wm.parameters()) + list(policy.parameters()), config.grad_clip
             )
-            optimizer.step()
-            
-            step += 1
-            
-            if step % config.log_every == 0:
+            wm_optimizer.step()
+            policy_optimizer.step()
+
+            global_step += 1
+            joint_step += 1
+
+            if global_step % config.log_every == 0:
                 log_data = {
                     "train/total_loss": total_loss.item(),
                     "train/wm_loss": wm_loss.item(),
@@ -796,37 +969,33 @@ def joint_train(config):
                     log_data[f"train/{name}_loss"] = value.item()
                 for name, value in head_loss_scaled_means.items():
                     log_data[f"train/{name}_loss_scaled"] = value.item()
-                wandb.log(log_data, step=step)
-                
-            if step % config.eval_every == 0:
-                print(f"Evaluating at step {step}...")
-                off_metrics = evaluate_offline(wm, policy, eval_loader, config, step)
-                wandb.log(off_metrics, step=step)
-                
-                # Pass reused envs here
-                on_metrics = evaluate_online(wm, policy, config, step, run, eval_envs)
-                wandb.log(on_metrics, step=step)
-                
-                torch.save({
-                    'wm': wm.state_dict(),
-                    'policy': policy.state_dict()
-                }, logdir / "latest.pt")
+                wandb.log(log_data, step=global_step)
 
-            if step % config.save_every == 0:
-                torch.save({
-                    'wm': wm.state_dict(),
-                    'policy': policy.state_dict(),
-                    'policy': policy.state_dict(),
-                    'optimizer': optimizer.state_dict()
-                }, logdir / f"step_{step}.pt")
+            if global_step % config.eval_every == 0:
+                print(f"Evaluating at step {global_step}...")
+                off_metrics = evaluate_offline(wm, policy, eval_loader, config, global_step)
+                wandb.log(off_metrics, step=global_step)
 
+                if eval_envs is None:
+                    eval_envs = init_eval_envs()
+                on_metrics = evaluate_online(wm, policy, config, global_step, run, eval_envs)
+                wandb.log(on_metrics, step=global_step)
+
+                save_ckpt(logdir / "latest.pt", "joint", global_step, joint_step)
+
+            if global_step % config.save_every == 0:
+                save_ckpt(logdir / f"step_{global_step}.pt", "joint", global_step, joint_step)
+
+        final_phase = "joint" if joint_step > 0 else "wm_pretrain"
+        save_ckpt(logdir / "latest.pt", final_phase, global_step, joint_step)
         print("Pretraining Finished.")
     
     finally:
         print("Closing Eval Envs...")
-        for env in eval_envs:
-            try: env.close()
-            except: pass
+        if eval_envs is not None:
+            for env in eval_envs:
+                try: env.close()
+                except: pass
 
 if __name__ == "__main__":
     # 1. Pre-parse to get the env_config name
@@ -884,6 +1053,7 @@ if __name__ == "__main__":
     defaults.setdefault('wm_loss_scale', 1.0)
     defaults.setdefault('batch_length', 64)
     defaults.setdefault('batch_size', 16)
+    defaults.setdefault('wm_pretrain_steps', 0)
     defaults.setdefault('save_every', 10000)
     defaults.setdefault('robosuite_task', 'Lift')
     defaults.setdefault('robosuite_robots', ['Panda'])

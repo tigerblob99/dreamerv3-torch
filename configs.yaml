@@ -517,22 +517,24 @@ joint_train:
       {layers: 2, loss_scale: 1.0, outscale: 1.0}
 
   # --- Training Loop ---
+  wm_pretrain_steps: 500000       # Optional WM-only warmup steps before joint WM+BC training
   steps: 150000             # Total training steps
   model_lr: 3e-4           # Learning rate for joint optimizer
   opt_eps: 1e-5             # Adam epsilon for joint optimizer
   weight_decay: 5e-2        # Weight decay for joint optimizer
-  dyn_scale: 0.24           # KL beta * delta = 0.3 * 0.8
-  rep_scale: 0.06           # KL beta * (1 - delta) = 0.3 * 0.2
+  dyn_scale: 0.5 #0.24           # KL beta * delta = 0.3 * 0.8
+  rep_scale: 0.1 #0.06           # KL beta * (1 - delta) = 0.3 * 0.2
 
   batch_size: 64            # Batch size
   batch_length: 64          # Sequence length
-  eval_dataset_size: 10000  # Cap eval transitions loaded into RAM
+  eval_dataset_size: 50000  # Cap eval transitions loaded into RAM
   expert_data_fraction: 0.25  # Fraction of expert data in each batch (e.g., 0.67 for 2/3 expert, 1/3 play)
+  dreamer_like_sequence_sampling: True  # When True, appended chunks start at episode index 0 like Dreamer replay windows.
   grad_clip: 100.0          # Gradient clipping norm
   log_every: 100          # Logging frequency (steps)
   save_every: 10000
-  run_name: "square_baseline_actr_12_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG)"  # Name for this training run (used in logging and checkpointing)
-  logdir: logdir/square_baseline_actr_12_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG)  # Base logging directory for this run
+  run_name: "square_baseline_actr_14_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG,pretraining)"  # Name for this training run (used in logging and checkpointing)
+  logdir: logdir/square_baseline_actr_14_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG,pretraining)  # Base logging directory for this run
   offline_traindir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1_train'
   offline_evaldir: 'logdir/robosuite_square_reset_every_5e4_run2 (larger latent)/eval_eps'
   offline_playdir: 'logdir/robosuite_square_reset_every_5e4_run2 (larger latent)/train_eps' #['datasets/robomimic_data_MV/Square_MH_Shaped_shifted_0-1','datasets/robomimic_data_MV/lift_MH_train']
@@ -657,8 +659,8 @@ rl_finetune:
   dyn_stoch: 32
   dyn_discrete: 32
   # file paths
-  logdir: logdir/rl_finetune_deter_latents_square_pretrained_wm_33_(square_baseline_actr_12_10k) #(wrap around dataset_less_pretrained_WM)  # Logging directory for RL fine-tuning runs
-  checkpoint: 'logdir/square_baseline_actr_12_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG)/step_10000.pt'  # Path to pre-trained Dreamer/joint checkpoint
+  logdir: logdir/rl_finetune_deter_latents_square_pretrained_wm_35_(square_baseline_actr_12_10k, reset std head,80k) #(wrap around dataset_less_pretrained_WM)  # Logging directory for RL fine-tuning runs
+  checkpoint: 'logdir/square_baseline_actr_12_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG)/step_80000.pt'  # Path to pre-trained Dreamer/joint checkpoint
   dreamer_wm_checkpoint: '' #'logdir/robosuite_can_reset_every_10k_run2/latest.pt'  # Optional Dreamer checkpoint for WM override; when set, WM loads from here.
   expert_dir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1'
 
@@ -712,9 +714,11 @@ rl_finetune:
   policy_init: checkpoint   # checkpoint: load actor+WM, random: load WM only
   policy_units: 1024
   actor:
-    {layers: 4, dist: 'normal', entropy: 5e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 2e-4, eps: 1e-5, grad_clip: 100.0, outscale: 1.0, bc_kl_scale: 0.01}
+    {layers: 4, dist: 'normal', entropy: 1e-3, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 2e-4, eps: 1e-5, grad_clip: 100.0, outscale: 1.0, bc_kl_scale: 0.01}
   critic:
     {layers: 4, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-4, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+  reinit_actor_std_head: True                                                                                                                                                                                                                                                                   
+  reinit_actor_std_value: 0.22
   discount: 0.95
   discount_lambda: 0.95
   imag_gradient: 'dynamics'
@@ -778,14 +782,14 @@ dreamer_finetune:
   bc_kl_scale: 0.0  # KL(actor || frozen_BC) penalty; 0.0 disables entirely
 
   # Paths
-  logdir: logdir/dreamer_finetune/run1
-  checkpoint: 'logdir/square_baseline_actr_11_(DiWA params, LARGE play dataset,smaller lr,cont and reward)/latest.pt'
+  logdir: logdir/dreamer_finetune/run2-new cont and reward heads
+  checkpoint: 'logdir/square_baseline_actr_12_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG)/step_90000.pt'
   offline_traindir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1'
   freeze_wm: True  # False to allow joint WM+actor updates
 
   # Training
   steps: 100000
-  batch_size: 64
+  batch_size: 50
   batch_length: 64
   num_workers: 0
 

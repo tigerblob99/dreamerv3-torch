@@ -178,6 +178,60 @@ def _load_pretrained(world_model, actor, checkpoint_path, device):
     _load_actor_only(actor, checkpoint_path, device)
 
 
+def _inverse_std_transform(target_sigma, dist, min_std, max_std):
+    """Invert the dist-specific std transformation in networks.MLP.dist() to
+    solve for the raw std_layer output that yields σ = target_sigma.
+
+    Source formulas (networks.py:712-775):
+        normal / faithful_normal: σ = (max-min) * sigmoid(raw + 2.0) + min
+        tanh_normal:              σ = softplus(raw) + min
+        trunc_normal:             σ = 2 * sigmoid(raw / 2) + min
+    """
+    import math
+    s = float(target_sigma)
+    if dist in ("normal", "faithful_normal"):
+        hi = float(max_std)
+        lo = float(min_std)
+        if not (lo < s < hi):
+            raise ValueError(
+                f"reinit_actor_std_value={s} must satisfy min_std({lo}) < σ < max_std({hi})"
+            )
+        t = (s - lo) / (hi - lo)
+        return math.log(t / (1.0 - t)) - 2.0
+    if dist == "tanh_normal":
+        lo = float(min_std)
+        if s <= lo:
+            raise ValueError(f"reinit_actor_std_value={s} must be > min_std({lo})")
+        return math.log(math.expm1(s - lo))  # inv softplus
+    if dist == "trunc_normal":
+        lo = float(min_std)
+        if not (lo < s < lo + 2.0):
+            raise ValueError(f"reinit_actor_std_value={s} must satisfy {lo} < σ < {lo + 2.0}")
+        t = (s - lo) / 2.0
+        return 2.0 * math.log(t / (1.0 - t))
+    raise ValueError(f"Unsupported actor dist for std reinit: {dist!r}")
+
+
+def _reinit_actor_std_head(actor, target_sigma, dist, min_std, max_std):
+    """Zero the actor's std_layer weights and set bias so σ ≈ target across all states.
+
+    Operates on actor.actionMLP._mlp.std_layer (created only when std=='learned',
+    see networks.py:677). State-independent at init; gradients restore state-
+    dependence during RL training.
+    """
+    inner = actor.actionMLP._mlp
+    if not hasattr(inner, "std_layer"):
+        raise AttributeError(
+            "Cannot reinit std_layer: actor was built without a learnable std "
+            "(std != 'learned' in config.actor)."
+        )
+    raw = _inverse_std_transform(target_sigma, dist, min_std, max_std)
+    with torch.no_grad():
+        inner.std_layer.weight.data.zero_()
+        inner.std_layer.bias.data.fill_(raw)
+    return raw
+
+
 def _init_eval_envs(config):
     eval_every = int(getattr(config, "rl_eval_every", getattr(config, "eval_every", 0)))
     eval_episodes = int(getattr(config, "eval_episodes", getattr(config, "eval_episode_num", 0)))
@@ -866,6 +920,20 @@ def rl_finetune(config):
             "policy_init must be 'checkpoint' or 'random' for RL_finetune."
         )
 
+    if bool(getattr(config, "reinit_actor_std_head", False)):
+        target_sigma = float(getattr(config, "reinit_actor_std_value", 0.5))
+        raw = _reinit_actor_std_head(
+            actor,
+            target_sigma=target_sigma,
+            dist=config.actor["dist"],
+            min_std=float(config.actor["min_std"]),
+            max_std=float(config.actor["max_std"]),
+        )
+        print(
+            f"Reinit'd actor.actionMLP._mlp.std_layer -> target sigma={target_sigma:.3f} "
+            f"(raw bias={raw:.3f}); weights zeroed, state-independent at init."
+        )
+
     dreamer_wm_checkpoint = str(getattr(config, "dreamer_wm_checkpoint", "")).strip()
     if dreamer_wm_checkpoint:
         _load_world_model_only(
@@ -881,6 +949,20 @@ def rl_finetune(config):
     
     frozen_BC = Actor(config, feat_size, config.num_actions).to(config.device)
     _load_actor_only(frozen_BC, ckpt_path, config.device)
+
+    if bool(getattr(config, "reinit_actor_std_head", False)):
+        target_sigma = float(getattr(config, "reinit_actor_std_value", 0.5))
+        _reinit_actor_std_head(
+            frozen_BC,
+            target_sigma=target_sigma,
+            dist=config.actor["dist"],
+            min_std=float(config.actor["min_std"]),
+            max_std=float(config.actor["max_std"]),
+        )
+        print(
+            f"Reinit'd frozen_BC std_layer -> target sigma={target_sigma:.3f} "
+            "(matches actor; prevents bc_kl from collapsing actor sigma)."
+        )
 
     frozen_BC.eval()
     frozen_BC.requires_grad_(False)
