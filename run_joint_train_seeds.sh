@@ -10,8 +10,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --array=0-4
 #SBATCH --mem=85G
-#SBATCH --output=logdir/joint_train_seeds/joint_train_seeds-%A_%a.out
-#SBATCH --error=logdir/joint_train_seeds/joint_train_seeds-%A_%a.err
+#SBATCH --output=logdir/joint_train_seeds/slurm/array_%a/%x-%A.out
+#SBATCH --error=logdir/joint_train_seeds/slurm/array_%a/%x-%A.err
 #SBATCH --mail-type=BEGIN,END
 #SBATCH --mail-user=sedm7084@ox.ac.uk
 
@@ -20,22 +20,28 @@ set -euo pipefail
 # ────────────────────────────────────────────────────────────────
 # Data dirs (edit here to change dataset for all seeds)
 # ────────────────────────────────────────────────────────────────
-OFFLINE_TRAINDIR="${OFFLINE_TRAINDIR:-datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1_train}"
-OFFLINE_EVALDIR="${OFFLINE_EVALDIR:-logdir/robosuite_square_reset_every_5e4_run2 (larger latent)/eval_eps}"
-OFFLINE_PLAYDIR="${OFFLINE_PLAYDIR:-logdir/robosuite_square_reset_every_5e4_run2 (larger latent)/train_eps}"
+OFFLINE_TRAINDIR="${OFFLINE_TRAINDIR:-datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1}"
+OFFLINE_EVALDIR="${OFFLINE_EVALDIR:-datasets/robomimic_data_MV/can_MH_train}"
+OFFLINE_PLAYDIR="${OFFLINE_PLAYDIR:-}"
 
 # ────────────────────────────────────────────────────────────────
 # Seeds for the sweep (one per array index)
 # ────────────────────────────────────────────────────────────────
-SEEDS=(0 1 2 3 4)
+SEEDS=(0 3 5 7 9)
+
+# ────────────────────────────────────────────────────────────────
+# Sweep identity — downstream finetune scripts should reuse SWEEP_NAME
+# and resolve checkpoints as: logdir/${SWEEP_NAME}/seed_${SEED}/latest.pt
+# ────────────────────────────────────────────────────────────────
+SWEEP_NAME="${SWEEP_NAME:-joint_train_seeds}"
 
 # ────────────────────────────────────────────────────────────────
 # Runtime / environment
 # ────────────────────────────────────────────────────────────────
 SIF="${CONTAINER:-containerv5.sif}"
 SCRIPT_DIR="${SLURM_SUBMIT_DIR:-.}"
-BASE_LOGDIR="${BASE_LOGDIR:-logdir/joint_train_seeds}"
-ENV_CONFIG="${ENV_CONFIG:-square_env_eval}"
+BASE_LOGDIR="${BASE_LOGDIR:-logdir/${SWEEP_NAME}}"
+ENV_CONFIG="${ENV_CONFIG:-can_env_eval}"
 WANDB_ENV_FILE="${WANDB_ENV_FILE:-$HOME/.secrets/wandb.env}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
@@ -43,6 +49,9 @@ if [[ -f "$WANDB_ENV_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$WANDB_ENV_FILE"
 fi
+
+# Override wandb project for this sweep (after sourcing the env file, so it wins).
+export WANDB_PROJECT="${WANDB_PROJECT_OVERRIDE:-dreamerv3-joint-train-seeds}"
 
 WANDB_MODE="${WANDB_MODE:-online}"
 if [[ "${WANDB_MODE,,}" == "online" && -z "${WANDB_API_KEY:-}" ]]; then
@@ -57,7 +66,7 @@ for env_name in WANDB_API_KEY WANDB_PROJECT WANDB_ENTITY WANDB_MODE; do
     fi
 done
 
-mkdir -p "$BASE_LOGDIR"
+mkdir -p "$BASE_LOGDIR" "$BASE_LOGDIR/slurm"
 
 # ────────────────────────────────────────────────────────────────
 # Pick seed for this array task (fall back to running all if not in an array)
@@ -103,11 +112,33 @@ echo "=== Base logdir: $BASE_LOGDIR ==="
 echo "=== Env config: ${ENV_CONFIG:-<none>} ==="
 echo "=== Train dir: $OFFLINE_TRAINDIR ==="
 echo "=== Eval  dir: $OFFLINE_EVALDIR ==="
-echo "=== Play  dir: $OFFLINE_PLAYDIR ==="
+echo "=== Play  dir: ${OFFLINE_PLAYDIR:-<none — expert-only mode>} ==="
+echo "=== WANDB project: $WANDB_PROJECT ==="
+
+sanitize_path_tag() {
+    # Lowercase alnum / dash / underscore only; collapse runs; trim edges.
+    local s="$1"
+    s="${s// /_}"
+    s="$(printf '%s' "$s" | tr -c 'A-Za-z0-9._-' '_' | tr -s '_' | sed 's/^_//;s/_$//')"
+    printf '%s' "$s"
+}
+
+if [[ -n "$OFFLINE_PLAYDIR" ]]; then
+    # Last two path components of the play dir, e.g.
+    #   logdir/robosuite_square_reset_every_5e4_run2 (larger latent)/train_eps
+    # becomes: robosuite_square_reset_every_5e4_run2_larger_latent__train_eps
+    PLAY_TRIMMED="${OFFLINE_PLAYDIR%/}"
+    PLAY_PARENT="$(sanitize_path_tag "$(basename "$(dirname "$PLAY_TRIMMED")")")"
+    PLAY_LEAF="$(sanitize_path_tag "$(basename "$PLAY_TRIMMED")")"
+    DATA_TAG="expert_play-${PLAY_PARENT}__${PLAY_LEAF}"
+else
+    DATA_TAG="expert_only"
+fi
 
 for SEED in "${SEED_LIST[@]}"; do
-    RUN_NAME="seed_${SEED}"
+    RUN_NAME="seed_${SEED}_${DATA_TAG}"
     LOGDIR="${BASE_LOGDIR}/${RUN_NAME}"
+    CKPT_PATH="${LOGDIR}/latest.pt"
 
     CMD=(
         "${RUNNER[@]}"
@@ -117,8 +148,13 @@ for SEED in "${SEED_LIST[@]}"; do
         --seed "$SEED"
         --offline_traindir "$OFFLINE_TRAINDIR"
         --offline_evaldir "$OFFLINE_EVALDIR"
-        --offline_playdir "$OFFLINE_PLAYDIR"
     )
+
+    if [[ -n "$OFFLINE_PLAYDIR" ]]; then
+        CMD+=(--offline_playdir "$OFFLINE_PLAYDIR")
+    else
+        CMD+=(--expert_data_fraction 1.0)
+    fi
 
     if [[ -n "$ENV_CONFIG" ]]; then
         CMD+=(--env_config "$ENV_CONFIG")
@@ -129,9 +165,11 @@ for SEED in "${SEED_LIST[@]}"; do
 
     echo ""
     echo "────────────────────────────────────────"
+    echo "  Sweep:  $SWEEP_NAME"
     echo "  Run:    $RUN_NAME"
     echo "  Seed:   $SEED"
     echo "  Logdir: $LOGDIR"
+    echo "  Ckpt:   $CKPT_PATH  (expected after training)"
     echo "────────────────────────────────────────"
 
     "${CMD[@]}"
