@@ -662,7 +662,7 @@ rl_finetune:
   logdir: logdir/rl_finetune_deter_latents_square_pretrained_wm_35_(square_baseline_actr_12_10k, reset std head,80k) #(wrap around dataset_less_pretrained_WM)  # Logging directory for RL fine-tuning runs
   checkpoint: 'logdir/square_baseline_actr_12_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG)/step_80000.pt'  # Path to pre-trained Dreamer/joint checkpoint
   dreamer_wm_checkpoint: '' #'logdir/robosuite_can_reset_every_10k_run2/latest.pt'  # Optional Dreamer checkpoint for WM override; when set, WM loads from here.
-  expert_dir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1'
+  expert_dir: 'datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1'
 
   encoder: *robomimic_encoder
   decoder: *robomimic_decoder
@@ -682,14 +682,14 @@ rl_finetune:
   gail_use_transitions: True
 
   # Environment / eval env construction
-  robosuite_task: 'NutAssemblySquare'
+  robosuite_task: 'PickPlaceCan'
   robosuite_reward_shaping: True
   robosuite_reward_scale: 1.0
   robosuite_reward_shift: -1.0
   size: [84, 84]
   max_env_steps: 400
   clip_actions: True
-  num_envs: 8
+  num_envs: 6
 
   # Observation keys (must match encoder)
   camera_obs_keys: [agentview_image, robot0_eye_in_hand_image]
@@ -710,7 +710,7 @@ rl_finetune:
 
   # Training
   ac_batch_size: 900
-  batch_length: 17
+  batch_length: 14
   policy_init: checkpoint   # checkpoint: load actor+WM, random: load WM only
   policy_units: 1024
   actor:
@@ -722,7 +722,7 @@ rl_finetune:
   discount: 0.95
   discount_lambda: 0.95
   imag_gradient: 'dynamics'
-  imag_horizon: 17
+  imag_horizon: 14
   reward_EMA: True
   num_workers: 0
 
@@ -738,16 +738,16 @@ rl_finetune:
   foc_gamma: -1.0              # Discount for FOC Q-surrogate (-1.0 = use config.discount)
 
   # DITTO reward verification (state-aligned real-env rollouts)
-  ditto_verify: False
-  ditto_verify_hdf5_path: 'datasets/imageSquarePH_shaped.hdf5'
-  ditto_verify_evaldir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1'
+  ditto_verify: True
+  ditto_verify_hdf5_path: 'datasets/imagecanPH_shaped.hdf5'
+  ditto_verify_evaldir: 'datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1'
   ditto_verify_warmup_len: 5
   ditto_verify_horizon: 93
   ditto_verify_batches: 1
 
   # Logging
-  video_pred_log: False
-  log_action_mse: False
+  video_pred_log: True
+  log_action_mse: True
 
 dreamer_finetune:
   units: 512

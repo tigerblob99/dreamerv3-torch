@@ -3,6 +3,7 @@ run*
 !run_dreamer_sweep.sh
 !run_joint_train_sweep.sh
 !run_joint_train_seeds.sh
+!run_rl_finetune_seeds.sh
 logdir*
 vis_*
 result*
