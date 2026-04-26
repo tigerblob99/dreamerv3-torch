@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import os
 import pathlib
 import sys
@@ -588,14 +589,51 @@ def joint_train(config):
 
     logdir = pathlib.Path(config.logdir).expanduser()
     logdir.mkdir(parents=True, exist_ok=True)
-    
-    run = wandb.init(
+
+    resume = bool(getattr(config, 'resume', False))
+    resume_state = None
+    wandb_resume_id = None
+    if resume:
+        resume_path = logdir / 'latest.pt'
+        if not resume_path.exists():
+            raise FileNotFoundError(f"--resume set but {resume_path} not found")
+        resume_state = torch.load(resume_path, map_location=config.device)
+        print(
+            f"Resuming from {resume_path}: "
+            f"phase={resume_state.get('phase')} "
+            f"global_step={resume_state.get('global_step')} "
+            f"joint_step={resume_state.get('joint_step')}"
+        )
+        latest_run = logdir / 'wandb' / 'latest-run'
+        if latest_run.is_symlink() or latest_run.exists():
+            try:
+                target = (
+                    os.readlink(str(latest_run))
+                    if latest_run.is_symlink()
+                    else str(latest_run.resolve())
+                )
+                base = os.path.basename(target.rstrip('/'))
+                if base.startswith('run-'):
+                    wandb_resume_id = base.rsplit('-', 1)[-1]
+                    print(f"Resuming wandb run id={wandb_resume_id}")
+                else:
+                    print(f"Warning: unrecognized wandb latest-run target '{target}'; starting fresh wandb run")
+            except OSError as e:
+                print(f"Warning: could not resolve wandb latest-run ({e}); starting fresh wandb run")
+        else:
+            print(f"Warning: no wandb/latest-run in {logdir}; starting fresh wandb run")
+
+    wandb_init_kwargs = dict(
         project=os.getenv("WANDB_PROJECT", "Dreamer_Joint"),
         entity=os.getenv("WANDB_ENTITY"),
         config=vars(config),
         dir=str(logdir),
-        name=config.run_name if hasattr(config, 'run_name') else None
+        name=config.run_name if hasattr(config, 'run_name') else None,
     )
+    if wandb_resume_id is not None:
+        wandb_init_kwargs['id'] = wandb_resume_id
+        wandb_init_kwargs['resume'] = 'allow'
+    run = wandb.init(**wandb_init_kwargs)
     print(f"Logging to {logdir}")
 
     # --- Setup Datasets & Dataloaders ---
@@ -686,6 +724,41 @@ def joint_train(config):
     print(f"World Model Params: {sum(p.numel() for p in wm.parameters()):,}")
     print(f"-----------------------")
 
+    wm_init_ckpt = getattr(config, "wm_init_ckpt", "") or ""
+    if resume and wm_init_ckpt:
+        print(f"Resume: skipping wm_init_ckpt reload ({wm_init_ckpt}); weights come from latest.pt")
+        wm_init_ckpt = ""
+    if wm_init_ckpt:
+        print(f"Loading pretrained WM from {wm_init_ckpt}")
+        ckpt = torch.load(wm_init_ckpt, map_location=config.device)
+        if isinstance(ckpt, dict) and "wm" in ckpt:
+            # joint_train.py / offline_train.py checkpoint format.
+            wm_state = ckpt["wm"]
+        elif isinstance(ckpt, dict) and "agent_state_dict" in ckpt:
+            # dreamer.py checkpoint: full Dreamer agent; WM lives under `_wm.`,
+            # with an extra `_orig_mod.` level when the agent was torch.compiled.
+            agent_state = ckpt["agent_state_dict"]
+            wm_state = {}
+            for k, v in agent_state.items():
+                if not k.startswith("_wm."):
+                    continue
+                sub = k[len("_wm."):]
+                if sub.startswith("_orig_mod."):
+                    sub = sub[len("_orig_mod."):]
+                wm_state[sub] = v
+        else:
+            wm_state = ckpt
+        wm.load_state_dict(wm_state, strict=True)
+        if getattr(config, "wm_init_load_policy", False) and isinstance(ckpt, dict) and "policy" in ckpt:
+            policy.load_state_dict(ckpt["policy"], strict=False)
+            print("Also loaded policy weights from checkpoint.")
+
+    freeze_wm = bool(getattr(config, "freeze_wm", False))
+    if freeze_wm:
+        for p in wm.parameters():
+            p.requires_grad_(False)
+        print("freeze_wm=True: WM parameters frozen (no grads, no optimizer step, no weight-decay drift).")
+
     # When wm and bc cropping produce identical images (cropping disabled, or
     # both branches use center crop), the BC-branch encoder + RSSM pass is a
     # pure duplicate of the WM pass. Detect that case once and reuse feat_wm
@@ -712,6 +785,13 @@ def joint_train(config):
         eps=config.opt_eps,
         weight_decay=config.weight_decay,
     )
+
+    if resume:
+        wm.load_state_dict(resume_state['wm'], strict=True)
+        policy.load_state_dict(resume_state['policy'], strict=True)
+        wm_optimizer.load_state_dict(resume_state['wm_optimizer'])
+        policy_optimizer.load_state_dict(resume_state['policy_optimizer'])
+        print("Resume: loaded wm/policy/wm_optimizer/policy_optimizer state from latest.pt")
 
     def next_batch():
         raw_batch = next(train_iter)
@@ -770,11 +850,23 @@ def joint_train(config):
     try:
         global_step = 0
         joint_step = 0
+        resumed_phase = None
+        if resume:
+            global_step = int(resume_state.get('global_step', 0))
+            joint_step = int(resume_state.get('joint_step', 0))
+            resumed_phase = resume_state.get('phase')
 
         wm_pretrain_steps = int(getattr(config, "wm_pretrain_steps", 0))
-        if wm_pretrain_steps > 0:
-            print("Starting World Model Pretraining...")
-            for _ in range(wm_pretrain_steps):
+        if freeze_wm and wm_pretrain_steps > 0:
+            print(f"freeze_wm=True: skipping {wm_pretrain_steps} WM pretrain steps.")
+            wm_pretrain_steps = 0
+        if resume and resumed_phase == 'joint':
+            wm_pretrain_remaining = 0
+        else:
+            wm_pretrain_remaining = max(0, wm_pretrain_steps - global_step)
+        if wm_pretrain_remaining > 0:
+            print(f"Starting World Model Pretraining ({wm_pretrain_remaining} steps remaining)...")
+            for _ in range(wm_pretrain_remaining):
                 wm.train()
 
                 raw_batch = next_batch()
@@ -853,9 +945,13 @@ def joint_train(config):
             save_ckpt(logdir / "wm_pretrain_end.pt", "wm_pretrain", global_step, joint_step)
             save_ckpt(logdir / "latest.pt", "wm_pretrain", global_step, joint_step)
 
-        print("Starting Joint Pretraining...")
-        for _ in range(int(config.steps)):
-            wm.train()
+        joint_remaining = max(0, int(config.steps) - joint_step)
+        print(f"Starting Joint Pretraining ({joint_remaining} steps remaining)...")
+        for _ in range(joint_remaining):
+            if freeze_wm:
+                wm.eval()
+            else:
+                wm.train()
             policy.train()
 
             raw_batch = next_batch()
@@ -864,39 +960,52 @@ def joint_train(config):
             data_wm['image'] = data_wm.pop('image_wm')
             data_wm = wm.preprocess(data_wm)
 
-            embed_wm = wm.encoder(data_wm)
-            post_wm, prior_wm = wm.dynamics.observe(embed_wm, data_wm['action'], data_wm['is_first'])
+            wm_ctx = torch.no_grad() if freeze_wm else contextlib.nullcontext()
+            with wm_ctx:
+                embed_wm = wm.encoder(data_wm)
+                post_wm, prior_wm = wm.dynamics.observe(embed_wm, data_wm['action'], data_wm['is_first'])
+                feat_wm = wm.dynamics.get_feat(post_wm)
 
-            kl_loss, kl_val, dyn_loss, rep_loss = wm.dynamics.kl_loss(
-                post_wm, prior_wm, config.kl_free, config.dyn_scale, config.rep_scale
-            )
+            if freeze_wm:
+                zero = torch.zeros((), device=config.device)
+                kl_loss = zero
+                kl_val = zero.unsqueeze(0)
+                dyn_loss = zero.unsqueeze(0)
+                rep_loss = zero.unsqueeze(0)
+                recon_losses = zero.unsqueeze(0)
+                head_loss_means = {}
+                head_loss_scaled_means = {}
+                wm_loss = zero
+            else:
+                kl_loss, kl_val, dyn_loss, rep_loss = wm.dynamics.kl_loss(
+                    post_wm, prior_wm, config.kl_free, config.dyn_scale, config.rep_scale
+                )
 
-            feat_wm = wm.dynamics.get_feat(post_wm)
-            head_scales = {
-                "reward": config.reward_head["loss_scale"],
-                "cont": config.cont_head["loss_scale"],
-            }
-            recon_losses = 0
-            head_loss_means = {}
-            head_loss_scaled_means = {}
-            for name, head in wm.heads.items():
-                scale = head_scales.get(name, 1.0)
-                if scale == 0.0:
-                    continue
-                pred = head(feat_wm)
-                if isinstance(pred, dict):
-                    for k, v in pred.items():
-                        loss = -v.log_prob(data_wm[k])
+                head_scales = {
+                    "reward": config.reward_head["loss_scale"],
+                    "cont": config.cont_head["loss_scale"],
+                }
+                recon_losses = 0
+                head_loss_means = {}
+                head_loss_scaled_means = {}
+                for name, head in wm.heads.items():
+                    scale = head_scales.get(name, 1.0)
+                    if scale == 0.0:
+                        continue
+                    pred = head(feat_wm)
+                    if isinstance(pred, dict):
+                        for k, v in pred.items():
+                            loss = -v.log_prob(data_wm[k])
+                            recon_losses += scale * loss
+                            head_loss_means[k] = loss.mean()
+                            head_loss_scaled_means[k] = (scale * loss).mean()
+                    else:
+                        loss = -pred.log_prob(data_wm[name])
                         recon_losses += scale * loss
-                        head_loss_means[k] = loss.mean()
-                        head_loss_scaled_means[k] = (scale * loss).mean()
-                else:
-                    loss = -pred.log_prob(data_wm[name])
-                    recon_losses += scale * loss
-                    head_loss_means[name] = loss.mean()
-                    head_loss_scaled_means[name] = (scale * loss).mean()
+                        head_loss_means[name] = loss.mean()
+                        head_loss_scaled_means[name] = (scale * loss).mean()
 
-            wm_loss = (recon_losses + kl_loss).mean()
+                wm_loss = (recon_losses + kl_loss).mean()
 
             if crops_match:
                 feat_bc = feat_wm
@@ -906,12 +1015,13 @@ def joint_train(config):
                      img_bc = (img_bc - data_wm['image_mean']) / data_wm['image_std']
                 data_bc = data_wm.copy()
                 data_bc['image'] = img_bc
-                embed_bc = wm.encoder(data_bc)
-                post_bc, _ = wm.dynamics.observe(embed_bc, data_bc['action'], data_bc['is_first'])
-                feat_bc = wm.dynamics.get_feat(post_bc)
+                with wm_ctx:
+                    embed_bc = wm.encoder(data_bc)
+                    post_bc, _ = wm.dynamics.observe(embed_bc, data_bc['action'], data_bc['is_first'])
+                    feat_bc = wm.dynamics.get_feat(post_bc)
 
             target = raw_batch['policy_target'].to(config.device, dtype=torch.float32, non_blocking=True)
-            if config.bc_sg_wm:
+            if config.bc_sg_wm or freeze_wm:
                 feat_bc = feat_bc.detach()
             pred_dist = policy(feat_bc, return_dist=True)
             per_step_bc_loss = tools.regression_loss(pred_dist, target)
@@ -935,15 +1045,25 @@ def joint_train(config):
                     action_mse = torch.tensor(0.0, device=config.device)
                     action_mae = torch.tensor(0.0, device=config.device)
 
-            total_loss = (config.wm_loss_scale * wm_loss) + (config.bc_loss_scale * bc_loss)
+            if freeze_wm:
+                total_loss = config.bc_loss_scale * bc_loss
+            else:
+                total_loss = (config.wm_loss_scale * wm_loss) + (config.bc_loss_scale * bc_loss)
 
-            wm_optimizer.zero_grad()
+            if not freeze_wm:
+                wm_optimizer.zero_grad()
             policy_optimizer.zero_grad()
             total_loss.backward()
-            grad_norm = nn.utils.clip_grad_norm_(
-                list(wm.parameters()) + list(policy.parameters()), config.grad_clip
-            )
-            wm_optimizer.step()
+            if freeze_wm:
+                grad_norm = nn.utils.clip_grad_norm_(
+                    list(policy.parameters()), config.grad_clip
+                )
+            else:
+                grad_norm = nn.utils.clip_grad_norm_(
+                    list(wm.parameters()) + list(policy.parameters()), config.grad_clip
+                )
+            if not freeze_wm:
+                wm_optimizer.step()
             policy_optimizer.step()
 
             global_step += 1
@@ -1055,6 +1175,7 @@ if __name__ == "__main__":
     defaults.setdefault('batch_size', 16)
     defaults.setdefault('wm_pretrain_steps', 0)
     defaults.setdefault('save_every', 10000)
+    defaults.setdefault('resume', False)
     defaults.setdefault('robosuite_task', 'Lift')
     defaults.setdefault('robosuite_robots', ['Panda'])
     defaults.setdefault('robosuite_controller', 'OSC_POSE')
