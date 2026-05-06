@@ -78,6 +78,9 @@ defaults:
   opt_eps: 1e-8
   grad_clip: 1000
   dataset_size: 300000
+  wm_init_ckpt: ''
+  wm_init_load_policy: false
+  freeze_wm: false
   dataset_backend: 'cpu'
   dataset_gpu_fallback: 'hybrid'
   dataset_episode_sampling: 'shorter'  # 'shorter' (inverse-transition) or 'uniform'
@@ -497,10 +500,11 @@ square_env_eval:
 
 joint_train:
   # World Model
-  dyn_hidden: 1024
-  dyn_deter: 1024
+  dyn_hidden: 512
+  dyn_deter: 512 
   dyn_stoch: 32
   dyn_discrete: 32
+  units: 1024
   # --- actor model definition ---
   encoder: *robomimic_encoder
   decoder: *robomimic_decoder
@@ -517,8 +521,9 @@ joint_train:
       {layers: 2, loss_scale: 1.0, outscale: 1.0}
 
   # --- Training Loop ---
-  wm_pretrain_steps: 20000       # Optional WM-only warmup steps before joint WM+BC training
-  steps: 150000             # Total training steps
+  precision: 32
+  wm_pretrain_steps: 0       # Optional WM-only warmup steps before joint WM+BC training
+  steps: 60000             # Total training steps
   model_lr: 5e-4           # Learning rate for joint optimizer
   opt_eps: 1e-5             # Adam epsilon for joint optimizer
   weight_decay: 5e-2        # Weight decay for joint optimizer
@@ -528,17 +533,24 @@ joint_train:
   batch_size: 64            # Batch size
   batch_length: 64          # Sequence length
   eval_dataset_size: 50000  # Cap eval transitions loaded into RAM
+  dataset_size: 600000         # Cap total transitions loaded into RAM for training (per epoch)
   expert_data_fraction: 1.0  # Fraction of expert data in each batch (e.g., 0.67 for 2/3 expert, 1/3 play)
-  dreamer_like_sequence_sampling: True  # When True, appended chunks start at episode index 0 like Dreamer replay windows.
+  dreamer_like_sequence_sampling: False  # When True, appended chunks start at episode index 0 like Dreamer replay windows.
   grad_clip: 100.0          # Gradient clipping norm
-  log_every: 100          # Logging frequency (steps)
-  save_every: 10000
-  run_name: "square_baseline_actr_14_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG,pretraining)"  # Name for this training run (used in logging and checkpointing)
-  logdir: logdir/square_baseline_actr_14_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG,pretraining)  # Base logging directory for this run
-  offline_traindir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1_train'
-  offline_evaldir: 'logdir/robosuite_square_reset_every_5e4_run2 (larger latent)/eval_eps'
-  offline_playdir: 'logdir/robosuite_square_reset_every_5e4_run2 (larger latent)/train_eps' #['datasets/robomimic_data_MV/Square_MH_Shaped_shifted_0-1','datasets/robomimic_data_MV/lift_MH_train']
-
+  log_every: 1000          # Logging frequency (steps)
+  save_every: 20000
+  run_name: "can_baseline_actr_19_(online trained WM)"  # Name for this training run (used in logging and checkpointing)
+  logdir: logdir/can_baseline_actr_19_(online trained WM)  # Base logging directory for this run
+  offline_traindir: 'datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1'
+  offline_evaldir: 'datasets/robomimic_data_MV/can_MH_Shaped_shifted_0-1'
+  eval_dataset_random_load: True  # Randomize eval episode file order before applying eval_dataset_size.
+  eval_dataset_random_seed: 0
+  offline_playdir: '' #['datasets/robomimic_data_MV/Square_MH_Shaped_shifted_0-1','datasets/robomimic_data_MV/lift_MH_train']
+  play_dataset_random_load: True  # Randomize play episode file order before applying dataset_size.
+  play_dataset_random_seed: 0
+  wm_init_ckpt: 'logdir/robosuite_can_reset_every_10k_run2/latest.pt' #'logdir/robosuite_square_reset_every_5e4_run2 (larger latent)/latest.pt'
+  wm_init_load_policy: False  # When True, initialize actor from checkpoint if wm_init_ckpt is set
+  freeze_wm: True
 
   
   # --- Loss Scales ---
@@ -555,10 +567,10 @@ joint_train:
   # --- Evaluation Settings ---
   eval_every: 5000         # Frequency of evaluation (steps)
   offline_eval_batches: 64  # Number of batches to calculate validation loss on
-  eval_episodes: 100          # Number of online episodes to run in Robosuite
-  max_env_steps: 350        # Max steps per online episode
-  num_envs: 4            # Number of parallel environments for online eval
-  robosuite_task: ''  # Robosuite task name
+  eval_episodes: 200          # Number of online episodes to run in Robosuite
+  max_env_steps: 300        # Max steps per online episode
+  num_envs: 8            # Number of parallel environments for online eval
+  robosuite_task: 'PickPlaceCan'  # Robosuite task name
   
   # --- Observation Handling (Robosuite Defaults) ---
   # These ensure the environment matches the encoder input structure
@@ -578,7 +590,7 @@ joint_train:
     
   # --- System ---
   num_workers: 0            # Keep at 0 for efficient in-memory dataset usage
-  video_pred_log: True      # Log reconstruction and rollout videos to WandB
+  video_pred_log: False      # Log reconstruction and rollout videos to WandB
 
 rl_train:
   # --- Online RL training with fresh on-policy env rollouts ---
@@ -653,14 +665,14 @@ rl_train:
 rl_finetune:
   # --- RL_finetune.py specific run config ---
   #model parameters
-  units: 512
-  dyn_deter: 1024
-  dyn_hidden: 1024
+  units: 1024
+  dyn_deter: 512
+  dyn_hidden: 512
   dyn_stoch: 32
   dyn_discrete: 32
   # file paths
-  logdir: logdir/rl_finetune_deter_latents_square_pretrained_wm_35_(square_baseline_actr_12_10k, reset std head,80k) #(wrap around dataset_less_pretrained_WM)  # Logging directory for RL fine-tuning runs
-  checkpoint: 'logdir/square_baseline_actr_12_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG)/step_80000.pt'  # Path to pre-trained Dreamer/joint checkpoint
+  logdir: logdir/rl_finetune_deter_latents_square_pretrained_wm_43_(can_baseline_actr_19) #(wrap around dataset_less_pretrained_WM)  # Logging directory for RL fine-tuning runs
+  checkpoint: 'logdir/can_baseline_actr_19_(online trained WM)/latest.pt'  # Path to pre-trained Dreamer/joint checkpoint
   dreamer_wm_checkpoint: '' #'logdir/robosuite_can_reset_every_10k_run2/latest.pt'  # Optional Dreamer checkpoint for WM override; when set, WM loads from here.
   expert_dir: 'datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1'
 
@@ -689,7 +701,7 @@ rl_finetune:
   size: [84, 84]
   max_env_steps: 400
   clip_actions: True
-  num_envs: 6
+  num_envs: 8
 
   # Observation keys (must match encoder)
   camera_obs_keys: [agentview_image, robot0_eye_in_hand_image]
@@ -710,19 +722,19 @@ rl_finetune:
 
   # Training
   ac_batch_size: 900
-  batch_length: 14
+  batch_length: 15
   policy_init: checkpoint   # checkpoint: load actor+WM, random: load WM only
   policy_units: 1024
   actor:
     {layers: 4, dist: 'normal', entropy: 1e-3, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 2e-4, eps: 1e-5, grad_clip: 100.0, outscale: 1.0, bc_kl_scale: 0.01}
   critic:
     {layers: 4, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-4, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
-  reinit_actor_std_head: True                                                                                                                                                                                                                                                                   
+  reinit_actor_std_head: False                                                                                                                                                                                                                                                                   
   reinit_actor_std_value: 0.22
-  discount: 0.95
+  discount: 0.98
   discount_lambda: 0.95
   imag_gradient: 'dynamics'
-  imag_horizon: 14
+  imag_horizon: 15
   reward_EMA: True
   num_workers: 0
 
@@ -738,21 +750,127 @@ rl_finetune:
   foc_gamma: -1.0              # Discount for FOC Q-surrogate (-1.0 = use config.discount)
 
   # DITTO reward verification (state-aligned real-env rollouts)
-  ditto_verify: True
-  ditto_verify_hdf5_path: 'datasets/imagecanPH_shaped.hdf5'
-  ditto_verify_evaldir: 'datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1'
+  ditto_verify: False
+  ditto_verify_hdf5_path: 'datasets/imageSquarePH_shaped.hdf5'
+  ditto_verify_evaldir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1'
   ditto_verify_warmup_len: 5
   ditto_verify_horizon: 93
   ditto_verify_batches: 1
 
   # Logging
-  video_pred_log: True
-  log_action_mse: True
+  video_pred_log: False
+  log_action_mse: False
 
-dreamer_finetune:
+rl_finetune_lumos:
+  # --- RL_finetune_lumos.py specific run config ---
+  # LUMOS-style: every expert episode is encoded end-to-end with the frozen WM
+  # at startup so each cached posterior has seen all preceding expert states.
+  # Imagination starts are sampled from those cached posteriors -- effectively
+  # the "warmed-up posterior" prescribed by DITTO/LUMOS, but amortized once.
+
+  #model parameters
   units: 512
   dyn_deter: 1024
   dyn_hidden: 1024
+  dyn_stoch: 32
+  dyn_discrete: 32
+  # file paths
+  logdir: logdir/rl_finetune_lumos/square_lumos_1_(square baseline actr 9 init, online finetune with LumosDataset)  # Logging directory for this run
+  checkpoint: 'logdir/joint_train_seeds_square/seed_0_expert_play-robomimic_data_MV__Square_MH_Shaped_shifted_0-1/latest.pt'
+  dreamer_wm_checkpoint: ''
+  expert_dir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1'
+
+  encoder: *robomimic_encoder
+  decoder: *robomimic_decoder
+  reward_head:
+      {layers: 2, dist: 'symlog_disc', loss_scale: 0.1, outscale: 0.0}
+  cont_head:
+      {layers: 2, loss_scale: 0.0, outscale: 1.0}
+
+  # Reward model
+  reward_model: ditto
+  reward_metric: max_cos
+  reward_scale: 1.0
+  reward_shift: -1.0
+  gail_hidden_dim: 256
+  gail_layers: 2
+  gail_lr: 1e-4
+  gail_use_transitions: True
+
+  # Environment / eval env construction
+  robosuite_task: 'NutAssemblySquare'
+  robosuite_reward_shaping: True
+  robosuite_reward_scale: 1.0
+  robosuite_reward_shift: -1.0
+  size: [84, 84]
+  max_env_steps: 400
+  clip_actions: True
+  num_envs: 8
+
+  # Observation keys (must match encoder)
+  camera_obs_keys: [agentview_image, robot0_eye_in_hand_image]
+  flip_camera_keys: [agentview_image, robot0_eye_in_hand_image]
+  bc_cnn_keys_order: [image]
+  bc_mlp_keys_order:
+    - robot0_joint_pos
+    - robot0_joint_vel
+    - robot0_gripper_qpos
+    - robot0_gripper_qvel
+    - aux_robot0_joint_pos_sin
+    - aux_robot0_joint_pos_cos
+  aux_key_map:
+    aux_robot0_joint_pos_sin: robot0_joint_pos_sin
+    aux_robot0_joint_pos_cos: robot0_joint_pos_cos
+  image_crop_height: 84
+  image_crop_width: 84
+
+  # Training
+  ac_batch_size: 900
+  policy_init: checkpoint
+  policy_units: 1024
+  actor:
+    {layers: 4, dist: 'normal', entropy: 1e-3, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 2e-4, eps: 1e-5, grad_clip: 100.0, outscale: 1.0, bc_kl_scale: 0.01}
+  critic:
+    {layers: 4, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-4, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+  reinit_actor_std_head: False
+  reinit_actor_std_value: 0.22
+  discount: 0.98
+  discount_lambda: 0.95
+  imag_gradient: 'dynamics'
+  imag_horizon: 15           # also defines the LumosDataset window length
+  reward_EMA: True
+  num_workers: 0
+
+  # LUMOS-specific
+  lumos_cache_device: cuda    # 'cuda' to keep cached posteriors on the GPU (faster, more VRAM)
+
+  # Schedule keys
+  rl_steps: 100000
+  rl_log_every: 500
+  rl_save_every: 10000
+  rl_eval_every: 5000
+  eval_episodes: 100
+  rl_critic_pretrain_steps: 500
+  rl_critic_pretrain_log_every: 100
+  foc_lambda: 0.01
+  foc_gamma: -1.0
+
+  # DITTO reward verification (state-aligned real-env rollouts)
+  ditto_verify: True
+  ditto_verify_hdf5_path: 'datasets/imageSquarePH_shaped.hdf5'
+  ditto_verify_evaldir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1'
+  ditto_verify_warmup_len: 5
+  ditto_verify_horizon: 93
+  ditto_verify_batches: 1
+
+  # Logging
+  video_pred_log: False
+  log_action_mse: False
+
+dreamer_finetune:
+  units: 1024
+  dyn_deter: 512
+  dyn_hidden: 512
   dyn_stoch: 32
   dyn_discrete: 32
   norm: True
@@ -767,7 +885,7 @@ dreamer_finetune:
 
   # Actor layers/dist must match joint_train action_mlp (layers:4, dist:normal).
   actor:
-    {layers: 4, units: 1024, dist: 'normal', entropy: 3e-4, unimix_ratio: 0.01, std: 'learned',
+    {layers: 4, units: 1024, dist: 'normal', entropy: 1e-3, unimix_ratio: 0.01, std: 'learned',
      min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 2e-4, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
   critic:
     {layers: 4, dist: 'symlog_disc', slow_target: True, slow_target_update: 1,
@@ -777,14 +895,15 @@ dreamer_finetune:
   imag_gradient: 'dynamics'
   imag_gradient_mix: 0.0
   reward_EMA: True
-  discount: 0.95
+  discount: 0.98
   discount_lambda: 0.95
-  bc_kl_scale: 0.0  # KL(actor || frozen_BC) penalty; 0.0 disables entirely
+  bc_kl_scale: 0.01  # KL(actor || frozen_BC) penalty; 0.0 disables entirely
 
   # Paths
-  logdir: logdir/dreamer_finetune/run2-new cont and reward heads
-  checkpoint: 'logdir/square_baseline_actr_12_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG)/step_90000.pt'
-  offline_traindir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1'
+  logdir: logdir/dreamer_finetune/run5-can dreamer WM
+  checkpoint: 'logdir/can_baseline_actr_19_(online trained WM)/latest.pt'
+  dreamer_wm_checkpoint: ''  # Optional Dreamer checkpoint for WM override; when set, WM loads from here instead of `checkpoint`.
+  offline_traindir: 'logdir/robosuite_can_reset_every_10k_run2/train_eps'
   freeze_wm: True  # False to allow joint WM+actor updates
 
   # Training
@@ -797,11 +916,11 @@ dreamer_finetune:
   log_every: 500
   eval_every: 5000
   save_every: 10000
-  eval_episodes: 50
-  max_env_steps: 350
-  num_envs: 6
+  eval_episodes: 200
+  max_env_steps: 300
+  num_envs: 10
   clip_actions: True
-  robosuite_task: 'NutAssemblySquare'
+  robosuite_task: 'PickPlaceCan'
   robosuite_robots: ['Panda']
   robosuite_controller: 'OSC_POSE'
   robosuite_reward_shaping: True
@@ -844,3 +963,27 @@ dreamer_finetune:
     aux_robot0_joint_pos_cos: robot0_joint_pos_cos
   image_crop_height: 84
   image_crop_width: 84
+
+dreamer_online_finetune:
+  # Online Dreamer fine-tuning from a joint_train checkpoint.
+  # Compose with a base config that defines task/encoder/decoder, e.g.:
+  #   --configs robomimic dreamer_online_finetune
+  # Pretrain/prefill are disabled so the loaded WM isn't stampeded by a burst
+  # of updates on random-prefill data. Point offline_traindir at in-distribution
+  # data to seed replay instead of random prefill (see dreamer.py:508).
+  units: 512
+  dyn_hidden: 1024
+  dyn_deter: 1024
+  dyn_stoch: 32
+  dyn_discrete: 32
+  actor:
+    {layers: 4, units: 1024}  # match joint_train action_mlp that produced the BC checkpoint
+  checkpoint: 'logdir/square_baseline_actr_14_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG,pretraining)/latest.pt'              # joint_train checkpoint (WM + BC actor)
+  dreamer_wm_checkpoint: ''   # Optional Dreamer WM checkpoint; overrides WM in `checkpoint`
+  logdir: logdir/dreamer_online_finetune/run3-14-finer evals # Logging directory for this run
+  pretrain: 0
+  prefill: 0
+  offline_traindir: 'logdir/robosuite_square_reset_every_5e4_run2 (larger latent)/train_eps'
+
+  eval_every: 15000
+  eval_episode_num: 200
