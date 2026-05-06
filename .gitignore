@@ -4,6 +4,7 @@ run*
 !run_joint_train_sweep.sh
 !run_joint_train_seeds.sh
 !run_rl_finetune_seeds.sh
+!run_rl_finetune_lumos_ckpts.sh
 logdir*
 vis_*
 result*
