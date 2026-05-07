@@ -25,10 +25,10 @@ set -euo pipefail
 # Pipes are the separator so paths-with-spaces and parens survive.
 # ────────────────────────────────────────────────────────────────
 CKPT_ENTRIES=(
-  "logdir/joint_train_seeds_square_PH/seed_0_expert_only/latest.pt|datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1|square_env_eval"
-  "logdir/joint_train_seeds/seed_0_expert_only/latest.pt|datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1|can_env_eval"
-  "logdir/joint_train_seeds/seed_0_expert_play-robomimic_data_MV__can_MH_Shaped_shifted_0-1/latest.pt|datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1|can_env_eval"
-  "logdir/joint_train_seeds_can_warmstart/seed_0_expert_play-robomimic_data_MV__can_MH_Shaped_shifted_0-1/latest.pt|datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1|can_env_eval"
+  "logdir/joint_train_seeds_square_PH/seed_3_expert_only/latest.pt|datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1|square_env_eval"
+  "logdir/joint_train_seeds/seed_3_expert_only/latest.pt|datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1|can_env_eval"
+  "logdir/joint_train_seeds/seed_3_expert_play-robomimic_data_MV__can_MH_Shaped_shifted_0-1/latest.pt|datasets/robomimic_data_MV/can_PH_Shaped_shifted_0-1|can_env_eval"
+  "logdir/joint_train_seeds_square/seed_3_expert_play-robomimic_data_MV__Square_MH_Shaped_shifted_0-1/latest.pt|datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1|square_env_eval"
 )
 
 # ────────────────────────────────────────────────────────────────
