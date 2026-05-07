@@ -15,6 +15,7 @@ defaults:
   log_every: 1e4
   reset_every: 0
   env_restart_every: 0
+  robosuite_hard_reset: False  # False reuses MjSim across env.reset() (placements still re-randomize via placement_initializer); True is robosuite's default but leaks RAM via per-reset MjSim/render-context rebuild
   device: 'cuda:0'
   compile: True
   precision: 32
@@ -200,6 +201,7 @@ robosuite:
   opt_eps: 1e-5
   units: 1024
   env_restart_every: 5e4
+  robosuite_hard_reset: False  # avoid robosuite's per-reset MjSim rebuild leak; placements still re-randomize
   batch_size: 32
   train_ratio: 1024
   prefill: 4800
@@ -571,6 +573,7 @@ joint_train:
   max_env_steps: 300        # Max steps per online episode
   num_envs: 8            # Number of parallel environments for online eval
   robosuite_task: 'PickPlaceCan'  # Robosuite task name
+  robosuite_hard_reset: False  # avoid robosuite's per-reset MjSim rebuild leak; placements still re-randomize
   
   # --- Observation Handling (Robosuite Defaults) ---
   # These ensure the environment matches the encoder input structure
@@ -615,6 +618,7 @@ rl_train:
   num_eval_envs: 8          # Parallel envs for evaluation rollouts
   max_env_steps: 500        # Horizon per episode
   clip_actions: True        # Clip policy actions to [-1, 1]
+  robosuite_hard_reset: False  # avoid robosuite's per-reset MjSim rebuild leak; placements still re-randomize
 
   # --- Observation keys (must match encoder config) ---
   camera_obs_keys: [agentview_image, robot0_eye_in_hand_image]
@@ -702,6 +706,7 @@ rl_finetune:
   max_env_steps: 400
   clip_actions: True
   num_envs: 8
+  robosuite_hard_reset: False  # avoid robosuite's per-reset MjSim rebuild leak; placements still re-randomize
 
   # Observation keys (must match encoder)
   camera_obs_keys: [agentview_image, robot0_eye_in_hand_image]
@@ -775,8 +780,8 @@ rl_finetune_lumos:
   dyn_stoch: 32
   dyn_discrete: 32
   # file paths
-  logdir: logdir/rl_finetune_lumos/square_lumos_1_(square baseline actr 9 init, online finetune with LumosDataset)  # Logging directory for this run
-  checkpoint: 'logdir/joint_train_seeds_square/seed_0_expert_play-robomimic_data_MV__Square_MH_Shaped_shifted_0-1/latest.pt'
+  logdir: logdir/rl_finetune_lumos/square_lumos_3_(14, trained on 300k)  # Logging directory for this run
+  checkpoint: 'logdir/square_baseline_actr_14_(DiWA params, LARGE play dataset,smaller lr,cont and reward,SG,pretraining)/latest.pt'
   dreamer_wm_checkpoint: ''
   expert_dir: 'datasets/robomimic_data_MV/Square_PH_Shaped_shifted_0-1'
 
@@ -805,7 +810,8 @@ rl_finetune_lumos:
   size: [84, 84]
   max_env_steps: 400
   clip_actions: True
-  num_envs: 8
+  num_envs: 14
+  robosuite_hard_reset: False  # avoid robosuite's per-reset MjSim rebuild leak; placements still re-randomize
 
   # Observation keys (must match encoder)
   camera_obs_keys: [agentview_image, robot0_eye_in_hand_image]
@@ -825,8 +831,8 @@ rl_finetune_lumos:
   image_crop_width: 84
 
   # Training
-  ac_batch_size: 900
-  policy_init: checkpoint
+  ac_batch_size: 1024
+  policy_init: random   # checkpoint: load actor+WM, random: load WM only
   policy_units: 1024
   actor:
     {layers: 4, dist: 'normal', entropy: 1e-3, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 2e-4, eps: 1e-5, grad_clip: 100.0, outscale: 1.0, bc_kl_scale: 0.01}
@@ -849,7 +855,8 @@ rl_finetune_lumos:
   rl_log_every: 500
   rl_save_every: 10000
   rl_eval_every: 5000
-  eval_episodes: 100
+  env_restart_every: 0
+  eval_episodes: 200
   rl_critic_pretrain_steps: 500
   rl_critic_pretrain_log_every: 100
   foc_lambda: 0.01
@@ -924,6 +931,7 @@ dreamer_finetune:
   robosuite_robots: ['Panda']
   robosuite_controller: 'OSC_POSE'
   robosuite_reward_shaping: True
+  robosuite_hard_reset: False  # avoid robosuite's per-reset MjSim rebuild leak; placements still re-randomize
   controller_configs:
     type: BASIC
     body_parts:

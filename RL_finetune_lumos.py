@@ -288,6 +288,22 @@ def _init_eval_envs(config):
     return envs
 
 
+def _restart_eval_envs(config, eval_envs):
+    """Close existing eval envs and re-initialize them.
+
+    Mirrors dreamer.py's `env_restart_every` logic: tear down the workers and
+    spawn fresh ones to clear any accumulated state (memory growth, sim drift,
+    stale handles). Returns the newly-built env list.
+    """
+    if eval_envs is not None:
+        for env in eval_envs:
+            try:
+                env.close()
+            except Exception:
+                pass
+    return _init_eval_envs(config)
+
+
 def _imagine_policy(wm, actor, start_state, horizon, is_first=None, post=None):
     """Roll out the actor in imagination through the world model.
 
@@ -329,16 +345,17 @@ def _imagine_policy(wm, actor, start_state, horizon, is_first=None, post=None):
     for t in range(horizon):
         # At splice boundaries (t > 0, is_first[:,t] == 1) blend the
         # imagined state with the posterior from observe, mirroring the
-        # reset logic in RSSM.obs_step.
+        # reset logic in RSSM.obs_step. Done unconditionally to avoid the
+        # CPU<->GPU sync that `is_first_t.any()` would force every step;
+        # rows with mask=0 pass through unchanged.
         if t > 0:
             is_first_t = is_first[:, t]  # (B,)
-            if is_first_t.any():
-                post_t = {k: v[:, t] for k, v in post.items()}
-                for key in state:
-                    mask = is_first_t.reshape(
-                        is_first_t.shape + (1,) * (state[key].ndim - is_first_t.ndim)
-                    )
-                    state[key] = state[key] * (1.0 - mask) + post_t[key] * mask
+            post_t = {k: v[:, t] for k, v in post.items()}
+            for key in state:
+                mask = is_first_t.reshape(
+                    is_first_t.shape + (1,) * (state[key].ndim - is_first_t.ndim)
+                )
+                state[key] = state[key] * (1.0 - mask) + post_t[key] * mask
 
         feat = wm.dynamics.get_feat(state)
         deter_feat = wm.dynamics.get_feat(state, deterministic_only=True)
@@ -1110,6 +1127,14 @@ def rl_finetune(config):
                 logger.write(fps=False)
 
     actor.requires_grad_(True)
+    env_restart_every = int(getattr(config, "env_restart_every", 0) or 0)
+    next_env_restart = None
+    if env_restart_every > 0 and eval_envs is not None:
+        next_env_restart = env_restart_every
+        print(
+            "[startup] eval env restarts enabled: "
+            f"every={env_restart_every} next_at={next_env_restart}"
+        )
     if eval_envs is not None:
         eval_step = pretrain_steps
         print(
@@ -1237,6 +1262,15 @@ def rl_finetune(config):
                     logger.scalar(name, value)
                 logger.write(fps=False)
 
+            if (
+                next_env_restart is not None
+                and eval_envs is not None
+                and step >= next_env_restart
+            ):
+                print(f"[runtime] restarting eval envs at step={step}.")
+                eval_envs = _restart_eval_envs(config, eval_envs)
+                next_env_restart = step + env_restart_every
+
             if eval_envs is not None and eval_every > 0 and step > 0 and (step % eval_every == 0):
                 print(f"Evaluating online at step {step}...")
                 online_metrics = evaluate_online(
@@ -1338,6 +1372,7 @@ def _parse_config(argv=None):
     defaults.setdefault("eval_episodes", defaults.get("eval_episode_num", 0))
     defaults.setdefault("num_envs", defaults.get("envs", 1))
     defaults.setdefault("max_env_steps", defaults.get("time_limit", 500))
+    defaults.setdefault("env_restart_every", 0)
     defaults.setdefault("clip_actions", False)
     defaults.setdefault("checkpoint", "")
     defaults.setdefault("dreamer_wm_checkpoint", "")
